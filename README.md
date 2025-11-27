@@ -57,7 +57,7 @@ pub fn main() !void {
 
 ## Requirements
 
-- Zig 0.14.0 or later (0.16-dev for full std.Io support)
+- Zig 0.16.0-dev.1470+32dc46aae
 
 ## Build
 

@@ -1,9 +1,7 @@
 .{
-    .fingerprint = 0xfc1acdfbe22e90c7,
-    .name = .static_ecs,
+    .name = .StaticECS,
     .version = "0.0.1",
-    .paths = .{
-        "build.zig",
-        "src",
-    },
+    .minimum_zig_version = "0.16.0-dev.1470+32dc46aae",
+    .paths = .{ "build.zig", "src" },
+    .fingerprint = 0xda68e083e789c6de,
 }
