@@ -1,6 +1,7 @@
 # StaticECS
 
 **Experimental General-Purpose Entity Component System for Zig**
+
 Built with the use of Kilo Code and Claude 4.5 Opus
 
 StaticECS is a compile-time configurable ECS framework that leverages Zig's comptime capabilities with the goals to generate highly optimized, zero-overhead entity component systems tailored to exact application needs.
