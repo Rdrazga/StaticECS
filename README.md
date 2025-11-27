@@ -2,9 +2,11 @@
 
 **Experimental General-Purpose Entity Component System for Zig**
 
-StaticECS is a compile-time configurable ECS framework that leverages Zig's comptime capabilities to generate highly optimized, zero-overhead entity component systems tailored to exact application needs.
+Built with the use of Kilo Code and Claude 4.5 Opus
 
-## Key Features
+StaticECS is a compile-time configurable ECS framework that leverages Zig's comptime capabilities with the goals to generate highly optimized, zero-overhead entity component systems tailored to exact application needs.
+
+## Features (Verifying)
 
 - **Full Comptime Configuration** - Define components, archetypes, systems, and all bounds at compile time
 - **Zero Runtime Overhead** - Type generation and validation happens entirely at compile time
@@ -74,10 +76,6 @@ This is an experimental project exploring the boundaries of compile-time ECS arc
 - Lock-free coordination primitives
 - Platform-specific optimizations (io_uring, NUMA, huge pages)
 - Adaptive runtime backend selection
-
-## Credits
-
-Built using **Claude Opus 4.5** - Anthropic's AI assistant.
 
 ## License
 
