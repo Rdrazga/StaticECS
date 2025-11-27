@@ -1,0 +1,9 @@
+.{
+    .fingerprint = 0xfc1acdfbe22e90c7,
+    .name = .static_ecs,
+    .version = "0.0.1",
+    .paths = .{
+        "build.zig",
+        "src",
+    },
+}
