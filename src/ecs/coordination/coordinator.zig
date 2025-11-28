@@ -512,3 +512,156 @@ test "createPipelineConfigs" {
     try std.testing.expectEqual(config_mod.WorldRole.compute, pipeline.compute.coordination.role);
     try std.testing.expectEqual(@as(u8, 2), pipeline.compute.coordination.world_id);
 }
+
+// ============================================================================
+// Extended Coordinator Tests (Task: Add Coordination Module Tests)
+// ============================================================================
+
+test "WorldCoordinator: multi-world initialization and lifecycle" {
+    // Test coordinator creates proper queue matrix for multi-world setup.
+    const TestComp = struct { value: i32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{TestComp} },
+        .coordination = .{
+            .role = .standalone,
+            .transfer_queue = .{ .capacity = 64 },
+        },
+    };
+
+    // Create coordinator for 3 worlds
+    const Coordinator = WorldCoordinator(cfg, 3);
+    var coord = Coordinator.init(std.testing.allocator);
+    defer coord.deinit();
+
+    // Verify initialization (no crash)
+    try std.testing.expectEqual(@as(u8, 3), Coordinator.num_worlds);
+
+    // Check initial stats (all zeros)
+    const initial_stats = coord.getStats();
+    try std.testing.expectEqual(@as(u64, 0), initial_stats.ticks);
+    try std.testing.expectEqual(@as(u64, 0), initial_stats.queue_full_count);
+    for (0..8) |i| {
+        try std.testing.expectEqual(@as(u64, 0), initial_stats.transfers_sent[i]);
+        try std.testing.expectEqual(@as(u64, 0), initial_stats.transfers_received[i]);
+    }
+
+    // Call start() - should set running state
+    try std.testing.expect(!coord.isRunning());
+    coord.start();
+    try std.testing.expect(coord.isRunning());
+
+    // Call stop() - should clear running state
+    coord.stop();
+    try std.testing.expect(!coord.isRunning());
+}
+
+test "WorldCoordinator: tick recording and stats accumulation" {
+    // Test tick recording and statistics accumulation.
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{} },
+        .coordination = .{
+            .transfer_queue = .{ .capacity = 64 },
+        },
+    };
+
+    const Coordinator = WorldCoordinator(cfg, 2);
+    var coord = Coordinator.init(std.testing.allocator);
+    defer coord.deinit();
+
+    // Record multiple ticks
+    coord.recordTick();
+    coord.recordTick();
+    coord.recordTick();
+
+    try std.testing.expectEqual(@as(u64, 3), coord.getStats().ticks);
+
+    // Stats should persist across multiple operations
+    const transfer = Coordinator.createTransfer(0, 1);
+    _ = coord.queueTransfer(0, 1, transfer);
+    _ = coord.queueTransfer(0, 1, transfer);
+
+    try std.testing.expectEqual(@as(u64, 2), coord.getStats().transfers_sent[0]);
+    try std.testing.expectEqual(@as(u64, 3), coord.getStats().ticks);
+
+    // Reset should clear all stats
+    coord.resetStats();
+    try std.testing.expectEqual(@as(u64, 0), coord.getStats().ticks);
+    try std.testing.expectEqual(@as(u64, 0), coord.getStats().transfers_sent[0]);
+}
+
+test "WorldCoordinator: queue full back-pressure" {
+    // Test that queue correctly reports full and tracks queue_full_count.
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{} },
+        .coordination = .{
+            .transfer_queue = .{ .capacity = 4 }, // Small capacity for testing
+        },
+    };
+
+    const Coordinator = WorldCoordinator(cfg, 2);
+    var coord = Coordinator.init(std.testing.allocator);
+    defer coord.deinit();
+
+    // Fill the queue
+    for (0..4) |_| {
+        const transfer = Coordinator.createTransfer(0, 1);
+        try std.testing.expect(coord.queueTransfer(0, 1, transfer));
+    }
+
+    // Next push should fail and increment queue_full_count
+    const extra_transfer = Coordinator.createTransfer(0, 1);
+    try std.testing.expect(!coord.queueTransfer(0, 1, extra_transfer));
+    try std.testing.expectEqual(@as(u64, 1), coord.getStats().queue_full_count);
+
+    // Pop one and verify transfer succeeds again
+    _ = coord.popTransferFor(1);
+    try std.testing.expect(coord.queueTransfer(0, 1, extra_transfer));
+}
+
+test "WorldCoordinator: bidirectional transfers" {
+    // Test transfers in both directions between worlds.
+    const Data = struct { id: u32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Data} },
+        .coordination = .{
+            .transfer_queue = .{ .capacity = 64 },
+        },
+    };
+
+    const Coordinator = WorldCoordinator(cfg, 3);
+    var coord = Coordinator.init(std.testing.allocator);
+    defer coord.deinit();
+
+    // World 0 -> World 1
+    var t01 = Coordinator.createTransfer(0, 1);
+    _ = t01.packComponent(Data, .{ .id = 100 });
+    try std.testing.expect(coord.queueTransfer(0, 1, t01));
+
+    // World 1 -> World 0 (reverse direction)
+    var t10 = Coordinator.createTransfer(1, 0);
+    _ = t10.packComponent(Data, .{ .id = 200 });
+    try std.testing.expect(coord.queueTransfer(1, 0, t10));
+
+    // World 1 -> World 2
+    var t12 = Coordinator.createTransfer(1, 2);
+    _ = t12.packComponent(Data, .{ .id = 300 });
+    try std.testing.expect(coord.queueTransfer(1, 2, t12));
+
+    // Verify pending counts
+    try std.testing.expectEqual(@as(usize, 1), coord.pendingTransfersFor(0));
+    try std.testing.expectEqual(@as(usize, 1), coord.pendingTransfersFor(1));
+    try std.testing.expectEqual(@as(usize, 1), coord.pendingTransfersFor(2));
+    try std.testing.expectEqual(@as(usize, 3), coord.totalPendingTransfers());
+
+    // Pop and verify data integrity
+    const recv0 = coord.popTransferFor(0).?;
+    try std.testing.expectEqual(@as(u32, 200), recv0.unpackComponent(Data).?.id);
+
+    const recv1 = coord.popTransferFor(1).?;
+    try std.testing.expectEqual(@as(u32, 100), recv1.unpackComponent(Data).?.id);
+
+    const recv2 = coord.popTransferFor(2).?;
+    try std.testing.expectEqual(@as(u32, 300), recv2.unpackComponent(Data).?.id);
+}

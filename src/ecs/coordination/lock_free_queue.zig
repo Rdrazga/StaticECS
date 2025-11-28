@@ -517,3 +517,146 @@ test "getCapacity" {
     var spsc = SPSCQueue(u32, 128).init();
     try std.testing.expectEqual(@as(usize, 128), spsc.getCapacity());
 }
+
+// ============================================================================
+// Extended Queue Tests (Task: Add Coordination Module Tests)
+// ============================================================================
+
+test "LockFreeQueue: FIFO ordering verification" {
+    // Verifies the Vyukov-style sequence-based algorithm maintains FIFO order.
+    // Push items 1..10, verify len(), pop all and verify FIFO ordering.
+    var queue = LockFreeQueue(u32, 16).init();
+
+    // Push items 1..10
+    for (1..11) |i| {
+        try std.testing.expect(queue.push(@intCast(i)));
+    }
+
+    // Verify len() reports 10
+    try std.testing.expectEqual(@as(usize, 10), queue.len());
+
+    // Pop all items in order - verify FIFO (1 comes out first)
+    for (1..11) |expected| {
+        const item = queue.pop();
+        try std.testing.expect(item != null);
+        try std.testing.expectEqual(@as(u32, @intCast(expected)), item.?);
+    }
+
+    // Verify queue is empty after all pops
+    try std.testing.expect(queue.isEmpty());
+    try std.testing.expectEqual(@as(?u32, null), queue.pop());
+}
+
+test "LockFreeQueue: empty queue pop behavior" {
+    // Test that empty queue correctly returns null on pop.
+    var queue = LockFreeQueue(u32, 8).init();
+
+    // Pop from empty queue - should return null
+    try std.testing.expectEqual(@as(?u32, null), queue.pop());
+    try std.testing.expect(queue.isEmpty());
+
+    // Push one item
+    try std.testing.expect(queue.push(42));
+    try std.testing.expect(!queue.isEmpty());
+
+    // Pop - should return item
+    try std.testing.expectEqual(@as(?u32, 42), queue.pop());
+
+    // Pop again - should return null
+    try std.testing.expectEqual(@as(?u32, null), queue.pop());
+    try std.testing.expect(queue.isEmpty());
+}
+
+test "LockFreeQueue: capacity boundary stress" {
+    // Test behavior exactly at capacity boundaries with push after pop.
+    var queue = LockFreeQueue(u32, 4).init();
+
+    // Fill to capacity
+    try std.testing.expect(queue.push(1));
+    try std.testing.expect(queue.push(2));
+    try std.testing.expect(queue.push(3));
+    try std.testing.expect(queue.push(4));
+
+    // Verify full (5th push should fail)
+    try std.testing.expect(queue.isFull());
+    try std.testing.expect(!queue.push(5));
+    try std.testing.expectEqual(@as(usize, 4), queue.len());
+
+    // Pop one, verify can push again
+    try std.testing.expectEqual(@as(?u32, 1), queue.pop());
+    try std.testing.expect(!queue.isFull());
+    try std.testing.expect(queue.push(5));
+    try std.testing.expect(queue.isFull());
+
+    // Verify remaining items in FIFO order
+    try std.testing.expectEqual(@as(?u32, 2), queue.pop());
+    try std.testing.expectEqual(@as(?u32, 3), queue.pop());
+    try std.testing.expectEqual(@as(?u32, 4), queue.pop());
+    try std.testing.expectEqual(@as(?u32, 5), queue.pop());
+    try std.testing.expect(queue.isEmpty());
+}
+
+test "LockFreeQueue: batch partial fill" {
+    // Test pushBatch when queue can only accept partial batch.
+    var queue = LockFreeQueue(u32, 4).init();
+
+    // Fill 2 slots first
+    try std.testing.expect(queue.push(100));
+    try std.testing.expect(queue.push(200));
+
+    // Try to batch push 4 items - should only accept 2
+    const items = [_]u32{ 1, 2, 3, 4 };
+    const pushed = queue.pushBatch(&items);
+    try std.testing.expectEqual(@as(usize, 2), pushed);
+    try std.testing.expect(queue.isFull());
+
+    // Verify all items in order
+    try std.testing.expectEqual(@as(?u32, 100), queue.pop());
+    try std.testing.expectEqual(@as(?u32, 200), queue.pop());
+    try std.testing.expectEqual(@as(?u32, 1), queue.pop());
+    try std.testing.expectEqual(@as(?u32, 2), queue.pop());
+}
+
+test "SPSCQueue: FIFO ordering verification" {
+    // Test the cache-line optimized SPSC queue maintains FIFO order.
+    var queue = SPSCQueue(u32, 16).init();
+
+    // Push several items (single producer)
+    for (1..9) |i| {
+        try std.testing.expect(queue.push(@intCast(i)));
+    }
+
+    // Pop items and verify order (single consumer)
+    for (1..9) |expected| {
+        const item = queue.pop();
+        try std.testing.expect(item != null);
+        try std.testing.expectEqual(@as(u32, @intCast(expected)), item.?);
+    }
+
+    // Verify empty
+    try std.testing.expect(queue.isEmpty());
+    try std.testing.expectEqual(@as(?u32, null), queue.pop());
+}
+
+test "SPSCQueue: interleaved push/pop" {
+    // Test SPSC queue with interleaved producer/consumer access.
+    var queue = SPSCQueue(u32, 8).init();
+
+    // Interleaved push/pop
+    try std.testing.expect(queue.push(1));
+    try std.testing.expect(queue.push(2));
+    try std.testing.expectEqual(@as(?u32, 1), queue.pop());
+
+    try std.testing.expect(queue.push(3));
+    try std.testing.expectEqual(@as(?u32, 2), queue.pop());
+    try std.testing.expectEqual(@as(?u32, 3), queue.pop());
+
+    // Push more after partial drain
+    try std.testing.expect(queue.push(4));
+    try std.testing.expect(queue.push(5));
+    try std.testing.expectEqual(@as(usize, 2), queue.len());
+
+    try std.testing.expectEqual(@as(?u32, 4), queue.pop());
+    try std.testing.expectEqual(@as(?u32, 5), queue.pop());
+    try std.testing.expect(queue.isEmpty());
+}

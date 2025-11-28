@@ -207,6 +207,8 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
             ecs_processed: u64 = 0,
             /// Fast-path items processed.
             fast_path_processed: u64 = 0,
+            /// ECS processing errors (spawn failures, etc.).
+            ecs_errors: u64 = 0,
         };
 
         // ====================================================================
@@ -216,6 +218,7 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
         pub const Error = error{
             FastPathFull,
             EcsProcessingFailed,
+            NoArchetypeConfigured,
         };
 
         // ====================================================================
@@ -320,17 +323,52 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
         }
 
         /// Process input via ECS pipeline.
+        /// Creates an entity in the first configured archetype with default-initialized
+        /// components. The input data is acknowledged but semantic mapping to specific
+        /// component fields requires user-provided converters (future enhancement).
+        ///
+        /// Tiger Style: Fail-fast on errors, explicit bounds checking.
         fn processViaEcs(self: *Self, input: InputData) Error!void {
-            // Create entity with input data as component
-            // Note: This requires a component type matching InputData
-            // For now, we just track the stat - full implementation
-            // would create an entity with appropriate components
-            _ = input;
-            self.stats.ecs_processed += 1;
+            // Tiger Style: Assert input invariants
+            std.debug.assert(input.len <= input.data.len);
 
-            // In full implementation:
-            // const entity = self.world.createEntity() catch return error.EcsProcessingFailed;
-            // self.world.setComponent(entity, inputToComponent(input));
+            // Compile-time check: require at least one archetype for fallback
+            const archetype_count = cfg.archetypes.archetypes.len;
+            if (archetype_count == 0) {
+                // No archetypes configured - cannot create entities
+                self.stats.ecs_errors += 1;
+                return error.NoArchetypeConfigured;
+            }
+
+            // Use first archetype as fallback destination
+            // Future: Make fallback archetype configurable via HybridPipelineConfig
+            const fallback_arch = cfg.archetypes.archetypes[0];
+            const FallbackComponents = @Tuple(fallback_arch.components);
+
+            // Create default-initialized component values
+            // Note: Components are zero-initialized; input bytes are acknowledged
+            // but not copied to components (would require type-specific mapping)
+            var components: FallbackComponents = undefined;
+            inline for (0..fallback_arch.components.len) |i| {
+                components[i] = std.mem.zeroes(fallback_arch.components[i]);
+            }
+
+            // Spawn entity with fallback archetype
+            _ = self.world.spawn(fallback_arch.name, components) catch |err| {
+                // Track failed spawn attempts
+                self.stats.ecs_errors += 1;
+                // Log error type for debugging
+                if (cfg.options.enable_debug_asserts) {
+                    std.debug.print("processViaEcs spawn failed: {}\n", .{err});
+                }
+                return error.EcsProcessingFailed;
+            };
+
+            // Input data acknowledged - entity created as proxy
+            // The input.data bytes could be stored if we had a RawData component,
+            // but that would require adding it to the archetype configuration
+            // Input is used in assert above, no need for explicit discard
+            self.stats.ecs_processed += 1;
         }
 
         // ====================================================================
@@ -638,4 +676,160 @@ test "InputData and OutputData" {
     const output = Pipeline.OutputData.fromSlice("response");
     try std.testing.expectEqual(@as(u32, 8), output.len);
     try std.testing.expectEqualStrings("response", output.asSlice());
+}
+
+// ============================================================================
+// Phase 2 Bug Fix Regression Test
+// ============================================================================
+
+test "HybridPipeline processViaEcs creates entity in world" {
+    // Test that processViaEcs actually creates an entity when called.
+    //
+    // Verifies fix for P1-HYBRID where ECS fallback was non-functional.
+    // Previously processViaEcs was just a stub that only counted entities
+    // without actually creating them. Now it spawns real entities.
+
+    // Define a predicate that never allows fast-path, forcing ECS fallback
+    const NeverFastPath = struct {
+        pub fn canFastPath(input: anytype) bool {
+            _ = input;
+            return false; // Force all processing through ECS
+        }
+    };
+
+    const TestPosition = struct { x: f32, y: f32 };
+    const TestVelocity = struct { dx: f32, dy: f32 };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{ TestPosition, TestVelocity } },
+        .archetypes = .{
+            .archetypes = &.{
+                // First archetype is used as fallback destination
+                .{ .name = "movable", .components = &.{ TestPosition, TestVelocity } },
+            },
+        },
+        .pipeline = .{
+            .mode = .hybrid,
+            .hybrid = .{
+                .fast_path_predicate_type = NeverFastPath,
+                .fast_path_capacity = 10,
+                .fallback_on_full = true,
+            },
+        },
+        .options = .{
+            .max_entities = 100,
+            .enable_debug_asserts = false, // Disable debug prints in test
+        },
+    };
+
+    const WorldType = @import("../world.zig").World(test_config);
+    const Pipeline = HybridPipeline(test_config);
+
+    var world = WorldType.init(std.testing.allocator);
+    defer world.deinit();
+
+    var pipeline = Pipeline.init(&world);
+
+    // 1. Save initial entity count (should be 0)
+    const initial_count = world.entityCount();
+    try std.testing.expectEqual(@as(u32, 0), initial_count);
+
+    // 2. Create InputData with some test bytes
+    const input = Pipeline.InputData.fromSlice("test input data");
+
+    // 3. Define a callback (won't be used since fast-path is disabled)
+    const dummy_callback = struct {
+        fn cb(in: *Pipeline.InputData, out: *Pipeline.OutputData) void {
+            _ = in;
+            out.status = 200;
+        }
+    }.cb;
+
+    // 4. Process via the pipeline - should go to ECS since predicate returns false
+    try pipeline.process(input, dummy_callback);
+
+    // 5. Verify world entity count increased by 1
+    try std.testing.expectEqual(@as(u32, 1), world.entityCount());
+
+    // 6. Verify stats.ecs_processed incremented
+    try std.testing.expectEqual(@as(u64, 1), pipeline.stats.ecs_processed);
+
+    // 7. Verify fast_path_misses was also recorded (predicate returned false)
+    try std.testing.expectEqual(@as(u64, 1), pipeline.stats.fast_path_misses);
+
+    // 8. Verify no errors occurred
+    try std.testing.expectEqual(@as(u64, 0), pipeline.stats.ecs_errors);
+
+    // 9. Process another input - entity count should increase again
+    try pipeline.process(input, dummy_callback);
+    try std.testing.expectEqual(@as(u32, 2), world.entityCount());
+    try std.testing.expectEqual(@as(u64, 2), pipeline.stats.ecs_processed);
+}
+
+test "HybridPipeline processViaEcs fallback when queue full" {
+    // Test that when fast-path queue is full, entities fall back to ECS.
+    //
+    // This verifies the fix handles the fallback path correctly.
+
+    // Define a predicate that always allows fast-path
+    const AlwaysFastPath = struct {
+        pub fn canFastPath(input: anytype) bool {
+            _ = input;
+            return true; // Allow fast-path
+        }
+    };
+
+    const TestComp = struct { x: i32 };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{TestComp} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{TestComp} },
+        } },
+        .pipeline = .{
+            .mode = .hybrid,
+            .hybrid = .{
+                .fast_path_predicate_type = AlwaysFastPath,
+                .fast_path_capacity = 2, // Very small capacity
+                .fallback_on_full = true, // Enable fallback
+            },
+        },
+        .options = .{
+            .max_entities = 100,
+            .enable_debug_asserts = false,
+        },
+    };
+
+    const WorldType = @import("../world.zig").World(test_config);
+    const Pipeline = HybridPipeline(test_config);
+
+    var world = WorldType.init(std.testing.allocator);
+    defer world.deinit();
+
+    var pipeline = Pipeline.init(&world);
+
+    const input = Pipeline.InputData.fromSlice("test");
+    const dummy_callback = struct {
+        fn cb(in: *Pipeline.InputData, out: *Pipeline.OutputData) void {
+            _ = in;
+            out.status = 200;
+        }
+    }.cb;
+
+    // Fill fast-path queue (capacity = 2)
+    try pipeline.process(input, dummy_callback);
+    try pipeline.process(input, dummy_callback);
+
+    // Queue should now be full
+    try std.testing.expect(pipeline.isQueueFull());
+    try std.testing.expectEqual(@as(u64, 2), pipeline.stats.fast_path_hits);
+    try std.testing.expectEqual(@as(u32, 0), world.entityCount()); // No ECS entities yet
+
+    // Next process should fall back to ECS
+    try pipeline.process(input, dummy_callback);
+
+    // Verify fallback occurred
+    try std.testing.expectEqual(@as(u64, 1), pipeline.stats.fallback_count);
+    try std.testing.expectEqual(@as(u64, 1), pipeline.stats.ecs_processed);
+    try std.testing.expectEqual(@as(u32, 1), world.entityCount()); // One ECS entity created
 }

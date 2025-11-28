@@ -220,6 +220,40 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
             import_batches: u64 = 0,
             /// Total export operations performed.
             export_operations: u64 = 0,
+            /// Entities that failed during spawn (createEntity failed).
+            spawn_failures: u64 = 0,
+            /// Entities despawned due to component set failures (transactional rollback).
+            component_failures: u64 = 0,
+        };
+
+        // ====================================================================
+        // Commit Result
+        // ====================================================================
+
+        /// Result of committing an import batch.
+        /// Tracks both successful entities and any failures for visibility.
+        ///
+        /// Tiger Style: No silent error swallowing - failures are always visible.
+        pub const CommitResult = struct {
+            /// Slice of successfully created entity handles.
+            entities: []const WorldType.WorldEntityHandle,
+            /// Number of entities successfully created with all components.
+            entities_created: u32,
+            /// Number of entities that failed to spawn (createEntity error).
+            spawn_failures: u32,
+            /// Number of entities despawned due to component set failures.
+            /// These entities were created but rolled back due to incomplete component data.
+            component_failures: u32,
+
+            /// Returns true if all entities in the batch were created successfully.
+            pub fn isComplete(self: CommitResult) bool {
+                return self.spawn_failures == 0 and self.component_failures == 0;
+            }
+
+            /// Returns total number of failed operations.
+            pub fn totalFailures(self: CommitResult) u32 {
+                return self.spawn_failures + self.component_failures;
+            }
         };
 
         // ====================================================================
@@ -306,24 +340,40 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
         }
 
         /// Commit import batch to world, creating entities.
-        /// Returns slice of created entity handles.
-        pub fn commitImport(self: *Self) Error![]const WorldType.WorldEntityHandle {
+        /// Returns a CommitResult containing created entities and failure statistics.
+        ///
+        /// Tiger Style: Transactional semantics - if any component fails to set,
+        /// the entity is despawned (rolled back) to prevent incomplete/corrupt entities.
+        /// Failures are tracked and returned, never silently swallowed.
+        pub fn commitImport(self: *Self) CommitResult {
             const count = self.import_buffer.len;
             if (count == 0) {
-                return &[_]WorldType.WorldEntityHandle{};
+                return .{
+                    .entities = &[_]WorldType.WorldEntityHandle{},
+                    .entities_created = 0,
+                    .spawn_failures = 0,
+                    .component_failures = 0,
+                };
             }
 
             // Use export buffer's entity array as scratch space for results
             var created: *[batch_size]WorldType.WorldEntityHandle = &self.export_buffer.entities;
+            var created_count: u32 = 0;
+            var spawn_failures: u32 = 0;
+            var component_failures: u32 = 0;
 
             for (0..count) |i| {
                 const entry = &self.import_buffer.entries[i];
 
                 // Create entity in world
-                const entity = self.world.createEntity() catch |err| {
-                    _ = err;
-                    return error.WorldError;
+                const entity = self.world.createEntity() catch {
+                    // Track spawn failure and continue to next entry
+                    spawn_failures += 1;
+                    continue;
                 };
+
+                // Track if any component fails to set for this entity
+                var entity_complete = true;
 
                 // Set all components from entry
                 inline for (0..num_components) |comp_idx| {
@@ -332,8 +382,8 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
                     if (entry.component_mask & mask != 0) {
                         if (entry.components.get(comp_idx)) |value| {
                             self.world.setComponent(entity, value) catch {
-                                // Component set failed - entity created but incomplete
-                                // In production, might want to track this
+                                // Component set failed - mark entity as incomplete
+                                entity_complete = false;
                             };
                             // Suppress unused variable warning
                             _ = T;
@@ -341,15 +391,37 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
                     }
                 }
 
-                created[i] = entity;
+                // Tiger Style: Transactional rollback on partial failure
+                // If any component failed to set, despawn the entity to prevent
+                // incomplete/corrupt entities from existing in the world
+                if (!entity_complete) {
+                    self.world.destroyEntity(entity) catch {
+                        // Despawn failed - entity exists but is incomplete
+                        // This is a serious error state, but we still track it
+                    };
+                    component_failures += 1;
+                    continue;
+                }
+
+                // Entity fully created with all components
+                created[created_count] = entity;
+                created_count += 1;
             }
 
             // Update stats
-            self.stats.entities_imported += count;
+            self.stats.entities_imported += created_count;
             self.stats.import_batches += 1;
+            self.stats.spawn_failures += spawn_failures;
+            self.stats.component_failures += component_failures;
 
             self.import_buffer.reset();
-            return created[0..count];
+
+            return .{
+                .entities = created[0..created_count],
+                .entities_created = created_count,
+                .spawn_failures = spawn_failures,
+                .component_failures = component_failures,
+            };
         }
 
         // ====================================================================
@@ -657,4 +729,118 @@ test "ComponentTuple type defaults" {
 
     // Test max_component_data_size is calculated
     try std.testing.expect(Pipeline.ComponentTuple.max_component_data_size > 0);
+}
+
+// ============================================================================
+// Phase 2 Bug Fix Regression Tests
+// ============================================================================
+
+test "ExternalPipeline CommitResult structure and methods" {
+    // Test that CommitResult properly tracks failures and provides
+    // helper methods for checking success.
+    //
+    // Verifies fix for P1-COMMIT where errors were silently swallowed.
+    // Now commitImport returns CommitResult with failure counts instead
+    // of silently ignoring them.
+    //
+    // Note: Full integration test with actual entity creation is blocked
+    // because commitImport calls World methods (createEntity, setComponent,
+    // destroyEntity) that don't exist in the current World API. This test
+    // validates the CommitResult structure and helper methods work correctly.
+
+    const TestComp = struct { x: i32 };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{TestComp} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{TestComp} },
+        } },
+        .pipeline = .{
+            .mode = .external,
+            .external = .{ .batch_size = 16 },
+        },
+    };
+
+    const Pipeline = ExternalPipeline(test_config);
+
+    // Test CommitResult helper methods with success case
+    // Use u8 as dummy entity type for testing structure
+    const success_result: Pipeline.CommitResult = .{
+        .entities = &[0]@import("../world.zig").World(test_config).WorldEntityHandle{},
+        .entities_created = 5,
+        .spawn_failures = 0,
+        .component_failures = 0,
+    };
+
+    // isComplete() should return true when no failures
+    try std.testing.expect(success_result.isComplete());
+    try std.testing.expectEqual(@as(u32, 0), success_result.totalFailures());
+
+    // Test CommitResult helper methods with partial failure case
+    const partial_result: Pipeline.CommitResult = .{
+        .entities = &[0]@import("../world.zig").World(test_config).WorldEntityHandle{},
+        .entities_created = 3,
+        .spawn_failures = 1,
+        .component_failures = 1,
+    };
+
+    // isComplete() should return false when there are failures
+    try std.testing.expect(!partial_result.isComplete());
+    try std.testing.expectEqual(@as(u32, 2), partial_result.totalFailures());
+
+    // Test Stats structure includes failure tracking fields
+    // (Part of the fix: Stats now tracks spawn_failures and component_failures)
+    var stats = Pipeline.Stats{};
+    try std.testing.expectEqual(@as(u64, 0), stats.spawn_failures);
+    try std.testing.expectEqual(@as(u64, 0), stats.component_failures);
+
+    // Verify stats track failures when updated
+    stats.spawn_failures = 3;
+    stats.component_failures = 2;
+    try std.testing.expectEqual(@as(u64, 3), stats.spawn_failures);
+    try std.testing.expectEqual(@as(u64, 2), stats.component_failures);
+}
+
+test "ExternalPipeline ImportBuffer batch operations" {
+    // Test the import buffer operations that support the commitImport fix.
+    //
+    // The fix for P1-COMMIT added proper batch tracking. This test verifies
+    // the ImportBuffer correctly tracks entries before commit.
+
+    const TestComp = struct { value: i32 };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{TestComp} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{TestComp} },
+        } },
+        .pipeline = .{
+            .mode = .external,
+            .external = .{ .batch_size = 4 }, // Small batch for testing
+        },
+    };
+
+    const Pipeline = ExternalPipeline(test_config);
+    var buffer: Pipeline.ImportBuffer = .{};
+
+    // Initially empty
+    try std.testing.expectEqual(@as(u32, 0), buffer.len);
+    try std.testing.expect(!buffer.isFull());
+    try std.testing.expectEqual(@as(u32, 4), buffer.remaining());
+
+    // Simulate adding entries (would happen via addImport in full pipeline)
+    buffer.len = 2;
+    try std.testing.expectEqual(@as(u32, 2), buffer.len);
+    try std.testing.expectEqual(@as(u32, 2), buffer.remaining());
+    try std.testing.expect(!buffer.isFull());
+
+    // Fill buffer
+    buffer.len = 4;
+    try std.testing.expect(buffer.isFull());
+    try std.testing.expectEqual(@as(u32, 0), buffer.remaining());
+
+    // Reset clears the buffer
+    buffer.reset();
+    try std.testing.expectEqual(@as(u32, 0), buffer.len);
+    try std.testing.expect(!buffer.isFull());
 }

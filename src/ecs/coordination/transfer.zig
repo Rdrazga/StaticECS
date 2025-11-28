@@ -135,18 +135,33 @@ pub fn EntityTransfer(comptime cfg: WorldConfig) type {
         }
 
         /// Pack a component into the transfer data.
-        /// Returns false if buffer is full.
+        /// Uses FIXED OFFSET based on component index (not call order) to ensure
+        /// correct pack/unpack regardless of the order components are packed.
+        /// Returns false if component type is invalid or buffer overflow would occur.
+        ///
+        /// Tiger Style: Fixed offsets computed at comptime ensure deterministic layout.
         pub fn packComponent(self: *Self, comptime T: type, value: T) bool {
             const comp_idx = comptime getComponentIndex(T);
             if (comp_idx == null) return false;
 
+            // Use fixed offset based on component index, not current data_len
+            const offset = comptime getComponentOffset(T);
             const size = @sizeOf(T);
-            if (self.data_len + size > max_component_size) return false;
 
-            // Copy component bytes
+            // Assert: offset + size must fit in buffer (comptime-verified but runtime check for safety)
+            std.debug.assert(offset + size <= max_component_size);
+            // Assert: component should not already be packed (double-pack is a logic error)
+            std.debug.assert((self.component_mask & (@as(ComponentMask, 1) << @intCast(comp_idx.?))) == 0);
+
+            // Copy component bytes at fixed offset
             const bytes = std.mem.asBytes(&value);
-            @memcpy(self.data[self.data_len..][0..size], bytes);
-            self.data_len += @intCast(size);
+            @memcpy(self.data[offset..][0..size], bytes);
+
+            // Track maximum extent of data written for serialization efficiency
+            const end_pos: u16 = @intCast(offset + size);
+            if (end_pos > self.data_len) {
+                self.data_len = end_pos;
+            }
 
             // Set bit in mask
             self.component_mask |= @as(ComponentMask, 1) << @intCast(comp_idx.?);
@@ -161,28 +176,28 @@ pub fn EntityTransfer(comptime cfg: WorldConfig) type {
         }
 
         /// Unpack a component from transfer data.
-        /// Returns null if component not present.
+        /// Uses FIXED OFFSET based on component index to ensure correct data retrieval
+        /// regardless of the order components were packed.
+        /// Returns null if component not present in this transfer.
+        ///
+        /// Tiger Style: Fixed offsets ensure pack order independence.
         pub fn unpackComponent(self: *const Self, comptime T: type) ?T {
             const comp_idx = comptime getComponentIndex(T);
             if (comp_idx == null) return null;
 
-            // Check if component is present
+            // Check if component is present via mask
             if ((self.component_mask & (@as(ComponentMask, 1) << @intCast(comp_idx.?))) == 0) {
                 return null;
             }
 
-            // Calculate offset by summing sizes of preceding components
-            var offset: usize = 0;
-            inline for (cfg.components.types, 0..) |CompT, i| {
-                if (i >= comp_idx.?) break;
-                if ((self.component_mask & (@as(ComponentMask, 1) << @intCast(i))) != 0) {
-                    offset += @sizeOf(CompT);
-                }
-            }
-
-            // Read component
+            // Use fixed offset based on component index (matches packComponent)
+            const offset = comptime getComponentOffset(T);
             const size = @sizeOf(T);
-            if (offset + size > self.data_len) return null;
+
+            // Assert: offset + size must be within buffer bounds
+            std.debug.assert(offset + size <= max_component_size);
+            // Assert: data_len should cover this component's range (it was packed)
+            std.debug.assert(offset + size <= self.data_len);
 
             return std.mem.bytesAsValue(T, self.data[offset..][0..size]).*;
         }
@@ -193,6 +208,22 @@ pub fn EntityTransfer(comptime cfg: WorldConfig) type {
                 if (CompT == T) return i;
             }
             return null;
+        }
+
+        /// Get the fixed byte offset for a component type (comptime).
+        /// Each component has a predetermined offset based on its index,
+        /// calculated by summing sizes of ALL components with lower indices.
+        /// This ensures pack/unpack order independence.
+        ///
+        /// Tiger Style: Comptime computation guarantees zero runtime overhead.
+        fn getComponentOffset(comptime T: type) usize {
+            const comp_idx = getComponentIndex(T) orelse @compileError("Unknown component type");
+            var offset: usize = 0;
+            inline for (cfg.components.types, 0..) |CompT, i| {
+                if (i >= comp_idx) break;
+                offset += @sizeOf(CompT);
+            }
+            return offset;
         }
 
         /// Get total size of this transfer packet
@@ -372,6 +403,88 @@ test "EntityTransfer max data size" {
     try std.testing.expect(Transfer.max_data_size >= @sizeOf(Large) + @sizeOf(Small));
 }
 
+test "Transfer: out-of-order pack/unpack" {
+    // This test verifies the fix for P1-TRANSFER bug where packing components
+    // out of index order would cause data corruption during unpack.
+    //
+    // Components: A (index 0), B (index 1), C (index 2)
+    // Pack order: C first, then A (out of index order)
+    // Expected: Unpack should correctly retrieve A and C values
+
+    const A = struct { value: u32 };
+    const B = struct { value: u64 };
+    const C = struct { value: u16, flag: bool };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ A, B, C } },
+    };
+
+    const Transfer = EntityTransfer(cfg);
+
+    // Test 1: Pack out of index order (C first, then A)
+    {
+        var transfer = Transfer.init(0, 1);
+
+        // Pack C (index 2) FIRST
+        try std.testing.expect(transfer.packComponent(C, .{ .value = 0xCAFE, .flag = true }));
+        // Pack A (index 0) SECOND - out of order!
+        try std.testing.expect(transfer.packComponent(A, .{ .value = 0xDEADBEEF }));
+
+        // Verify presence
+        try std.testing.expect(transfer.hasComponent(A));
+        try std.testing.expect(!transfer.hasComponent(B));
+        try std.testing.expect(transfer.hasComponent(C));
+
+        // Unpack A - should get correct value despite being packed second
+        const a = transfer.unpackComponent(A).?;
+        try std.testing.expectEqual(@as(u32, 0xDEADBEEF), a.value);
+
+        // Unpack C - should get correct value despite being packed first
+        const c = transfer.unpackComponent(C).?;
+        try std.testing.expectEqual(@as(u16, 0xCAFE), c.value);
+        try std.testing.expect(c.flag);
+
+        // B should not be present
+        try std.testing.expectEqual(@as(?B, null), transfer.unpackComponent(B));
+    }
+
+    // Test 2: Pack in reverse index order (C, B, A)
+    {
+        var transfer = Transfer.init(1, 2);
+
+        // Pack in complete reverse order
+        try std.testing.expect(transfer.packComponent(C, .{ .value = 333, .flag = false }));
+        try std.testing.expect(transfer.packComponent(B, .{ .value = 222 }));
+        try std.testing.expect(transfer.packComponent(A, .{ .value = 111 }));
+
+        // Unpack in index order and verify
+        const a = transfer.unpackComponent(A).?;
+        try std.testing.expectEqual(@as(u32, 111), a.value);
+
+        const b = transfer.unpackComponent(B).?;
+        try std.testing.expectEqual(@as(u64, 222), b.value);
+
+        const c = transfer.unpackComponent(C).?;
+        try std.testing.expectEqual(@as(u16, 333), c.value);
+        try std.testing.expect(!c.flag);
+    }
+
+    // Test 3: Pack middle component only
+    {
+        var transfer = Transfer.init(2, 3);
+
+        // Only pack B (middle component)
+        try std.testing.expect(transfer.packComponent(B, .{ .value = 0x123456789ABCDEF0 }));
+
+        try std.testing.expect(!transfer.hasComponent(A));
+        try std.testing.expect(transfer.hasComponent(B));
+        try std.testing.expect(!transfer.hasComponent(C));
+
+        const b = transfer.unpackComponent(B).?;
+        try std.testing.expectEqual(@as(u64, 0x123456789ABCDEF0), b.value);
+    }
+}
+
 test "TransferQueue creation" {
     const Pos = struct { x: f32 };
 
@@ -387,4 +500,206 @@ test "TransferQueue creation" {
     const QueueType = TransferQueue(cfg);
     const queue = QueueType.init();
     try std.testing.expect(queue.getCapacity() == 64);
+}
+
+// ============================================================================
+// Extended Transfer Tests (Task: Add Coordination Module Tests)
+// ============================================================================
+
+test "EntityTransfer: full round-trip serialization" {
+    // Test complete entity transfer cycle with multiple components.
+    // Simulates transfer from world 0 (accept) to world 1 (io).
+    const Position = struct { x: f32, y: f32, z: f32 };
+    const Velocity = struct { dx: f32, dy: f32, dz: f32 };
+    const Health = struct { current: u32, max: u32 };
+    const Name = struct { id: u64, len: u8 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Position, Velocity, Health, Name } },
+    };
+
+    const Transfer = EntityTransfer(cfg);
+
+    // Step 1: Create transfer with source/target world IDs
+    var transfer = Transfer.init(0, 1);
+    try std.testing.expectEqual(@as(u8, 0), transfer.source_world);
+    try std.testing.expectEqual(@as(u8, 1), transfer.target_world);
+
+    // Step 2: Pack multiple components with various data
+    const pos = Position{ .x = 100.5, .y = 200.25, .z = -50.0 };
+    const vel = Velocity{ .dx = 1.0, .dy = -0.5, .dz = 0.0 };
+    const health = Health{ .current = 80, .max = 100 };
+
+    try std.testing.expect(transfer.packComponent(Position, pos));
+    try std.testing.expect(transfer.packComponent(Velocity, vel));
+    try std.testing.expect(transfer.packComponent(Health, health));
+    // Note: Name is NOT packed (simulating partial transfer)
+
+    // Step 3: Verify component mask is correct
+    try std.testing.expect(transfer.hasComponent(Position));
+    try std.testing.expect(transfer.hasComponent(Velocity));
+    try std.testing.expect(transfer.hasComponent(Health));
+    try std.testing.expect(!transfer.hasComponent(Name)); // Not packed
+
+    // Step 4: Unpack each component
+    const unpacked_pos = transfer.unpackComponent(Position).?;
+    const unpacked_vel = transfer.unpackComponent(Velocity).?;
+    const unpacked_health = transfer.unpackComponent(Health).?;
+
+    // Step 5: Verify all data matches original values
+    try std.testing.expectApproxEqRel(@as(f32, 100.5), unpacked_pos.x, 0.001);
+    try std.testing.expectApproxEqRel(@as(f32, 200.25), unpacked_pos.y, 0.001);
+    try std.testing.expectApproxEqRel(@as(f32, -50.0), unpacked_pos.z, 0.001);
+
+    try std.testing.expectApproxEqRel(@as(f32, 1.0), unpacked_vel.dx, 0.001);
+    try std.testing.expectApproxEqRel(@as(f32, -0.5), unpacked_vel.dy, 0.001);
+    try std.testing.expectApproxEqRel(@as(f32, 0.0), unpacked_vel.dz, 0.001);
+
+    try std.testing.expectEqual(@as(u32, 80), unpacked_health.current);
+    try std.testing.expectEqual(@as(u32, 100), unpacked_health.max);
+
+    // Step 6: Verify unpacking non-packed components returns null
+    try std.testing.expectEqual(@as(?Name, null), transfer.unpackComponent(Name));
+}
+
+test "EntityTransfer: transfer flags behavior" {
+    // Test that transfer flags are properly set and preserved.
+    const Data = struct { value: u32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Data} },
+    };
+
+    const Transfer = EntityTransfer(cfg);
+    var transfer = Transfer.init(0, 1);
+
+    // Default flags
+    try std.testing.expect(!transfer.flags.destroy_on_arrive);
+    try std.testing.expect(!transfer.flags.priority);
+    try std.testing.expect(transfer.flags.full_transfer);
+
+    // Modify flags
+    transfer.flags.destroy_on_arrive = true;
+    transfer.flags.priority = true;
+    transfer.flags.full_transfer = false;
+
+    // Set generation for validation
+    transfer.generation = 42;
+
+    // Pack some data
+    _ = transfer.packComponent(Data, .{ .value = 123 });
+
+    // Verify flags persist
+    try std.testing.expect(transfer.flags.destroy_on_arrive);
+    try std.testing.expect(transfer.flags.priority);
+    try std.testing.expect(!transfer.flags.full_transfer);
+    try std.testing.expectEqual(@as(u16, 42), transfer.generation);
+
+    // Reset clears flags but preserves source/target
+    transfer.reset();
+    try std.testing.expect(!transfer.flags.destroy_on_arrive);
+    try std.testing.expect(!transfer.flags.priority);
+    try std.testing.expect(transfer.flags.full_transfer);
+    try std.testing.expectEqual(@as(u16, 0), transfer.generation);
+    try std.testing.expectEqual(@as(u8, 0), transfer.source_world);
+    try std.testing.expectEqual(@as(u8, 1), transfer.target_world);
+}
+
+test "EntityTransfer: component size boundaries" {
+    // Test transfers with components of various sizes.
+    const Tiny = struct { byte: u8 };
+    const Small = struct { x: u16, y: u16 };
+    const Medium = struct { data: [16]u8 };
+    const Large = struct { matrix: [4][4]f32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Tiny, Small, Medium, Large } },
+    };
+
+    const Transfer = EntityTransfer(cfg);
+    var transfer = Transfer.init(2, 3);
+
+    // Pack all components
+    try std.testing.expect(transfer.packComponent(Tiny, .{ .byte = 0xFF }));
+    try std.testing.expect(transfer.packComponent(Small, .{ .x = 1000, .y = 2000 }));
+    try std.testing.expect(transfer.packComponent(Medium, .{ .data = [_]u8{0xAA} ** 16 }));
+
+    var matrix: [4][4]f32 = undefined;
+    for (&matrix, 0..) |*row, i| {
+        for (row, 0..) |*val, j| {
+            val.* = @floatFromInt(i * 4 + j);
+        }
+    }
+    try std.testing.expect(transfer.packComponent(Large, .{ .matrix = matrix }));
+
+    // Unpack and verify
+    const tiny = transfer.unpackComponent(Tiny).?;
+    try std.testing.expectEqual(@as(u8, 0xFF), tiny.byte);
+
+    const small = transfer.unpackComponent(Small).?;
+    try std.testing.expectEqual(@as(u16, 1000), small.x);
+    try std.testing.expectEqual(@as(u16, 2000), small.y);
+
+    const medium = transfer.unpackComponent(Medium).?;
+    try std.testing.expectEqual(@as(u8, 0xAA), medium.data[0]);
+    try std.testing.expectEqual(@as(u8, 0xAA), medium.data[15]);
+
+    const large = transfer.unpackComponent(Large).?;
+    try std.testing.expectApproxEqRel(@as(f32, 0.0), large.matrix[0][0], 0.001);
+    try std.testing.expectApproxEqRel(@as(f32, 15.0), large.matrix[3][3], 0.001);
+}
+
+test "EntityTransfer: totalSize calculation" {
+    // Test that totalSize correctly reports the effective transfer size.
+    const A = struct { a: u32 };
+    const B = struct { b: u64 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ A, B } },
+    };
+
+    const Transfer = EntityTransfer(cfg);
+    var transfer = Transfer.init(0, 1);
+
+    // Initial size (header only, no data)
+    const initial_size = transfer.totalSize();
+    try std.testing.expectEqual(@as(u16, 0), transfer.data_len);
+
+    // Pack A - size should increase
+    _ = transfer.packComponent(A, .{ .a = 1 });
+    try std.testing.expect(transfer.data_len > 0);
+    try std.testing.expect(transfer.totalSize() > initial_size);
+
+    // Pack B - size should increase more
+    const size_after_a = transfer.totalSize();
+    _ = transfer.packComponent(B, .{ .b = 2 });
+    try std.testing.expect(transfer.totalSize() > size_after_a);
+}
+
+test "SPSCTransferQueue creation" {
+    // Test SPSC queue variant for single producer/consumer scenarios.
+    const Data = struct { id: u32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Data} },
+        .coordination = .{
+            .transfer_queue = .{ .capacity = 32 },
+        },
+    };
+
+    const SPSCQueueType = SPSCTransferQueue(cfg);
+    var queue = SPSCQueueType.init();
+
+    try std.testing.expectEqual(@as(usize, 32), queue.getCapacity());
+    try std.testing.expect(queue.isEmpty());
+
+    // Push a transfer
+    const Transfer = EntityTransfer(cfg);
+    var t = Transfer.init(0, 1);
+    _ = t.packComponent(Data, .{ .id = 999 });
+    try std.testing.expect(queue.push(t));
+
+    // Pop and verify
+    const received = queue.pop().?;
+    try std.testing.expectEqual(@as(u32, 999), received.unpackComponent(Data).?.id);
 }

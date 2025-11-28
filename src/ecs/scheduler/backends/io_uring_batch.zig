@@ -113,6 +113,10 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         pending_ops: [max_pending]PendingOp,
         pending_count: u16,
 
+        /// Whether io_uring was successfully initialized.
+        /// When false, operates in degraded mode (no syscall batching).
+        io_uring_active: bool,
+
         /// Represents a pending I/O operation.
         pub const PendingOp = struct {
             /// System index that initiated this operation.
@@ -163,7 +167,13 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         };
 
         /// Initialize the io_uring batch backend.
-        pub fn init(allocator: Allocator, trace_sink: ?TraceSink) !Self {
+        ///
+        /// This function is infallible to maintain interface consistency with other backends.
+        /// If io_uring initialization fails, the backend operates in degraded mode where
+        /// I/O batching is disabled and operations proceed without syscall batching.
+        ///
+        /// Tiger Style: Graceful degradation - optional feature failure doesn't block operation.
+        pub fn init(allocator: Allocator, trace_sink: ?TraceSink) Self {
             var self = Self{
                 .allocator = allocator,
                 .trace_sink = trace_sink,
@@ -172,6 +182,7 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                 .ring = undefined,
                 .pending_ops = [_]PendingOp{PendingOp.init()} ** max_pending,
                 .pending_count = 0,
+                .io_uring_active = false,
             };
 
             if (io_uring_available) {
@@ -181,7 +192,14 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                     flags |= std.os.linux.IORING_SETUP_SQPOLL;
                 }
 
-                self.ring = try std.os.linux.IoUring.init(batch_cfg.sq_entries, flags);
+                // Attempt io_uring init - on failure, operate in degraded mode
+                self.ring = std.os.linux.IoUring.init(batch_cfg.sq_entries, flags) catch {
+                    // io_uring unavailable (permission denied, kernel too old, etc.)
+                    // Continue in degraded mode - systems still execute, just without batching
+                    return self;
+                };
+
+                self.io_uring_active = true;
 
                 // Set SQ thread CPU affinity if configured
                 if (batch_cfg.kernel_poll and batch_cfg.sq_thread_cpu != null) {
@@ -195,7 +213,7 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
 
         /// Clean up resources.
         pub fn deinit(self: *Self) void {
-            if (io_uring_available) {
+            if (io_uring_available and self.io_uring_active) {
                 self.ring.deinit();
             }
         }
@@ -292,6 +310,7 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             self.tick_count = 0;
             self.pending_count = 0;
             self.stats.reset();
+            // Note: io_uring_active state is preserved - it reflects hardware capability
         }
 
         /// Get backend statistics.
@@ -375,7 +394,7 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
 
         /// Submit all pending operations to io_uring.
         fn submitBatch(self: *Self) u64 {
-            if (!io_uring_available) return 0;
+            if (!io_uring_available or !self.io_uring_active) return 0;
 
             var submitted: u64 = 0;
 
@@ -410,7 +429,7 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
 
         /// Process completed operations from io_uring.
         fn processCompletions(self: *Self) void {
-            if (!io_uring_available) return;
+            if (!io_uring_available or !self.io_uring_active) return;
 
             // Wait for at least some completions if we have pending ops
             if (self.pending_count > 0) {

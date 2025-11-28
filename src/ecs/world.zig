@@ -248,19 +248,17 @@ pub fn World(comptime cfg: WorldConfig) type {
                     const moved_entity = table.removeEntityByRow(meta.archetype_row);
 
                     // If another entity was moved, update its metadata
+                    // O(1) direct lookup using the moved entity's index (not O(n) linear search)
                     if (moved_entity) |moved_id| {
-                        // Find and update the moved entity's metadata
-                        for (&self.entities.metadata) |*m| {
-                            if (m.alive and m.archetype_index == i) {
-                                // Check if this entity was at the last row
-                                const last_row = table.len();
-                                if (m.archetype_row == last_row) {
-                                    m.archetype_row = meta.archetype_row;
-                                    break;
-                                }
-                            }
-                        }
-                        _ = moved_id;
+                        const moved_index = moved_id.index;
+                        var moved_meta = &self.entities.metadata[moved_index];
+
+                        // Tiger Style: Assert invariants before update
+                        std.debug.assert(moved_meta.alive); // Moved entity must be alive
+                        std.debug.assert(moved_meta.archetype_index == i); // Must be in same archetype
+
+                        // Update to point to the vacated row (where despawned entity was)
+                        moved_meta.archetype_row = meta.archetype_row;
                     }
                     break;
                 }
@@ -405,17 +403,33 @@ pub fn World(comptime cfg: WorldConfig) type {
                     inline for (0..archetype_count) |i| {
                         if (self.current_archetype == i) {
                             const table = &self.world.storage[i];
+                            // Get archetype's component types for optional component checks
+                            const arch_components = cfg.archetypes.archetypes[i].components;
 
                             result.entity_id = table.getEntityId(self.current_row).?;
 
+                            // Required read components - always present (query matched)
                             inline for (0..Spec.read_components.len) |read_idx| {
                                 const T = Spec.read_components[read_idx];
                                 result.read[read_idx] = table.getComponentConst(T, self.current_row).?;
                             }
 
+                            // Required write components - always present (query matched)
                             inline for (0..Spec.write_components.len) |write_idx| {
                                 const T = Spec.write_components[write_idx];
                                 result.write[write_idx] = table.getComponent(T, self.current_row).?;
+                            }
+
+                            // Optional components - may or may not be present in this archetype.
+                            // Unlike required components, optional components don't affect query matching,
+                            // so we must check each archetype individually and return null if absent.
+                            inline for (0..Spec.optional_components.len) |opt_idx| {
+                                const T = Spec.optional_components[opt_idx];
+                                if (Spec.archetypeHasOptional(arch_components, T)) {
+                                    result.optional[opt_idx] = table.getComponentConst(T, self.current_row);
+                                } else {
+                                    result.optional[opt_idx] = null;
+                                }
                             }
 
                             return result;
@@ -988,4 +1002,137 @@ test "World component modification" {
     // Modify via setComponent
     try std.testing.expect(world.setComponent(e, Value, .{ .v = 200 }));
     try std.testing.expectEqual(@as(i32, 200), world.getComponent(e, Value).?.v);
+}
+
+test "World: despawn swap-remove metadata correctness" {
+    // Regression test for P1-DESPAWN bug fix
+    // When despawning an entity in the middle, swap-remove moves the last entity
+    // into the vacated slot. The moved entity's metadata must be updated correctly.
+    const Position = struct { x: f32, y: f32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "static", .components = &.{Position} },
+        } },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const TestWorld = World(cfg);
+    var world = TestWorld.init(std.testing.allocator);
+    defer world.deinit();
+
+    // Spawn 3 entities: e1, e2, e3 (in that order)
+    // Storage layout: [e1:row0, e2:row1, e3:row2]
+    const e1 = try world.spawn("static", .{Position{ .x = 1.0, .y = 1.0 }});
+    const e2 = try world.spawn("static", .{Position{ .x = 2.0, .y = 2.0 }});
+    const e3 = try world.spawn("static", .{Position{ .x = 3.0, .y = 3.0 }});
+
+    try std.testing.expectEqual(@as(u32, 3), world.entityCount());
+
+    // Verify initial positions
+    try std.testing.expectEqual(@as(f32, 1.0), world.getComponent(e1, Position).?.x);
+    try std.testing.expectEqual(@as(f32, 2.0), world.getComponent(e2, Position).?.x);
+    try std.testing.expectEqual(@as(f32, 3.0), world.getComponent(e3, Position).?.x);
+
+    // Despawn e2 - this triggers swap-remove
+    // e3 (last) should be moved into e2's slot (row 1)
+    // Storage layout after: [e1:row0, e3:row1]
+    try world.despawn(e2);
+
+    // Tiger Style: Postcondition assertions
+    try std.testing.expectEqual(@as(u32, 2), world.entityCount());
+
+    // e2 is now invalid
+    try std.testing.expect(!world.isAlive(e2));
+    try std.testing.expectEqual(@as(?*const Position, null), world.getComponent(e2, Position));
+
+    // CRITICAL: e3 must still be accessible with correct data
+    // This is the core regression test - if metadata update is wrong, this fails
+    try std.testing.expect(world.isAlive(e3));
+    const e3_pos = world.getComponent(e3, Position);
+    try std.testing.expect(e3_pos != null);
+    try std.testing.expectEqual(@as(f32, 3.0), e3_pos.?.x);
+    try std.testing.expectEqual(@as(f32, 3.0), e3_pos.?.y);
+
+    // e1 should be unchanged
+    try std.testing.expect(world.isAlive(e1));
+    try std.testing.expectEqual(@as(f32, 1.0), world.getComponent(e1, Position).?.x);
+
+    // Verify world consistency
+    try std.testing.expect(world.verify());
+}
+
+test "World: despawn first entity swap-remove" {
+    // Test despawning the first entity to verify edge case handling
+    const Health = struct { hp: i32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Health} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "units", .components = &.{Health} },
+        } },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const TestWorld = World(cfg);
+    var world = TestWorld.init(std.testing.allocator);
+    defer world.deinit();
+
+    // Spawn 3 entities
+    const e1 = try world.spawn("units", .{Health{ .hp = 100 }});
+    const e2 = try world.spawn("units", .{Health{ .hp = 200 }});
+    const e3 = try world.spawn("units", .{Health{ .hp = 300 }});
+
+    // Despawn first entity - e3 moves to row 0
+    try world.despawn(e1);
+
+    try std.testing.expectEqual(@as(u32, 2), world.entityCount());
+    try std.testing.expect(!world.isAlive(e1));
+
+    // e2 and e3 should still be accessible with correct data
+    try std.testing.expect(world.isAlive(e2));
+    try std.testing.expect(world.isAlive(e3));
+    try std.testing.expectEqual(@as(i32, 200), world.getComponent(e2, Health).?.hp);
+    try std.testing.expectEqual(@as(i32, 300), world.getComponent(e3, Health).?.hp);
+
+    // Verify world consistency
+    try std.testing.expect(world.verify());
+}
+
+test "World: despawn last entity no swap" {
+    // Test despawning the last entity - no swap should occur
+    const Tag = struct { id: u32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Tag} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "tagged", .components = &.{Tag} },
+        } },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const TestWorld = World(cfg);
+    var world = TestWorld.init(std.testing.allocator);
+    defer world.deinit();
+
+    // Spawn 3 entities
+    const e1 = try world.spawn("tagged", .{Tag{ .id = 1 }});
+    const e2 = try world.spawn("tagged", .{Tag{ .id = 2 }});
+    const e3 = try world.spawn("tagged", .{Tag{ .id = 3 }});
+
+    // Despawn last entity - no swap needed
+    try world.despawn(e3);
+
+    try std.testing.expectEqual(@as(u32, 2), world.entityCount());
+    try std.testing.expect(!world.isAlive(e3));
+
+    // e1 and e2 should be unchanged
+    try std.testing.expect(world.isAlive(e1));
+    try std.testing.expect(world.isAlive(e2));
+    try std.testing.expectEqual(@as(u32, 1), world.getComponent(e1, Tag).?.id);
+    try std.testing.expectEqual(@as(u32, 2), world.getComponent(e2, Tag).?.id);
+
+    // Verify world consistency
+    try std.testing.expect(world.verify());
 }

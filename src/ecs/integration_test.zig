@@ -1033,3 +1033,321 @@ test "execution model comparison - same world logic, different models" {
         try testing.expect(result.isSuccess());
     }
 }
+
+// ============================================================================
+// Regression Test: Despawn Swap-Remove Metadata Correctness
+// ============================================================================
+
+test "despawn swap-remove correctly updates moved entity metadata" {
+    // This test verifies the fix for P1-WORLD bug where after swap-remove during
+    // despawn, entity metadata was incorrectly updated using O(n) linear search
+    // instead of using moved_id.index directly.
+    //
+    // The bug: After despawning an entity, the last entity in the archetype is
+    // swapped into the vacated slot. The swapped entity's metadata must be updated
+    // to reflect its new row position. The fix uses O(1) direct index lookup
+    // via moved_id.index instead of O(n) linear search.
+
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    // Spawn 3 entities in the same archetype with distinct values
+    // Using "moving" archetype which has Position and Velocity
+    const e1 = try world.spawn("moving", .{
+        Position{ .x = 1.0, .y = 1.0, .z = 1.0 },
+        Velocity{ .dx = 10.0, .dy = 10.0, .dz = 10.0 },
+    });
+    const e2 = try world.spawn("moving", .{
+        Position{ .x = 2.0, .y = 2.0, .z = 2.0 },
+        Velocity{ .dx = 20.0, .dy = 20.0, .dz = 20.0 },
+    });
+    const e3 = try world.spawn("moving", .{
+        Position{ .x = 3.0, .y = 3.0, .z = 3.0 },
+        Velocity{ .dx = 30.0, .dy = 30.0, .dz = 30.0 },
+    });
+
+    // Precondition: All 3 entities alive and have correct data
+    try testing.expectEqual(@as(u32, 3), world.entityCount());
+    try testing.expect(world.isAlive(e1));
+    try testing.expect(world.isAlive(e2));
+    try testing.expect(world.isAlive(e3));
+
+    // Verify initial component values
+    try testing.expectEqual(@as(f32, 1.0), world.getComponent(e1, Position).?.x);
+    try testing.expectEqual(@as(f32, 2.0), world.getComponent(e2, Position).?.x);
+    try testing.expectEqual(@as(f32, 3.0), world.getComponent(e3, Position).?.x);
+
+    // Despawn middle entity (e2)
+    // After despawn: e3's data should be swapped into e2's old slot (row 1)
+    // The metadata for e3 must be updated to point to row 1
+    try world.despawn(e2);
+
+    // Postcondition 1: e2 no longer alive
+    try testing.expect(!world.isAlive(e2));
+    try testing.expectEqual(@as(u32, 2), world.entityCount());
+
+    // Postcondition 2: e1 still alive with correct data
+    try testing.expect(world.isAlive(e1));
+    const e1_pos = world.getComponent(e1, Position).?.*;
+    try testing.expectEqual(@as(f32, 1.0), e1_pos.x);
+    try testing.expectEqual(@as(f32, 1.0), e1_pos.y);
+    try testing.expectEqual(@as(f32, 1.0), e1_pos.z);
+
+    // Postcondition 3: e3 still alive with CORRECT data (not e2's data!)
+    // This is the critical check - if metadata wasn't updated correctly,
+    // e3's handle would point to wrong row and return wrong data or crash
+    try testing.expect(world.isAlive(e3));
+    const e3_pos = world.getComponent(e3, Position).?.*;
+    try testing.expectEqual(@as(f32, 3.0), e3_pos.x);
+    try testing.expectEqual(@as(f32, 3.0), e3_pos.y);
+    try testing.expectEqual(@as(f32, 3.0), e3_pos.z);
+
+    // Also verify velocity component for e3 (double-check metadata)
+    const e3_vel = world.getComponent(e3, Velocity).?.*;
+    try testing.expectEqual(@as(f32, 30.0), e3_vel.dx);
+    try testing.expectEqual(@as(f32, 30.0), e3_vel.dy);
+    try testing.expectEqual(@as(f32, 30.0), e3_vel.dz);
+
+    // Postcondition 4: Can spawn new entity and access all alive entities
+    const e4 = try world.spawn("moving", .{
+        Position{ .x = 4.0, .y = 4.0, .z = 4.0 },
+        Velocity{ .dx = 40.0, .dy = 40.0, .dz = 40.0 },
+    });
+
+    try testing.expectEqual(@as(u32, 3), world.entityCount());
+    try testing.expect(world.isAlive(e4));
+
+    // Final verification: all alive entities have correct values
+    try testing.expectEqual(@as(f32, 1.0), world.getComponent(e1, Position).?.x);
+    try testing.expectEqual(@as(f32, 3.0), world.getComponent(e3, Position).?.x);
+    try testing.expectEqual(@as(f32, 4.0), world.getComponent(e4, Position).?.x);
+
+    // Verify e2's handle is invalid
+    try testing.expect(world.getComponent(e2, Position) == null);
+}
+
+test "despawn swap-remove edge case: despawn last entity" {
+    // Test that despawning the last entity (no swap needed) works correctly
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    const e1 = try world.spawn("moving", .{
+        Position{ .x = 1.0, .y = 1.0, .z = 1.0 },
+        Velocity{ .dx = 10.0, .dy = 10.0, .dz = 10.0 },
+    });
+    const e2 = try world.spawn("moving", .{
+        Position{ .x = 2.0, .y = 2.0, .z = 2.0 },
+        Velocity{ .dx = 20.0, .dy = 20.0, .dz = 20.0 },
+    });
+
+    // Despawn last entity (e2) - no swap should occur
+    try world.despawn(e2);
+
+    try testing.expectEqual(@as(u32, 1), world.entityCount());
+    try testing.expect(world.isAlive(e1));
+    try testing.expect(!world.isAlive(e2));
+
+    // e1 should still have correct data
+    const e1_pos = world.getComponent(e1, Position).?.*;
+    try testing.expectEqual(@as(f32, 1.0), e1_pos.x);
+}
+
+test "despawn swap-remove edge case: despawn first entity" {
+    // Test that despawning the first entity (last swaps into position 0) works
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    const e1 = try world.spawn("moving", .{
+        Position{ .x = 1.0, .y = 1.0, .z = 1.0 },
+        Velocity{ .dx = 10.0, .dy = 10.0, .dz = 10.0 },
+    });
+    const e2 = try world.spawn("moving", .{
+        Position{ .x = 2.0, .y = 2.0, .z = 2.0 },
+        Velocity{ .dx = 20.0, .dy = 20.0, .dz = 20.0 },
+    });
+    const e3 = try world.spawn("moving", .{
+        Position{ .x = 3.0, .y = 3.0, .z = 3.0 },
+        Velocity{ .dx = 30.0, .dy = 30.0, .dz = 30.0 },
+    });
+
+    // Despawn first entity (e1) - e3 swaps into position 0
+    try world.despawn(e1);
+
+    try testing.expectEqual(@as(u32, 2), world.entityCount());
+    try testing.expect(!world.isAlive(e1));
+    try testing.expect(world.isAlive(e2));
+    try testing.expect(world.isAlive(e3));
+
+    // e2 should still have value 2
+    try testing.expectEqual(@as(f32, 2.0), world.getComponent(e2, Position).?.x);
+    // e3 should still have value 3 (its metadata should point to row 0 now)
+    try testing.expectEqual(@as(f32, 3.0), world.getComponent(e3, Position).?.x);
+}
+
+test "despawn swap-remove multiple sequential despawns" {
+    // Test multiple despawns in sequence with metadata integrity
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    // Spawn 5 entities
+    const e1 = try world.spawn("moving", .{
+        Position{ .x = 1.0, .y = 0, .z = 0 },
+        Velocity{ .dx = 0, .dy = 0, .dz = 0 },
+    });
+    const e2 = try world.spawn("moving", .{
+        Position{ .x = 2.0, .y = 0, .z = 0 },
+        Velocity{ .dx = 0, .dy = 0, .dz = 0 },
+    });
+    const e3 = try world.spawn("moving", .{
+        Position{ .x = 3.0, .y = 0, .z = 0 },
+        Velocity{ .dx = 0, .dy = 0, .dz = 0 },
+    });
+    const e4 = try world.spawn("moving", .{
+        Position{ .x = 4.0, .y = 0, .z = 0 },
+        Velocity{ .dx = 0, .dy = 0, .dz = 0 },
+    });
+    const e5 = try world.spawn("moving", .{
+        Position{ .x = 5.0, .y = 0, .z = 0 },
+        Velocity{ .dx = 0, .dy = 0, .dz = 0 },
+    });
+
+    try testing.expectEqual(@as(u32, 5), world.entityCount());
+
+    // Despawn e2 (e5 swaps to row 1)
+    try world.despawn(e2);
+    try testing.expectEqual(@as(u32, 4), world.entityCount());
+    try testing.expectEqual(@as(f32, 5.0), world.getComponent(e5, Position).?.x);
+
+    // Despawn e4 (e3 swaps to row 3, but e3 is at row 2, so actually e5 at row 1 would be end)
+    // Actually the archetype storage determines the new row based on its internal length
+    try world.despawn(e4);
+    try testing.expectEqual(@as(u32, 3), world.entityCount());
+
+    // Despawn e1
+    try world.despawn(e1);
+    try testing.expectEqual(@as(u32, 2), world.entityCount());
+
+    // e3 and e5 should still be accessible with correct values
+    try testing.expect(world.isAlive(e3));
+    try testing.expect(world.isAlive(e5));
+    try testing.expectEqual(@as(f32, 3.0), world.getComponent(e3, Position).?.x);
+    try testing.expectEqual(@as(f32, 5.0), world.getComponent(e5, Position).?.x);
+
+    // Dead entities should return null
+    try testing.expect(world.getComponent(e1, Position) == null);
+    try testing.expect(world.getComponent(e2, Position) == null);
+    try testing.expect(world.getComponent(e4, Position) == null);
+}
+
+// ============================================================================
+// Phase 2 Bug Fix Regression Tests
+// ============================================================================
+
+test "query iteration with optional components returns correct data" {
+    // Test that queries with optional components correctly return
+    // pointer when component exists, null when it doesn't.
+    //
+    // Verifies fix for P1-OPTIONAL where optional components were ignored
+    // in buildResult() - it now correctly checks each archetype for optional
+    // component presence.
+
+    // Create a custom config with archetypes that do and don't have Health
+    const OptionalTestConfig = WorldConfig{
+        .components = .{
+            .types = &.{ Position, Velocity, Health },
+        },
+        .archetypes = .{
+            .archetypes = &.{
+                // "with_optional": has Position, Velocity, Health
+                .{ .name = "with_optional", .components = &.{ Position, Velocity, Health } },
+                // "without_optional": has Position, Velocity (no Health)
+                .{ .name = "without_optional", .components = &.{ Position, Velocity } },
+            },
+        },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const OptionalWorld = ecs.World(OptionalTestConfig);
+    var world = OptionalWorld.init(testing.allocator);
+    defer world.deinit();
+
+    // Spawn entities in archetype WITH optional component (Health)
+    const e_with_1 = try world.spawn("with_optional", .{
+        Position{ .x = 1.0, .y = 1.0, .z = 1.0 },
+        Velocity{ .dx = 10.0, .dy = 0, .dz = 0 },
+        Health{ .current = 100, .max = 100 },
+    });
+    const e_with_2 = try world.spawn("with_optional", .{
+        Position{ .x = 2.0, .y = 2.0, .z = 2.0 },
+        Velocity{ .dx = 0, .dy = 10.0, .dz = 0 },
+        Health{ .current = 80, .max = 100 },
+    });
+
+    // Spawn entities in archetype WITHOUT optional component (no Health)
+    const e_without_1 = try world.spawn("without_optional", .{
+        Position{ .x = 3.0, .y = 3.0, .z = 3.0 },
+        Velocity{ .dx = 5.0, .dy = 5.0, .dz = 0 },
+    });
+    const e_without_2 = try world.spawn("without_optional", .{
+        Position{ .x = 4.0, .y = 4.0, .z = 4.0 },
+        Velocity{ .dx = 0, .dy = 0, .dz = 5.0 },
+    });
+
+    try testing.expectEqual(@as(u32, 4), world.entityCount());
+
+    // Define QuerySpec with Health as optional
+    const OptionalHealthQuery = struct {
+        pub const read_components = [_]type{Velocity};
+        pub const write_components = [_]type{Position};
+        pub const exclude_components = [_]type{};
+        pub const optional_components = [_]type{Health};
+
+        pub fn matchesArchetype(comptime components: []const type) bool {
+            var has_vel = false;
+            var has_pos = false;
+            inline for (components) |Comp| {
+                if (Comp == Velocity) has_vel = true;
+                if (Comp == Position) has_pos = true;
+            }
+            return has_vel and has_pos;
+        }
+
+        pub fn archetypeHasOptional(comptime components: []const type, comptime T: type) bool {
+            inline for (components) |C| {
+                if (C == T) return true;
+            }
+            return false;
+        }
+    };
+
+    var iter = world.query(OptionalHealthQuery);
+
+    // Track results
+    var with_health_count: u32 = 0;
+    var without_health_count: u32 = 0;
+    var total_health: u32 = 0;
+
+    while (iter.next()) |result| {
+        // Access optional Health component
+        if (result.optional[0]) |health_ptr| {
+            // Entity HAS the optional Health component
+            with_health_count += 1;
+            total_health += health_ptr.current;
+        } else {
+            // Entity does NOT have the optional Health component
+            without_health_count += 1;
+        }
+    }
+
+    // Verify the fix: optional components correctly return pointer or null
+    // based on whether the archetype has the component
+    try testing.expectEqual(@as(u32, 2), with_health_count); // e_with_1, e_with_2
+    try testing.expectEqual(@as(u32, 2), without_health_count); // e_without_1, e_without_2
+    try testing.expectEqual(@as(u32, 180), total_health); // 100 + 80
+
+    // Verify entities are still accessible by handle
+    try testing.expect(world.isAlive(e_with_1));
+    try testing.expect(world.isAlive(e_with_2));
+    try testing.expect(world.isAlive(e_without_1));
+    try testing.expect(world.isAlive(e_without_2));
+}

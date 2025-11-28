@@ -526,8 +526,10 @@ pub fn FrameExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
             const instant = std.time.Instant.now() catch return 0;
             // Return nanoseconds since epoch approximation using a base instant
             // For frame timing, we care about deltas, so this works
+            // Thread-local storage: each thread gets its own time base to avoid
+            // data races when multiple threads call this concurrently.
             const base = struct {
-                var value: ?std.time.Instant = null;
+                threadlocal var value: ?std.time.Instant = null;
             };
             if (base.value == null) {
                 base.value = instant;

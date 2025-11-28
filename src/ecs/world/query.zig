@@ -237,19 +237,21 @@ pub fn ArchetypeQueryIterator(comptime Spec: type, comptime Table: type) type {
 
             var result: Result = undefined;
 
-            // Get entity ID
-            result.entity_id = self.table.getEntityId(self.current_row).?;
+            // Get entity ID - invariant: valid rows always have entity IDs
+            result.entity_id = self.table.getEntityId(self.current_row) orelse unreachable;
 
             // Get read component pointers using tuple indexing
+            // Invariant: query only iterates archetypes containing required components
             inline for (Spec.read_components, 0..) |T, i| {
                 const ptr = self.table.getComponentConst(T, self.current_row);
-                result.read[i] = ptr.?;
+                result.read[i] = ptr orelse unreachable;
             }
 
             // Get write component pointers using tuple indexing
+            // Invariant: query only iterates archetypes containing required components
             inline for (Spec.write_components, 0..) |T, i| {
                 const ptr = self.table.getComponent(T, self.current_row);
-                result.write[i] = ptr.?;
+                result.write[i] = ptr orelse unreachable;
             }
 
             // Get optional component pointers (null if not in this archetype)

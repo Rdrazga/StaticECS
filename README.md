@@ -55,7 +55,7 @@ pub fn main() !void {
 
 ## Version
 
-**0.0.1-alpha** - Experimental
+**0.1.1** - Code Review Remediation Release
 
 ## Requirements
 

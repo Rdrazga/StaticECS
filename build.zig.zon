@@ -1,6 +1,6 @@
 .{
     .name = .StaticECS,
-    .version = "0.0.1",
+    .version = "0.1.1",
     .minimum_zig_version = "0.16.0-dev.1470+32dc46aae",
     .paths = .{ "build.zig", "src" },
     .fingerprint = 0xda68e083e789c6de,

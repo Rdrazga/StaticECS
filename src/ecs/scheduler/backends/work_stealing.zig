@@ -260,6 +260,10 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         };
 
         /// Per-worker state.
+        ///
+        /// Tiger Style: Each worker has its own command buffer to avoid data races
+        /// when multiple workers execute systems concurrently. Command buffers are
+        /// merged after each phase completes.
         pub const Worker = struct {
             /// Local work queue (Chase-Lev deque).
             local_queue: ChaseLevDeque(Task, local_queue_size),
@@ -275,6 +279,10 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             tasks_executed: u64,
             /// Tasks stolen by this worker.
             tasks_stolen: u64,
+            /// Per-worker command buffer to avoid race conditions when
+            /// multiple workers add commands concurrently.
+            /// Each worker writes to its own buffer, merged after phase.
+            command_buffer: CmdBuf,
 
             pub fn init(seed: u64) Worker {
                 return .{
@@ -285,6 +293,7 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                     .active = false,
                     .tasks_executed = 0,
                     .tasks_stolen = 0,
+                    .command_buffer = CmdBuf.init(),
                 };
             }
 
@@ -593,6 +602,11 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             // (In single-threaded mode, this processes everything)
             self.runWorkerLoop(0, ctx, policy, errors);
 
+            // Merge all per-worker command buffers into the main buffer.
+            // Tiger Style: Merge in worker order for deterministic command ordering.
+            // This ensures command execution order is stable across runs.
+            self.mergeWorkerCommands(ctx.commands);
+
             // Collect results
             result.systems_run = total_tasks;
             result.tasks_stolen = self.workers[0].tasks_stolen;
@@ -605,15 +619,34 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             return result;
         }
 
+        /// Worker loop that executes tasks from local queue, steals from others,
+        /// and uses a per-worker context to avoid data races.
+        ///
+        /// Tiger Style: Each worker has its own command buffer. Commands are merged
+        /// deterministically after phase completion to maintain execution order invariants.
         fn runWorkerLoop(
             self: *Self,
             worker_id: u16,
-            ctx: *SysCtx,
+            shared_ctx: *SysCtx,
             policy: FramePolicy,
             errors: *AggregateErrors,
         ) void {
             var worker = &self.workers[worker_id];
             var spins: u16 = 0;
+
+            // Create per-worker context with worker's own command buffer.
+            // This eliminates race conditions when multiple workers add commands.
+            // Read-only fields (world, resources, delta_time, tick, time_ns) are safe
+            // to share as they don't change during phase execution.
+            var worker_ctx = SysCtx.init(
+                shared_ctx.world,
+                shared_ctx.resources,
+                shared_ctx.delta_time,
+                shared_ctx.tick,
+                shared_ctx.time_ns,
+                &worker.command_buffer,
+                shared_ctx.allocator,
+            );
 
             while (self.tasks_remaining.load(.acquire) > 0) {
                 var task: ?Task = null;
@@ -644,10 +677,10 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                     task = self.global_queue.pop();
                 }
 
-                // Execute task if found
+                // Execute task if found - use worker-local context
                 if (task) |t| {
                     if (t.valid) {
-                        self.executeTask(t, ctx, policy, errors);
+                        self.executeTask(t, &worker_ctx, policy, errors);
                         worker.tasks_executed += 1;
                         _ = self.tasks_remaining.fetchSub(1, .release);
                     }
@@ -710,6 +743,41 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             func(ctx) catch |err| {
                 errors.add(err, task.system_idx, ctx.time_ns);
             };
+        }
+
+        /// Merge all per-worker command buffers into the main command buffer.
+        ///
+        /// Tiger Style: Commands are merged in worker ID order (0, 1, 2, ...) to
+        /// ensure deterministic command ordering across runs. This is critical for
+        /// reproducible execution, especially in multi-threaded scenarios.
+        ///
+        /// Memory ordering: Called after all workers have finished (tasks_remaining == 0),
+        /// so no additional synchronization is needed beyond the acquire fence in the
+        /// worker loop termination condition.
+        fn mergeWorkerCommands(self: *Self, target: *CmdBuf) void {
+            for (0..self.num_workers) |worker_idx| {
+                var worker = &self.workers[worker_idx];
+                const src_commands = worker.command_buffer.getCommands();
+
+                for (src_commands) |cmd| {
+                    // Check if target can accept more commands
+                    if (target.count >= CmdBuf.max_command_count) {
+                        // Target full - clear remaining worker buffers and return
+                        // In production, this should emit a warning/trace
+                        for (worker_idx..self.num_workers) |remaining_idx| {
+                            self.workers[remaining_idx].command_buffer.clear();
+                        }
+                        return;
+                    }
+
+                    // Copy command to target
+                    target.commands[target.count] = cmd;
+                    target.count += 1;
+                }
+
+                // Clear worker's command buffer for next phase
+                worker.command_buffer.clear();
+            }
         }
 
         fn applyCommands(self: *Self, world: *WorldType, commands: *CmdBuf) void {

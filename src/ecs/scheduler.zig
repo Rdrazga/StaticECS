@@ -143,25 +143,38 @@ pub fn Scheduler(comptime cfg: WorldConfig) type {
         /// Run a fixed-rate loop until the stop flag is set.
         ///
         /// This provides consistent timing for game/simulation loops.
+        /// Uses the scheduler's backend for tick execution, which includes
+        /// tracing support configured via setTraceSink().
         ///
         /// Parameters:
         /// - `rate_config`: Target frame rate and timing parameters
-        /// - `stop_flag`: Pointer to a flag that stops the loop when true
+        /// - `stop_flag`: Pointer to a volatile flag that stops the loop when true
         ///
-        /// Returns the final frame result.
+        /// Returns the final frame result (success or last error encountered).
         pub fn runFixedRate(
             self: *Self,
             rate_config: FixedRateConfig,
-            stop_flag: *volatile bool,
+            stop_flag: *const volatile bool,
         ) FrameResult {
-            return runFixedRateLoop(
-                cfg,
-                WorldType,
-                self.world,
-                rate_config,
-                self.trace_sink,
-                stop_flag,
-            );
+            const frame_time_ns: u64 = @divTrunc(1_000_000_000, rate_config.target_hz);
+            var last_frame_instant = std.time.Instant.now() catch return .{ .success = {} };
+            var last_result: FrameResult = .{ .success = {} };
+
+            while (!stop_flag.*) {
+                const now_instant = std.time.Instant.now() catch continue;
+                const elapsed: u64 = now_instant.since(last_frame_instant);
+
+                if (elapsed >= frame_time_ns) {
+                    const delta_seconds: f64 = @as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0;
+                    last_result = self.tick(delta_seconds);
+                    last_frame_instant = now_instant;
+                } else {
+                    // Sleep for remaining time to avoid busy-waiting
+                    const sleep_ns = frame_time_ns - elapsed;
+                    std.time.sleep(sleep_ns);
+                }
+            }
+            return last_result;
         }
 
         /// Get the current tick count.

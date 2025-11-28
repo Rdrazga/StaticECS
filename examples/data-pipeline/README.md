@@ -5,11 +5,10 @@ Demonstrates using StaticECS for ETL/stream processing workloads.
 ## Features Demonstrated
 
 - **Records as Entities**: Each data record is an entity
-- **Pipeline Stages**: Custom phases for ingest → validate → transform → enrich → output
-- **Archetype Transitions**: Records gain components as they move through stages
-- **State Machine**: Record.stage tracks position in pipeline
-- **Statistics Resource**: Track throughput, latency, success rates
-- **External Service**: Simulated enrichment service integration
+- **Pipeline Stages**: Custom phases for ingest → validate → transform → output → cleanup
+- **Archetype Transitions**: Records can gain components as they move through stages
+- **State Machine**: `Record.stage` tracks position in pipeline
+- **Statistics Resource**: Track throughput and success rates
 
 ## Structure
 
@@ -27,35 +26,33 @@ data-pipeline/
                         └─────────────────────────────────────┘
                                         │
     ┌───────────┬───────────┬───────────┼───────────┬───────────┐
-    ▼           ▼           ▼           ▼           ▼           ▼
-┌───────┐  ┌────────┐  ┌─────────┐  ┌────────┐  ┌────────┐  ┌───────┐
-│Ingest │→ │Validate│→ │Transform│→ │ Enrich │→ │ Output │→ │Cleanup│
-└───────┘  └────────┘  └─────────┘  └────────┘  └────────┘  └───────┘
+    ▼           ▼           ▼           ▼           ▼           │
+┌───────┐  ┌────────┐  ┌─────────┐  ┌────────┐  ┌───────┐       │
+│Ingest │→ │Validate│→ │Transform│→ │ Output │→ │Cleanup│       │
+└───────┘  └────────┘  └─────────┘  └────────┘  └───────┘       │
     │           │           │           │           │           │
-    ▼           ▼           ▼           ▼           ▼           ▼
-[RawData] [ParsedData] [TransformData] [EnrichData] [Complete]  [Delete]
+    ▼           ▼           ▼           ▼           ▼           │
+[RawData] [ParsedData] [TransformData] [Complete]  [Stats]      │
+                                                                │
+                           5 Custom Phases ─────────────────────┘
 ```
 
 ## Entity Lifecycle
 
 ```
-raw_record (Record, RawData, Timing)
+raw_record (Record, RawData)
     │
-    │ ← validate system adds ParsedData
+    │ ← validate system (stub - would add ParsedData)
     ▼
-validated_record (Record, RawData, ParsedData, Timing)
+validated_record (Record, RawData, ParsedData)
     │
-    │ ← transform system adds TransformedData
+    │ ← transform system (stub - would add TransformedData)
     ▼
-transformed_record (Record, RawData, ParsedData, TransformedData, Timing)
+transformed_record (Record, RawData, ParsedData, TransformedData)
     │
-    │ ← enrich system adds EnrichedData
+    │ ← output system updates stats
     ▼
-enriched_record (Record, ..., EnrichedData, Timing)
-    │
-    │ ← output system marks complete
-    ▼
-[despawned by cleanup]
+[stats updated, would despawn by cleanup]
 ```
 
 ## Running
@@ -63,13 +60,14 @@ enriched_record (Record, ..., EnrichedData, Timing)
 From the StaticECS root:
 
 ```bash
-zig build
-zig run examples/data-pipeline/main.zig
+zig build run-example-pipeline
 ```
 
 ## Key Concepts
 
 ### Custom Pipeline Phases
+
+The example defines 5 custom phases for ordered execution:
 
 ```zig
 .phases = .{
@@ -77,30 +75,30 @@ zig run examples/data-pipeline/main.zig
         .{ .name = "ingest", .order = 0 },
         .{ .name = "validate", .order = 1 },
         .{ .name = "transform", .order = 2 },
-        .{ .name = "enrich", .order = 3 },
-        .{ .name = "output", .order = 4 },
-        .{ .name = "cleanup", .order = 5 },
+        .{ .name = "output", .order = 3 },
+        .{ .name = "cleanup", .order = 4 },
     },
 },
 ```
 
-### Archetype Transitions
+### Resource Access Pattern
 
-Records gain components as they progress:
+Systems access shared resources via `ctx.world.resources`:
 
 ```zig
-fn validateSystem(ctx: *Context) !void {
-    // Query records in validation stage
-    var query = ctx.world.query(.{ .include = &.{Record, RawData} });
+fn ingestSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    const stats = ctx.world.resources.get(PipelineStats) orelse return;
     
-    while (query.next()) |result| {
-        if (result.getConst(Record).stage != .ingested) continue;
-        
-        // Parse and add new component
-        const parsed = parseRecord(result.getConst(RawData));
-        try ctx.world.addComponent(result.entity, ParsedData, parsed);
-        
-        result.get(Record).stage = .validated;
+    // Batch ingestion every 3 ticks
+    if (@mod(ctx.tick, 3) == 0) {
+        for (0..5) |i| {
+            _ = ctx.world.spawn("record", .{
+                Record{ .id = ctx.tick * 10 + i, .stage = .ingested },
+                RawData{ .data_len = 100, .timestamp_ns = ctx.time_ns },
+            }) catch {};
+            stats.records_ingested += 1;
+        }
     }
 }
 ```
@@ -112,31 +110,30 @@ const PipelineStats = struct {
     records_ingested: u64 = 0,
     records_completed: u64 = 0,
     records_failed: u64 = 0,
-    avg_latency_ns: u64 = 0,
+    tick_count: u64 = 0,
 };
 
-fn outputSystem(ctx: *Context) !void {
-    const stats = ctx.getResource(PipelineStats) orelse return;
-    // Update stats on completion
-    stats.records_completed += 1;
+fn outputSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    const stats = ctx.world.resources.get(PipelineStats) orelse return;
+    // Update completion stats
+    stats.records_completed += stats.records_ingested / 2;
 }
 ```
 
-### Timing Tracking
+> **Note**: The validate, transform, and output systems in this example are stubs.
+> A real pipeline would implement full record processing logic.
 
-Each record tracks its journey:
+### System Context Helper
+
+Systems receive an opaque pointer that must be cast to the typed context:
 
 ```zig
-const RecordTiming = struct {
-    ingested_at_ns: u64 = 0,
-    validated_at_ns: u64 = 0,
-    transformed_at_ns: u64 = 0,
-    enriched_at_ns: u64 = 0,
-    completed_at_ns: u64 = 0,
-};
+const Context = ecs.SystemContext(cfg, World);
 
-// Calculate end-to-end latency
-const latency = timing.completed_at_ns - timing.ingested_at_ns;
+fn getContext(ctx_ptr: *anyopaque) *Context {
+    return @ptrCast(@alignCast(ctx_ptr));
+}
 ```
 
 ## Extending
@@ -164,7 +161,7 @@ Ideas for building a real data pipeline:
 
 ## Performance Considerations
 
-- **Batch Size**: Configure `PipelineConfig.batch_size` for throughput vs latency
+- **Batch Size**: Configure batch ingestion rate for throughput vs latency
 - **Max Entities**: Set `max_entities` to limit memory for in-flight records
 - **Entity Index Bits**: Smaller index = more generations for record recycling
 - **System Order**: Phases ensure correct processing order

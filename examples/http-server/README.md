@@ -8,8 +8,8 @@ Demonstrates using StaticECS for server-side applications with connection manage
 - **Request/Response Components**: HTTP data attached to connection entities
 - **State Machine Pattern**: Connection state transitions via component values
 - **Resources**: Server configuration and statistics
-- **Event Queues**: Logging request completions
-- **Timeout Handling**: Automatic cleanup of stale connections
+- **Custom Phases**: accept → read → process → write → cleanup
+- **I/O Context**: Demonstrates async I/O capability check
 
 ## Structure
 
@@ -26,31 +26,28 @@ http-server/
 │                        HTTP Server ECS                          │
 ├─────────────────────────────────────────────────────────────────┤
 │ Resources:                                                       │
-│   ServerConfig - host, port, max_connections, timeout           │
-│   ServerStats  - requests, bytes, active connections            │
+│   ServerStats  - requests, active connections, tick count        │
 ├─────────────────────────────────────────────────────────────────┤
 │ Connection Entity:                                               │
-│   ├── Connection (client_id, state, bytes_sent/received)        │
-│   ├── Request (method, path, headers)                           │
-│   ├── Response (status, body, headers)                          │
-│   └── Timing (created_at, last_activity, timeout)               │
+│   ├── Connection (fd, state, timestamp)                         │
+│   ├── Request (method_len, path_len, content_length)            │
+│   └── Response (status_code, content_length, sent flags)        │
 ├─────────────────────────────────────────────────────────────────┤
 │ Systems (per frame):                                             │
-│   1. accept_connections  - Spawn new connection entities        │
-│   2. read_requests       - Parse incoming HTTP                  │
-│   3. process_requests    - Route and generate response          │
-│   4. send_responses      - Write response back                  │
-│   5. timeout_check       - Mark stale connections               │
-│   6. cleanup             - Despawn closed connections           │
+│   1. accept   - Spawn new connection entities                   │
+│   2. read     - Parse incoming HTTP (stub)                      │
+│   3. process  - Route and generate response (stub)              │
+│   4. write    - Write response back                             │
+│   5. cleanup  - Update stats                                    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Connection State Machine
 
 ```
-    new → reading_request → processing → writing_response → closing → [despawn]
-                    ↑                                           ↑
-                    └─── timeout ───────────────────────────────┘
+    new → reading → processing → writing → closed → [despawn]
+                ↑                              ↑
+                └─── timeout ──────────────────┘
 ```
 
 ## Running
@@ -58,8 +55,7 @@ http-server/
 From the StaticECS root:
 
 ```bash
-zig build
-zig run examples/http-server/main.zig
+zig build run-example-server
 ```
 
 ## Key Concepts
@@ -69,27 +65,13 @@ zig run examples/http-server/main.zig
 Each network connection becomes an ECS entity:
 
 ```zig
-_ = world.spawn("connection", .{
-    Connection{ .client_id = socket_fd, .state = .new },
-    Request{},   // Populated by read system
-    Response{},  // Populated by router
-    Timing{ .created_at_ns = now },
-});
-```
-
-### State-Based Processing
-
-Systems filter by connection state:
-
-```zig
-fn readRequestsSystem(ctx: *Context) !void {
-    var query = ctx.world.query(.{ .include = &.{Connection, Request} });
-    while (query.next()) |result| {
-        const conn = result.get(Connection);
-        if (conn.state != .new and conn.state != .reading_request) continue;
-        // Read from socket...
-        conn.state = .processing;
-    }
+// In acceptSystem - simulate accepting connections every 5 ticks
+if (@mod(ctx.tick, 5) == 0) {
+    const stats = ctx.world.resources.get(ServerStats) orelse return;
+    _ = ctx.world.spawn("connection", .{
+        Connection{ .fd = @intCast(ctx.tick), .state = .reading, .timestamp_ns = ctx.time_ns },
+    }) catch {};
+    stats.connections_active += 1;
 }
 ```
 
@@ -99,31 +81,60 @@ Resources track server-wide metrics:
 
 ```zig
 const ServerStats = struct {
-    requests_total: u64 = 0,
-    requests_success: u64 = 0,
     connections_active: u32 = 0,
-    bytes_sent: u64 = 0,
+    requests_total: u64 = 0,
+    tick_count: u64 = 0,
 };
 
-fn processRequestsSystem(ctx: *Context) !void {
-    const stats = ctx.getResource(ServerStats) orelse return;
-    stats.requests_total += 1;
+fn writeSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    const stats = ctx.world.resources.get(ServerStats) orelse return;
+    // Simulate completing requests
+    if (stats.connections_active > 0) {
+        stats.requests_total += 1;
+        stats.connections_active -|= 1;
+    }
+}
+```
+
+### I/O Context Capability
+
+Systems can check for async I/O support:
+
+```zig
+fn acceptSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+
+    // Check for async I/O support
+    if (ctx.hasIo()) {
+        _ = ctx.hasAsync();
+    }
     // ...
 }
 ```
 
-### Graceful Cleanup
+### Execution Model
 
-Command buffer handles entity removal after iteration:
+The example uses blocking single-thread mode:
 
 ```zig
-fn cleanupSystem(ctx: *Context) !void {
-    var query = ctx.world.query(.{ .include = &.{Connection} });
-    while (query.next()) |result| {
-        if (result.getConst(Connection).state == .closing) {
-            ctx.commands.despawn(result.entity);
-        }
-    }
+.schedule = .{
+    .execution_model = .blocking_single_thread, // Would use .evented_single_thread when std.Io is ready
+},
+```
+
+> **Note**: The read, process, and cleanup systems in this example are stubs.
+> A real server would implement full HTTP parsing and response generation.
+
+### System Context Helper
+
+Systems receive an opaque pointer that must be cast to the typed context:
+
+```zig
+const Context = ecs.SystemContext(cfg, World);
+
+fn getContext(ctx_ptr: *anyopaque) *Context {
+    return @ptrCast(@alignCast(ctx_ptr));
 }
 ```
 
@@ -133,7 +144,7 @@ Ideas for building a real server:
 
 1. **Real Sockets**: Replace simulated I/O with `std.net`
 2. **HTTP Parsing**: Use or build HTTP/1.1 parser
-3. **Async I/O**: Use `evented_single_thread` execution model
+3. **Async I/O**: Use `evented_single_thread` execution model when available
 4. **Keep-Alive**: Reset connection state instead of closing
 5. **Middleware**: Add logging, auth as system phases
 6. **Rate Limiting**: Track requests per client in component

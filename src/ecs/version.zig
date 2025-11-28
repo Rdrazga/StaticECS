@@ -70,9 +70,9 @@ pub const SemanticVersion = struct {
 /// The current version of the StaticECS library.
 pub const ECS_VERSION = SemanticVersion{
     .major = 0,
-    .minor = 0,
+    .minor = 1,
     .patch = 1,
-    .pre_release = "alpha",
+    .pre_release = null,
 };
 
 /// String representation of the current version.

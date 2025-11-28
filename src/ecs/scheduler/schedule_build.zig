@@ -344,10 +344,14 @@ pub fn buildExecutionOrder(comptime cfg: WorldConfig) []const u16 {
     comptime var order: [Sched.system_count]u16 = undefined;
     comptime var idx: usize = 0;
 
-    inline for (Sched.phases) |phase| {
-        const phase_stages = Sched.getStagesForPhase(phase);
+    // Iterate by phase index, not PhaseDef structs
+    // Use getStagesForPhaseIndex which takes u8 index
+    inline for (0..Sched.num_phases) |phase_idx| {
+        const phase_stages = Sched.getStagesForPhaseIndex(@intCast(phase_idx));
         inline for (phase_stages) |stage| {
-            inline for (stage.system_indices) |sys_idx| {
+            // Use getSystemIndices() to get only valid indices
+            const valid_indices = stage.getSystemIndices();
+            inline for (valid_indices) |sys_idx| {
                 order[idx] = sys_idx;
                 idx += 1;
             }

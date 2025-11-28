@@ -194,9 +194,11 @@ pub const BackendInterfaceDoc = struct {
 pub fn getTimeNs() u64 {
     const instant = std.time.Instant.now() catch return 0;
 
-    // Use a base instant for relative timing
+    // Use a base instant for relative timing.
+    // Thread-local storage: each thread gets its own time base to avoid
+    // data races when multiple threads call this concurrently.
     const base = struct {
-        var value: ?std.time.Instant = null;
+        threadlocal var value: ?std.time.Instant = null;
     };
 
     if (base.value == null) {
