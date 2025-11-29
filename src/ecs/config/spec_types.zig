@@ -14,6 +14,7 @@ const backend = @import("backend_config.zig");
 pub const ExecutionModel = core.ExecutionModel;
 pub const TickMode = core.TickMode;
 pub const LayoutMode = core.LayoutMode;
+pub const CapacityMode = core.CapacityMode;
 pub const PhaseDef = core.PhaseDef;
 pub const DEFAULT_PHASES = core.DEFAULT_PHASES;
 pub const ArchetypeDef = definition.ArchetypeDef;
@@ -104,6 +105,10 @@ pub const Options = struct {
     /// Must be <= (2^entity_index_bits - 1).
     /// Default with 20-bit index: max 1,048,575 entities.
     max_entities: u32 = 65536,
+    /// Archetype storage capacity mode.
+    /// Tiger_Style: Default to .fixed for static allocation compliance.
+    /// Use .dynamic only when entity count is truly unbounded.
+    capacity_mode: CapacityMode = .fixed,
     /// Maximum commands per frame (for command buffer sizing).
     max_commands_per_frame: u32 = 1024,
     /// Maximum inline data size for component data in commands (bytes).

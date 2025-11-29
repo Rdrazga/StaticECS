@@ -50,8 +50,9 @@ const TransferMarker = transfer_mod.TransferMarker;
 // Coordinator Statistics
 // ============================================================================
 
-/// Statistics tracked by the coordinator
-pub const CoordinatorStats = struct {
+/// Non-atomic snapshot of coordinator statistics (returned by getStats).
+/// Use this for reading/displaying stats outside the coordinator.
+pub const CoordinatorStatsSnapshot = struct {
     /// Total ticks executed
     ticks: u64 = 0,
     /// Transfers sent per world (indexed by source world)
@@ -64,9 +65,61 @@ pub const CoordinatorStats = struct {
     total_tick_time_ns: u64 = 0,
 
     const MAX_WORLDS = 8;
+};
 
+/// Atomic statistics tracked by the coordinator.
+/// All fields are atomic to ensure thread-safe concurrent updates.
+/// Tiger Style: Using monotonic ordering for pure statistics (no synchronization purpose).
+pub const CoordinatorStats = struct {
+    /// Total ticks executed
+    ticks: Atomic(u64),
+    /// Transfers sent per world (indexed by source world)
+    transfers_sent: [MAX_WORLDS]Atomic(u64),
+    /// Transfers received per world (indexed by target world)
+    transfers_received: [MAX_WORLDS]Atomic(u64),
+    /// Queue full events per world pair
+    queue_full_count: Atomic(u64),
+    /// Time spent in tick (nanoseconds)
+    total_tick_time_ns: Atomic(u64),
+
+    const MAX_WORLDS = 8;
+
+    /// Initialize all atomic counters to zero.
+    pub fn init() CoordinatorStats {
+        return .{
+            .ticks = Atomic(u64).init(0),
+            .transfers_sent = [_]Atomic(u64){Atomic(u64).init(0)} ** MAX_WORLDS,
+            .transfers_received = [_]Atomic(u64){Atomic(u64).init(0)} ** MAX_WORLDS,
+            .queue_full_count = Atomic(u64).init(0),
+            .total_tick_time_ns = Atomic(u64).init(0),
+        };
+    }
+
+    /// Reset all counters to zero atomically.
     pub fn reset(self: *CoordinatorStats) void {
-        self.* = .{};
+        self.ticks.store(0, .monotonic);
+        for (&self.transfers_sent) |*counter| {
+            counter.store(0, .monotonic);
+        }
+        for (&self.transfers_received) |*counter| {
+            counter.store(0, .monotonic);
+        }
+        self.queue_full_count.store(0, .monotonic);
+        self.total_tick_time_ns.store(0, .monotonic);
+    }
+
+    /// Create a non-atomic snapshot of current statistics.
+    /// Uses monotonic ordering since stats are for observation only.
+    pub fn snapshot(self: *const CoordinatorStats) CoordinatorStatsSnapshot {
+        var snap = CoordinatorStatsSnapshot{};
+        snap.ticks = self.ticks.load(.monotonic);
+        for (0..MAX_WORLDS) |i| {
+            snap.transfers_sent[i] = self.transfers_sent[i].load(.monotonic);
+            snap.transfers_received[i] = self.transfers_received[i].load(.monotonic);
+        }
+        snap.queue_full_count = self.queue_full_count.load(.monotonic);
+        snap.total_tick_time_ns = self.total_tick_time_ns.load(.monotonic);
+        return snap;
     }
 };
 
@@ -119,7 +172,7 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
             var self = Self{
                 .queues = undefined,
                 .running = Atomic(bool).init(false),
-                .stats = .{},
+                .stats = CoordinatorStats.init(),
                 .allocator = allocator,
             };
 
@@ -170,10 +223,10 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
 
             const queue = &self.queues[source_world][target_world];
             if (queue.push(transfer)) {
-                self.stats.transfers_sent[source_world] += 1;
+                _ = self.stats.transfers_sent[source_world].fetchAdd(1, .monotonic);
                 return true;
             } else {
-                self.stats.queue_full_count += 1;
+                _ = self.stats.queue_full_count.fetchAdd(1, .monotonic);
                 return false;
             }
         }
@@ -189,7 +242,7 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
 
                 const queue = &self.queues[src][target_world];
                 if (queue.pop()) |transfer| {
-                    self.stats.transfers_received[target_world] += 1;
+                    _ = self.stats.transfers_received[target_world].fetchAdd(1, .monotonic);
                     return transfer;
                 }
             }
@@ -211,7 +264,7 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
                 const queue = &self.queues[src][target_world];
                 const remaining = out.len - count;
                 const batch_count = queue.popBatch(out[count..][0..remaining]);
-                self.stats.transfers_received[target_world] += batch_count;
+                _ = self.stats.transfers_received[target_world].fetchAdd(batch_count, .monotonic);
                 count += batch_count;
             }
 
@@ -250,9 +303,9 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
             return &self.queues[source][target];
         }
 
-        /// Get coordinator statistics.
-        pub fn getStats(self: *const Self) CoordinatorStats {
-            return self.stats;
+        /// Get coordinator statistics as a non-atomic snapshot.
+        pub fn getStats(self: *const Self) CoordinatorStatsSnapshot {
+            return self.stats.snapshot();
         }
 
         /// Reset coordinator statistics.
@@ -262,7 +315,7 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
 
         /// Tick counter increment (for external tracking).
         pub fn recordTick(self: *Self) void {
-            self.stats.ticks += 1;
+            _ = self.stats.ticks.fetchAdd(1, .monotonic);
         }
 
         /// Create a transfer packet initialized for source→target.

@@ -1351,3 +1351,131 @@ test "query iteration with optional components returns correct data" {
     try testing.expect(world.isAlive(e_without_1));
     try testing.expect(world.isAlive(e_without_2));
 }
+
+// ============================================================================
+// Generation Validation Tests - WD-1 Safety Fix
+// Tests for the despawn generation check (prevents stale entity access)
+// ============================================================================
+
+test "despawn with recycled slot validates generation correctly" {
+    // This test verifies the WD-1 safety fix: generation validation during despawn
+    // ensures we don't corrupt data if an entity slot was recycled.
+    //
+    // Scenario:
+    // 1. Create entity A at slot N
+    // 2. Despawn entity A (slot N becomes free, generation increments)
+    // 3. Create entity B at slot N (gets recycled slot with new generation)
+    // 4. Attempt to despawn using stale handle A
+    // 5. Verify entity B is not affected by the failed despawn
+
+    var world = TinyWorld.init(testing.allocator);
+    defer world.deinit();
+
+    // Step 1: Create entity A
+    const entity_a = try world.spawn("point", .{Position{ .x = 100, .y = 100, .z = 100 }});
+    try testing.expect(world.isAlive(entity_a));
+    try testing.expectEqual(@as(u32, 1), world.entityCount());
+
+    // Capture the original index for verification
+    const original_index = entity_a.index();
+
+    // Step 2: Despawn entity A (frees slot, increments generation)
+    try world.despawn(entity_a);
+    try testing.expect(!world.isAlive(entity_a));
+    try testing.expectEqual(@as(u32, 0), world.entityCount());
+
+    // Step 3: Create entity B - should get the recycled slot with new generation
+    const entity_b = try world.spawn("point", .{Position{ .x = 200, .y = 200, .z = 200 }});
+    try testing.expect(world.isAlive(entity_b));
+    try testing.expectEqual(@as(u32, 1), world.entityCount());
+
+    // Verify entity B got the recycled slot (same index, different generation)
+    try testing.expectEqual(original_index, entity_b.index());
+    try testing.expect(entity_a.generation() != entity_b.generation());
+
+    // Step 4: Attempt to despawn using stale handle A
+    // This should fail with InvalidEntity because generation doesn't match
+    const stale_despawn_result = world.despawn(entity_a);
+    try testing.expectError(ecs.world_mod.WorldError.InvalidEntity, stale_despawn_result);
+
+    // Step 5: Verify entity B is unaffected
+    try testing.expect(world.isAlive(entity_b));
+    try testing.expectEqual(@as(u32, 1), world.entityCount());
+
+    // Entity B should still have correct component data
+    const pos_b = world.getComponent(entity_b, Position).?.*;
+    try testing.expectEqual(@as(f32, 200), pos_b.x);
+    try testing.expectEqual(@as(f32, 200), pos_b.y);
+    try testing.expectEqual(@as(f32, 200), pos_b.z);
+
+    // Stale handle A should not access entity B's data
+    try testing.expect(world.getComponent(entity_a, Position) == null);
+}
+
+test "despawn swap-remove with generation validation preserves data integrity" {
+    // This test exercises the fix for WD-1 where the swap-remove during despawn
+    // now uses generation-validated metadata access instead of direct array indexing.
+    //
+    // The test creates a scenario where:
+    // 1. Multiple entities exist in same archetype
+    // 2. Despawning triggers swap-remove
+    // 3. The moved entity's metadata is updated using validated access
+    // 4. All surviving entities remain accessible with correct data
+
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    // Spawn 5 entities to ensure we exercise swap-remove
+    const e1 = try world.spawn("living", .{
+        Position{ .x = 1, .y = 0, .z = 0 },
+        Health{ .current = 10, .max = 100 },
+    });
+    const e2 = try world.spawn("living", .{
+        Position{ .x = 2, .y = 0, .z = 0 },
+        Health{ .current = 20, .max = 100 },
+    });
+    const e3 = try world.spawn("living", .{
+        Position{ .x = 3, .y = 0, .z = 0 },
+        Health{ .current = 30, .max = 100 },
+    });
+    const e4 = try world.spawn("living", .{
+        Position{ .x = 4, .y = 0, .z = 0 },
+        Health{ .current = 40, .max = 100 },
+    });
+    const e5 = try world.spawn("living", .{
+        Position{ .x = 5, .y = 0, .z = 0 },
+        Health{ .current = 50, .max = 100 },
+    });
+
+    try testing.expectEqual(@as(u32, 5), world.entityCount());
+
+    // Despawn e1 (first entity) - e5 should swap into its slot
+    try world.despawn(e1);
+    try testing.expectEqual(@as(u32, 4), world.entityCount());
+    try testing.expect(!world.isAlive(e1));
+
+    // Despawn e3 (middle entity) - e4 should swap into its slot
+    try world.despawn(e3);
+    try testing.expectEqual(@as(u32, 3), world.entityCount());
+    try testing.expect(!world.isAlive(e3));
+
+    // Verify all surviving entities have correct data
+    // This confirms the generation-validated metadata update worked
+    try testing.expect(world.isAlive(e2));
+    try testing.expect(world.isAlive(e4));
+    try testing.expect(world.isAlive(e5));
+
+    try testing.expectEqual(@as(f32, 2), world.getComponent(e2, Position).?.x);
+    try testing.expectEqual(@as(f32, 4), world.getComponent(e4, Position).?.x);
+    try testing.expectEqual(@as(f32, 5), world.getComponent(e5, Position).?.x);
+
+    try testing.expectEqual(@as(u32, 20), world.getComponent(e2, Health).?.current);
+    try testing.expectEqual(@as(u32, 40), world.getComponent(e4, Health).?.current);
+    try testing.expectEqual(@as(u32, 50), world.getComponent(e5, Health).?.current);
+
+    // Stale handles return null/error
+    try testing.expect(world.getComponent(e1, Position) == null);
+    try testing.expect(world.getComponent(e3, Position) == null);
+    try testing.expectError(ecs.world_mod.WorldError.InvalidEntity, world.despawn(e1));
+    try testing.expectError(ecs.world_mod.WorldError.InvalidEntity, world.despawn(e3));
+}

@@ -113,3 +113,20 @@ pub const LayoutMode = enum {
     /// Single archetype with more compact entity representation.
     single_archetype,
 };
+
+// ============================================================================
+// Storage Mode Types
+// ============================================================================
+
+/// CapacityMode controls archetype table storage allocation strategy.
+/// Tiger_Style: Fixed mode enforces static allocation post-init.
+pub const CapacityMode = enum {
+    /// Fixed capacity - preallocated arrays, returns error on overflow.
+    /// Tiger_Style compliant: no dynamic allocation after initialization.
+    /// Storage is sized by max_entities or expected_entities_per_archetype.
+    fixed,
+    /// Dynamic capacity - grows as needed using ArrayList.
+    /// Backward compatible but violates Tiger_Style static allocation rule.
+    /// Use only when entity count is truly unbounded.
+    dynamic,
+};

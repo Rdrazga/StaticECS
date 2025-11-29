@@ -74,8 +74,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize world
-    var world = try World.init(allocator);
+    // Initialize world (does not return error)
+    var world = World.init(allocator);
     defer world.deinit();
 
     // Spawn an entity
@@ -104,10 +104,27 @@ pub fn main() !void {
 
 Systems process entities each frame.
 
-### Step 1: Write the System Function
+### Step 1: Define Types and Helpers
 
 ```zig
-fn movementSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+const World = ecs.World(cfg);
+const FrameError = ecs.FrameError;
+const Context = ecs.SystemContext(cfg, World);
+
+// Helper to cast opaque pointer to typed context
+fn getContext(ctx_ptr: *anyopaque) *Context {
+    return @ptrCast(@alignCast(ctx_ptr));
+}
+```
+
+### Step 2: Write the System Function
+
+Systems receive an opaque pointer for compatibility with the scheduler. Cast it using the helper:
+
+```zig
+fn movementSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     // Query all entities with Position and Velocity
     var query = ctx.world.query(.{
         .include = &.{ Position, Velocity },
@@ -124,7 +141,9 @@ fn movementSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 }
 ```
 
-### Step 2: Register in Config
+> **Note**: The opaque pointer pattern enables compile-time system registration without type dependencies between the config and system definitions.
+
+### Step 3: Register in Config
 
 ```zig
 const Phase = ecs.Phase;
@@ -151,7 +170,7 @@ pub const cfg = ecs.WorldConfig{
 };
 ```
 
-### Step 3: Run the Frame
+### Step 4: Run the Frame
 
 ```zig
 pub fn main() !void {
@@ -159,7 +178,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var world = try World.init(allocator);
+    // World.init does not return an error
+    var world = World.init(allocator);
     defer world.deinit();
 
     // Spawn some entities
@@ -169,19 +189,14 @@ pub fn main() !void {
         Name{ .value = "Ball".* ++ [_]u8{0} ** 28 },
     });
 
-    // Game loop
-    const Scheduler = World.Scheduler;
+    // Game loop using Scheduler
+    const Scheduler = ecs.Scheduler(cfg);
     var tick: u64 = 0;
-    var last_time = std.time.nanoTimestamp();
+    var scheduler = Scheduler.init(&world, null, allocator);
 
     while (tick < 1000) {
-        const now = std.time.nanoTimestamp();
-        const delta_ns = now - last_time;
-        const delta_time = @as(f64, @floatFromInt(delta_ns)) / 1_000_000_000.0;
-        last_time = now;
-
         // Execute frame - runs all systems in phase order
-        const result = Scheduler.executeFrame(&world, delta_time, tick, null, allocator);
+        const result = scheduler.tick(1.0 / 60.0);  // ~60 FPS delta
         
         switch (result) {
             .success => {},
@@ -204,7 +219,9 @@ pub fn main() !void {
 Use the command buffer during system execution to avoid iterator invalidation:
 
 ```zig
-fn spawnerSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn spawnerSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     // Deferred spawn - executed after system completes
     _ = ctx.commands.spawnInArchetype(0); // Archetype index 0
     
@@ -233,7 +250,9 @@ pub const cfg = ecs.WorldConfig{
     },
 };
 
-fn timeSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn timeSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     if (ctx.getResource(GameTime)) |time| {
         time.total += ctx.delta_time;
         time.frame = ctx.tick;
@@ -241,7 +260,8 @@ fn timeSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 }
 
 pub fn main() !void {
-    var world = try World.init(allocator);
+    // World.init does not return an error
+    var world = World.init(allocator);
     defer world.deinit();
     
     // Initialize resource
@@ -256,7 +276,9 @@ pub fn main() !void {
 Query entities that may or may not have certain components:
 
 ```zig
-fn renderSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn renderSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{Position},
         .optional = &.{Velocity},  // Might not be present
@@ -310,6 +332,7 @@ while (collision_events.pop()) |event| {
 - **[Configuration Reference](CONFIGURATION.md)** - All configuration options
 - **[System Authoring Guide](systems.md)** - Advanced system patterns
 - **[Execution Models](execution-models.md)** - Async and threading options
+- **[Multi-World Coordination](multi-world.md)** - Running multiple worlds with entity transfers
 
 ## Key Concepts
 

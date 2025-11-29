@@ -5,12 +5,14 @@
 //! with informative error messages.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const world_config = @import("world_config.zig");
 const spec = @import("spec_types.zig");
 const pipeline = @import("pipeline_config.zig");
 const coordination = @import("coordination_config.zig");
 const scalability = @import("scalability_config.zig");
+const backend = @import("backend_config.zig");
 
 // Re-export types used in public API
 pub const WorldConfig = world_config.WorldConfig;
@@ -18,42 +20,41 @@ pub const ComponentsSpec = spec.ComponentsSpec;
 pub const PipelineConfig = pipeline.PipelineConfig;
 pub const WorldCoordinationConfig = coordination.WorldCoordinationConfig;
 pub const ScalabilityConfig = scalability.ScalabilityConfig;
-
-// ============================================================================
-// Validation Error Types
-// ============================================================================
-
-/// Validation error types for compile-time config checking.
-pub const ConfigValidationError = error{
-    /// Component referenced in archetype not found in ComponentsSpec.
-    ComponentNotInSpec,
-    /// Duplicate archetype definition (same component set).
-    DuplicateArchetype,
-    /// System references component not in ComponentsSpec.
-    SystemComponentNotInSpec,
-    /// Single archetype mode requires exactly one archetype.
-    SingleArchetypeModeViolation,
-    /// Invalid execution model for given asynchrony/parallelism combination.
-    InvalidExecutionModelCombination,
-    /// Fixed-rate tick mode requires target_hz to be set.
-    FixedRateMissingHz,
-    /// max_entities must be greater than zero.
-    ZeroMaxEntities,
-    /// Transfer queue capacity must be power of 2.
-    TransferQueueCapacityNotPowerOfTwo,
-    /// Transfer batch size exceeds queue capacity.
-    TransferBatchSizeExceedsCapacity,
-    /// Component route references invalid target world.
-    InvalidRouteTarget,
-};
+pub const BackendConfig = backend.BackendConfig;
+pub const ExecutionModel = backend.ExecutionModel;
 
 // ============================================================================
 // Main Validation Function
 // ============================================================================
 
-/// Validates a WorldConfig at compile time.
+/// Validates all aspects of WorldConfig at compile time.
+/// Master validation function - coordinates sub-validators.
 /// Emits @compileError on invalid configurations.
 pub fn validateWorldConfig(comptime cfg: WorldConfig) void {
+    // Core configuration validation
+    validateEntityConfig(cfg);
+    validatePhaseConfig(cfg);
+    validateScheduleConfig(cfg);
+    validateComponentRefs(cfg);
+
+    // Sub-configuration validation (conditional)
+    if (cfg.coordination.role != .standalone) {
+        validateCoordinationConfig(cfg.coordination);
+    }
+    validatePipelineConfig(cfg.pipeline);
+    if (cfg.scalability.anyEnabled()) {
+        validateScalabilityConfig(cfg.scalability);
+    }
+    validateBackendConfig(cfg.schedule.execution_model, cfg.schedule.backend_config);
+}
+
+// ============================================================================
+// Core Validation Sub-Functions
+// ============================================================================
+
+/// Validates entity limits and ID configuration.
+/// Checks entity_index_bits range and max_entities bounds.
+fn validateEntityConfig(comptime cfg: WorldConfig) void {
     // Validate entity_index_bits range [8, 24]
     if (cfg.options.entity_index_bits < 8 or cfg.options.entity_index_bits > 24) {
         @compileError("WorldConfig: entity_index_bits must be between 8 and 24 (inclusive)");
@@ -71,15 +72,22 @@ pub fn validateWorldConfig(comptime cfg: WorldConfig) void {
     if (cfg.options.max_entities > max_index) {
         @compileError("WorldConfig: max_entities exceeds capacity of entity_index_bits");
     }
+}
 
-    // Validate phases
+/// Validates execution phases configuration.
+/// Ensures at least one phase exists and count is within limits.
+fn validatePhaseConfig(comptime cfg: WorldConfig) void {
     if (cfg.phases.phases.len == 0) {
         @compileError("WorldConfig: at least one phase must be defined");
     }
     if (cfg.phases.phases.len > cfg.options.max_phases) {
         @compileError("WorldConfig: phase count exceeds max_phases option");
     }
+}
 
+/// Validates scheduling mode configuration.
+/// Checks layout_mode and tick_mode consistency.
+fn validateScheduleConfig(comptime cfg: WorldConfig) void {
     // Validate single archetype mode
     if (cfg.options.layout_mode == .single_archetype) {
         if (cfg.archetypes.archetypes.len != 1) {
@@ -93,7 +101,12 @@ pub fn validateWorldConfig(comptime cfg: WorldConfig) void {
             @compileError("WorldConfig: fixed_rate tick mode requires target_hz to be set");
         }
     }
+}
 
+/// Validates component type references in archetypes and systems.
+/// Ensures all referenced components exist in ComponentsSpec,
+/// validates system phase indices, and checks for duplicate archetypes.
+fn validateComponentRefs(comptime cfg: WorldConfig) void {
     // Validate archetype component references
     for (cfg.archetypes.archetypes) |arch| {
         for (arch.components) |comp| {
@@ -130,19 +143,6 @@ pub fn validateWorldConfig(comptime cfg: WorldConfig) void {
                 @compileError("WorldConfig: duplicate archetype definitions with same component set: '" ++ arch_a.name ++ "' and '" ++ arch_b.name ++ "'");
             }
         }
-    }
-
-    // Validate coordination config (only for coordinated worlds)
-    if (cfg.coordination.role != .standalone) {
-        validateCoordinationConfig(cfg.coordination);
-    }
-
-    // Validate pipeline config
-    validatePipelineConfig(cfg.pipeline);
-
-    // Validate scalability config (only when features are enabled)
-    if (cfg.scalability.anyEnabled()) {
-        validateScalabilityConfig(cfg.scalability);
     }
 }
 
@@ -198,6 +198,102 @@ pub fn validateCoordinationConfig(comptime coord: WorldCoordinationConfig) void 
     // Validate batch size is reasonable (at least 1)
     if (coord.transfer_queue.batch_size == 0) {
         @compileError("WorldConfig: transfer_queue.batch_size must be at least 1");
+    }
+}
+
+/// Validates backend-specific configuration at compile time.
+/// Ensures execution_model and backend_config are consistent, and validates
+/// platform requirements and parameter bounds.
+pub fn validateBackendConfig(comptime execution_model: ExecutionModel, comptime backend_cfg: BackendConfig) void {
+    // 1. Platform validation: io_uring is Linux-only
+    if (execution_model == .io_uring_batch) {
+        if (builtin.target.os.tag != .linux) {
+            @compileError("io_uring_batch execution model is only available on Linux");
+        }
+    }
+
+    // 2. Execution model / backend config consistency
+    switch (execution_model) {
+        .blocking_single_thread, .evented_single_thread, .concurrent_threadpool => {
+            // These models should use .none backend config or be validated loosely
+            // No strict requirement - allow any backend_config (may be ignored)
+        },
+        .io_uring_batch => {
+            // Validate io_uring specific config when provided
+            if (backend_cfg == .io_uring_batch) {
+                const io_cfg = backend_cfg.io_uring_batch;
+                // sq_entries must be power of 2
+                if (!std.math.isPowerOfTwo(io_cfg.sq_entries)) {
+                    @compileError("io_uring_batch: sq_entries must be power of 2");
+                }
+                // cq_entries must be power of 2
+                if (!std.math.isPowerOfTwo(io_cfg.cq_entries)) {
+                    @compileError("io_uring_batch: cq_entries must be power of 2");
+                }
+                // cq_entries should be >= sq_entries
+                if (io_cfg.cq_entries < io_cfg.sq_entries) {
+                    @compileError("io_uring_batch: cq_entries should be >= sq_entries");
+                }
+                // batch_size must be positive and <= sq_entries
+                if (io_cfg.batch_size == 0) {
+                    @compileError("io_uring_batch: batch_size must be at least 1");
+                }
+                if (io_cfg.batch_size > io_cfg.sq_entries) {
+                    @compileError("io_uring_batch: batch_size exceeds sq_entries");
+                }
+            }
+        },
+        .work_stealing => {
+            // Validate work_stealing specific config when provided
+            if (backend_cfg == .work_stealing) {
+                const ws_cfg = backend_cfg.work_stealing;
+                // local_queue_size must be power of 2
+                if (!std.math.isPowerOfTwo(ws_cfg.local_queue_size)) {
+                    @compileError("work_stealing: local_queue_size must be power of 2");
+                }
+                // worker_count has reasonable max (0 = auto-detect is valid)
+                if (ws_cfg.worker_count > 256) {
+                    @compileError("work_stealing: worker_count maximum is 256");
+                }
+                // steal_batch should not exceed local_queue_size
+                if (ws_cfg.steal_batch > ws_cfg.local_queue_size) {
+                    @compileError("work_stealing: steal_batch exceeds local_queue_size");
+                }
+            }
+        },
+        .adaptive_hybrid => {
+            // Validate adaptive specific config when provided
+            if (backend_cfg == .adaptive) {
+                const adapt_cfg = backend_cfg.adaptive;
+                // batch_threshold must be positive
+                if (adapt_cfg.batch_threshold == 0) {
+                    @compileError("adaptive: batch_threshold must be at least 1");
+                }
+                // imbalance_threshold must be in (0, 1)
+                if (adapt_cfg.imbalance_threshold <= 0.0 or adapt_cfg.imbalance_threshold >= 1.0) {
+                    @compileError("adaptive: imbalance_threshold must be between 0 and 1 (exclusive)");
+                }
+                // window_size must be positive
+                if (adapt_cfg.window_size == 0) {
+                    @compileError("adaptive: window_size must be at least 1");
+                }
+                // switch_cooldown must be less than window_size to be meaningful
+                if (adapt_cfg.switch_cooldown >= adapt_cfg.window_size) {
+                    @compileError("adaptive: switch_cooldown should be less than window_size");
+                }
+                // Validate initial_backend if specified
+                if (adapt_cfg.initial_backend) |initial| {
+                    // initial_backend should not be adaptive_hybrid (recursive)
+                    if (initial == .adaptive_hybrid) {
+                        @compileError("adaptive: initial_backend cannot be adaptive_hybrid");
+                    }
+                    // initial_backend io_uring requires Linux
+                    if (initial == .io_uring_batch and builtin.target.os.tag != .linux) {
+                        @compileError("adaptive: initial_backend io_uring_batch requires Linux");
+                    }
+                }
+            }
+        },
     }
 }
 

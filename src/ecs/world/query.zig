@@ -454,7 +454,7 @@ test "ArchetypeQueryIterator" {
     const Position = struct { x: f32, y: f32 };
     const Velocity = struct { dx: f32, dy: f32 };
 
-    const Table = archetype_table.ArchetypeTable(&.{ Position, Velocity });
+    const Table = archetype_table.ArchetypeTable(&.{ Position, Velocity }, .dynamic, 0);
     var table = Table.init(std.testing.allocator, "test");
     defer table.deinit();
 
@@ -495,7 +495,7 @@ test "ArchetypeQueryIterator with optional - present" {
     const Velocity = struct { dx: f32, dy: f32 };
 
     // Table HAS both Position and Velocity
-    const Table = archetype_table.ArchetypeTable(&.{ Position, Velocity });
+    const Table = archetype_table.ArchetypeTable(&.{ Position, Velocity }, .dynamic, 0);
     var table = Table.init(std.testing.allocator, "test");
     defer table.deinit();
 
@@ -528,7 +528,7 @@ test "ArchetypeQueryIterator with optional - absent" {
     const Velocity = struct { dx: f32, dy: f32 };
 
     // Table only has Position, NOT Velocity
-    const Table = archetype_table.ArchetypeTable(&.{Position});
+    const Table = archetype_table.ArchetypeTable(&.{Position}, .dynamic, 0);
     var table = Table.init(std.testing.allocator, "test");
     defer table.deinit();
 

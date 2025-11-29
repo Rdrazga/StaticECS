@@ -11,6 +11,19 @@ const builtin = @import("builtin");
 const config = @import("../config.zig");
 const NumaConfig = config.NumaConfig;
 
+/// Architecture-specific syscall numbers for NUMA operations.
+/// Reference: https://syscall.sh/ and Linux kernel source
+/// Why: Syscall numbers vary by architecture; x86_64 != ARM64
+const SyscallNumbers = struct {
+    /// getcpu syscall - gets current CPU/NUMA node
+    /// x86_64: 309, ARM64: 168
+    const getcpu = switch (builtin.cpu.arch) {
+        .x86_64 => 309,
+        .aarch64 => 168,
+        else => @compileError("Unsupported architecture for NUMA getcpu syscall"),
+    };
+};
+
 /// NUMA memory policy constants (Linux).
 const MemPolicy = struct {
     const MPOL_DEFAULT: u32 = 0;
@@ -19,9 +32,59 @@ const MemPolicy = struct {
     const MPOL_INTERLEAVE: u32 = 3;
 };
 
+/// Allocation source tracking for explicit free routing.
+/// Why: Heuristics (page alignment, size) can fail when backing allocator
+/// returns page-aligned memory, causing munmap() on heap memory = corruption.
+const AllocationSource = enum(u8) {
+    /// Memory allocated via mmap with NUMA policy
+    numa = 0xAA,
+    /// Memory allocated via backing allocator (GPA, etc.)
+    backing = 0xBB,
+};
+
+/// Metadata header prepended to each allocation for explicit source tracking.
+/// Layout: [Header][padding][user data]
+/// Why: Eliminates heuristic-based free routing that caused heap corruption.
+const AllocationHeader = struct {
+    /// Magic value for corruption detection in debug builds.
+    magic: u32 = HEADER_MAGIC,
+    /// Source of this allocation for correct free routing.
+    source: AllocationSource,
+    /// Reserved for alignment and future use.
+    _reserved: [3]u8 = .{ 0, 0, 0 },
+    /// Original requested size (for debugging/assertions).
+    original_size: usize,
+
+    const HEADER_MAGIC: u32 = 0xDEAD_0A1A;
+
+    /// Header size aligned to maximum possible alignment requirement.
+    /// Why: Ensures returned user pointer maintains any alignment.
+    const SIZE: usize = @max(@sizeOf(AllocationHeader), 16);
+
+    /// Get header from user pointer (inverse of getUserPtr).
+    fn fromUserPtr(user_ptr: [*]u8) *AllocationHeader {
+        const header_addr = @intFromPtr(user_ptr) - SIZE;
+        return @ptrFromInt(header_addr);
+    }
+
+    /// Get user pointer from allocation base (header location).
+    fn getUserPtr(base_ptr: [*]u8) [*]u8 {
+        return @ptrFromInt(@intFromPtr(base_ptr) + SIZE);
+    }
+
+    /// Calculate total allocation size including header.
+    fn totalSize(user_size: usize) usize {
+        return user_size + SIZE;
+    }
+};
+
 /// NUMA-aware allocator wrapper.
 /// Wraps underlying allocator with NUMA node affinity hints.
 /// Compiles to no-op wrappers when NUMA is disabled or unsupported.
+///
+/// Allocation source tracking: Uses metadata headers to explicitly track
+/// whether each allocation came from NUMA mmap or the backing allocator.
+/// This prevents heap corruption from incorrect free routing.
 pub fn NumaAllocator(comptime cfg: NumaConfig) type {
     return struct {
         const Self = @This();
@@ -83,49 +146,74 @@ pub fn NumaAllocator(comptime cfg: NumaConfig) type {
             const self: *Self = @ptrCast(@alignCast(ctx));
 
             if (comptime !cfg.enabled) {
-                // NUMA not enabled - use backing allocator directly
+                // NUMA not enabled - use backing allocator directly (no header needed)
                 return self.backing_allocator.rawAlloc(len, ptr_align, ret_addr);
             }
 
             if (comptime builtin.os.tag != .linux) {
-                // NUMA only supported on Linux currently
+                // NUMA only supported on Linux currently (no header needed)
                 self.stats.fallback_count += 1;
                 return self.backing_allocator.rawAlloc(len, ptr_align, ret_addr);
             }
 
-            // Small allocations below page_size use backing allocator directly.
-            // This is both an optimization (mmap overhead for small allocs) and
-            // enables the free() heuristic to correctly identify allocation origin.
-            // Why: mmap always returns page-aligned pointers and allocates in page units.
-            // By ensuring NUMA allocations are >= page_size, we can distinguish them
-            // from backing allocator fallbacks at free() time.
+            // Calculate total size including metadata header.
+            // Why: Header enables explicit source tracking, eliminating heuristic-based
+            // free routing that caused heap corruption (P1-3 fix).
+            const total_size = AllocationHeader.totalSize(len);
             const page_size = std.mem.page_size;
+
+            // Small allocations below page_size use backing allocator.
+            // Why: mmap overhead not worth it for small allocations.
             if (len < page_size) {
-                self.stats.fallback_count += 1;
-                self.stats.remote_allocations += 1;
-                return self.backing_allocator.rawAlloc(len, ptr_align, ret_addr);
+                return self.allocFromBacking(len, total_size, ptr_align, ret_addr);
             }
 
             // Try NUMA-aware allocation on Linux for allocations >= page_size
-            const ptr = numaAlloc(len, self.node_id, cfg.strategy);
+            const ptr = numaAlloc(total_size, self.node_id, cfg.strategy);
 
-            if (ptr) |p| {
+            if (ptr) |base_ptr| {
                 // Assertion: mmap always returns page-aligned pointers
-                std.debug.assert(@intFromPtr(p) % page_size == 0);
+                std.debug.assert(@intFromPtr(base_ptr) % page_size == 0);
+
+                // Write header with NUMA source
+                const header: *AllocationHeader = @ptrCast(@alignCast(base_ptr));
+                header.* = .{
+                    .source = .numa,
+                    .original_size = len,
+                };
+
                 self.stats.local_allocations += 1;
                 self.stats.total_bytes_allocated += len;
-                return p;
+
+                return AllocationHeader.getUserPtr(base_ptr);
             }
 
             // Fallback to backing allocator when NUMA allocation fails.
-            // Note: free() uses pointer alignment to detect this case - if the backing
-            // allocator returns a page-aligned pointer AND len >= page_size, we cannot
-            // distinguish it from an mmap allocation at free time. This is a known
-            // limitation; the backing allocator should be GPA which typically doesn't
-            // return page-aligned pointers for arbitrary sizes.
+            // Header explicitly tracks this is backing allocator memory.
+            return self.allocFromBacking(len, total_size, ptr_align, ret_addr);
+        }
+
+        /// Allocate from backing allocator with header tracking.
+        fn allocFromBacking(self: *Self, user_len: usize, total_len: usize, ptr_align: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            // Need alignment that satisfies both header and user requirements
+            const min_align = @max(ptr_align.toByteUnits(), AllocationHeader.SIZE);
+            const backing_align: std.mem.Alignment = @enumFromInt(@ctz(min_align));
+
+            const base_ptr = self.backing_allocator.rawAlloc(total_len, backing_align, ret_addr) orelse {
+                return null;
+            };
+
+            // Write header with backing source
+            const header: *AllocationHeader = @ptrCast(@alignCast(base_ptr));
+            header.* = .{
+                .source = .backing,
+                .original_size = user_len,
+            };
+
             self.stats.fallback_count += 1;
             self.stats.remote_allocations += 1;
-            return self.backing_allocator.rawAlloc(len, ptr_align, ret_addr);
+
+            return AllocationHeader.getUserPtr(base_ptr);
         }
 
         fn resize(ctx: *anyopaque, buf: []u8, buf_align: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
@@ -135,8 +223,31 @@ pub fn NumaAllocator(comptime cfg: NumaConfig) type {
                 return self.backing_allocator.rawResize(buf, buf_align, new_len, ret_addr);
             }
 
+            // Get header to check allocation source
+            const header = AllocationHeader.fromUserPtr(buf.ptr);
+
+            // Validate header magic in debug builds
+            std.debug.assert(header.magic == AllocationHeader.HEADER_MAGIC);
+
             // NUMA allocations via mmap cannot be resized in place
-            // Return false to trigger reallocation
+            if (header.source == .numa) {
+                return false;
+            }
+
+            // Backing allocator might support resize
+            const total_new_len = AllocationHeader.totalSize(new_len);
+            const base_ptr = @as([*]u8, @ptrCast(header));
+            const total_old_len = AllocationHeader.totalSize(buf.len);
+            const base_slice = base_ptr[0..total_old_len];
+
+            const min_align = @max(buf_align.toByteUnits(), AllocationHeader.SIZE);
+            const backing_align: std.mem.Alignment = @enumFromInt(@ctz(min_align));
+
+            if (self.backing_allocator.rawResize(base_slice, backing_align, total_new_len, ret_addr)) {
+                // Update stored size on success
+                header.original_size = new_len;
+                return true;
+            }
             return false;
         }
 
@@ -148,29 +259,34 @@ pub fn NumaAllocator(comptime cfg: NumaConfig) type {
                 return;
             }
 
-            // Determine if this allocation came from numaAlloc (mmap) or backing allocator.
-            //
-            // Heuristic: mmap ALWAYS returns page-aligned pointers and we only use it for
-            // allocations >= page_size (see alloc()). Therefore:
-            // - If ptr is page-aligned AND len >= page_size → was mmap → use numaFree
-            // - Otherwise → was backing allocator fallback → use rawFree
-            //
-            // This fixes memory corruption where we previously called munmap() on memory
-            // that was allocated by the backing allocator (GPA) when numaAlloc failed.
-            const page_size = std.mem.page_size;
-            const ptr_addr = @intFromPtr(buf.ptr);
-            const is_page_aligned = (ptr_addr % page_size) == 0;
-
             // Assertion: sanity check on buffer validity
             std.debug.assert(buf.len > 0);
-            std.debug.assert(buf.ptr != undefined);
 
-            if (is_page_aligned and buf.len >= page_size) {
-                // Likely an mmap allocation - use munmap
-                numaFree(buf.ptr, buf.len);
-            } else {
-                // Either small allocation or non-page-aligned (backing allocator fallback)
-                self.backing_allocator.rawFree(buf, buf_align, ret_addr);
+            // Get header to determine allocation source explicitly.
+            // Why: Eliminates heuristic-based routing that caused heap corruption
+            // when backing allocator returned page-aligned pointers (P1-3 fix).
+            const header = AllocationHeader.fromUserPtr(buf.ptr);
+
+            // Validate header magic - catches corruption and double-free
+            std.debug.assert(header.magic == AllocationHeader.HEADER_MAGIC);
+
+            // Validate stored size matches (sanity check)
+            std.debug.assert(header.original_size == buf.len);
+
+            const total_len = AllocationHeader.totalSize(buf.len);
+            const base_ptr: [*]u8 = @ptrCast(header);
+
+            switch (header.source) {
+                .numa => {
+                    // NUMA allocation - free with munmap
+                    numaFree(base_ptr, total_len);
+                },
+                .backing => {
+                    // Backing allocator allocation - free with rawFree
+                    const min_align = @max(buf_align.toByteUnits(), AllocationHeader.SIZE);
+                    const backing_align: std.mem.Alignment = @enumFromInt(@ctz(min_align));
+                    self.backing_allocator.rawFree(base_ptr[0..total_len], backing_align, ret_addr);
+                },
             }
         }
 
@@ -274,19 +390,25 @@ pub fn detectNumaNodes() u8 {
 }
 
 /// Get the NUMA node for the current CPU.
-/// Returns 0 if detection fails.
+/// Returns 0 if detection fails or on unsupported platforms.
+///
+/// Platform Support:
+/// - Linux (x86_64, ARM64): Uses getcpu syscall
+/// - Other platforms: Returns 0 (assumes single NUMA node)
 pub fn getCurrentNumaNode() u8 {
     if (comptime builtin.os.tag != .linux) {
-        return 0;
+        return 0; // Fallback: assume single NUMA node on non-Linux
     }
 
-    // Use getcpu syscall to get current CPU and NUMA node
-    const SYS_getcpu = 309; // x86_64
+    // Compile-time architecture check via SyscallNumbers prevents
+    // compilation on unsupported architectures
+    const syscall_num = comptime SyscallNumbers.getcpu;
+
     var cpu: u32 = undefined;
     var node: u32 = undefined;
 
     const result = std.os.linux.syscall3(
-        @enumFromInt(SYS_getcpu),
+        @enumFromInt(syscall_num),
         @intFromPtr(&cpu),
         @intFromPtr(&node),
         0,
@@ -450,4 +572,64 @@ test "NumaAllocator enabled - mixed small and large allocations" {
     defer alloc.free(final_mem);
     @memset(final_mem, 0xFF);
     try std.testing.expectEqual(@as(u8, 0xFF), final_mem[0]);
+}
+
+test "NumaAllocator explicit source tracking via metadata header" {
+    // This test verifies the P1-3 fix: explicit source tracking via metadata headers.
+    // Previously, heuristic-based detection (page alignment + size) could fail when
+    // backing allocator returned page-aligned memory, causing munmap() on heap → corruption.
+    //
+    // The fix: AllocationHeader prepended to each allocation stores source explicitly.
+    //
+    // Note: Header tracking only applies on Linux when NUMA is enabled.
+    // On other platforms, the allocator passes through directly to backing allocator.
+
+    const TestConfig = NumaConfig{ .enabled = true, .strategy = .local_preferred };
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var numa = NumaAllocator(TestConfig).init(gpa.allocator(), 0);
+    var alloc = numa.allocator();
+
+    // Test 1: Small allocation (< page_size) - must use backing allocator
+    const small_mem = try alloc.alloc(u8, 256);
+    @memset(small_mem, 0x11);
+
+    // Header verification only valid on Linux where headers are used
+    if (comptime builtin.os.tag == .linux) {
+        // Verify header is accessible and marked as backing source
+        const small_header = AllocationHeader.fromUserPtr(small_mem.ptr);
+        try std.testing.expectEqual(AllocationHeader.HEADER_MAGIC, small_header.magic);
+        try std.testing.expectEqual(AllocationSource.backing, small_header.source);
+        try std.testing.expectEqual(@as(usize, 256), small_header.original_size);
+    }
+
+    // Free - should correctly route to backing allocator due to explicit tracking
+    alloc.free(small_mem);
+
+    // Test 2: Verify heap integrity after free
+    const verify_mem = try alloc.alloc(u8, 512);
+    defer alloc.free(verify_mem);
+    @memset(verify_mem, 0x22);
+    try std.testing.expectEqual(@as(u8, 0x22), verify_mem[0]);
+
+    // Header verification only valid on Linux where headers are used
+    if (comptime builtin.os.tag == .linux) {
+        // Verify this allocation also has correct header
+        const verify_header = AllocationHeader.fromUserPtr(verify_mem.ptr);
+        try std.testing.expectEqual(AllocationHeader.HEADER_MAGIC, verify_header.magic);
+        try std.testing.expectEqual(@as(usize, 512), verify_header.original_size);
+    }
+}
+
+test "AllocationHeader layout and size" {
+    // Verify header struct has expected size and alignment properties
+    try std.testing.expect(AllocationHeader.SIZE >= @sizeOf(AllocationHeader));
+    try std.testing.expect(AllocationHeader.SIZE >= 16); // Minimum alignment guarantee
+
+    // Verify magic constant is valid
+    try std.testing.expectEqual(@as(u32, 0xDEAD_0A1A), AllocationHeader.HEADER_MAGIC);
+
+    // Verify source enum values are distinct
+    try std.testing.expect(@intFromEnum(AllocationSource.numa) != @intFromEnum(AllocationSource.backing));
 }

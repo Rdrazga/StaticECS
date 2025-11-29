@@ -461,3 +461,242 @@ test "valid config with needs_io system" {
 //     };
 //     comptime validateWorldConfig(cfg);
 // }
+
+// ============================================================================
+// Backend Configuration Valid Tests
+// ============================================================================
+
+test "valid config with work_stealing execution model" {
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "entity", .components = &.{Position} },
+        } },
+        .schedule = .{
+            .execution_model = .work_stealing,
+            .backend_config = .{
+                .work_stealing = .{
+                    .worker_count = 4,
+                    .local_queue_size = 256, // Power of 2
+                    .steal_batch = 32,
+                },
+            },
+        },
+    };
+
+    comptime validateWorldConfig(cfg);
+}
+
+test "valid config with work_stealing auto-detect workers" {
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "entity", .components = &.{Position} },
+        } },
+        .schedule = .{
+            .execution_model = .work_stealing,
+            .backend_config = .{
+                .work_stealing = .{
+                    .worker_count = 0, // Auto-detect
+                    .local_queue_size = 128,
+                },
+            },
+        },
+    };
+
+    comptime validateWorldConfig(cfg);
+}
+
+test "valid config with adaptive_hybrid execution model" {
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "entity", .components = &.{Position} },
+        } },
+        .schedule = .{
+            .execution_model = .adaptive_hybrid,
+            .backend_config = .{
+                .adaptive = .{
+                    .batch_threshold = 64,
+                    .imbalance_threshold = 0.3,
+                    .window_size = 100,
+                    .switch_cooldown = 10,
+                },
+            },
+        },
+    };
+
+    comptime validateWorldConfig(cfg);
+}
+
+// ============================================================================
+// Backend Configuration Manual Comptime Error Tests
+// ============================================================================
+//
+// These tests verify that invalid backend configs produce compile errors.
+// Uncomment ONE AT A TIME to verify the expected error message.
+
+// --- Error 12: io_uring on non-Linux (only fails on Windows/Mac) ---
+// Expected: "io_uring_batch execution model is only available on Linux"
+//
+// test "comptime error: io_uring on non-Linux" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .schedule = .{
+//             .execution_model = .io_uring_batch,
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }
+
+// --- Error 13: work_stealing queue size not power of 2 ---
+// Expected: "work_stealing: local_queue_size must be power of 2"
+//
+// test "comptime error: work_stealing queue not power of 2" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .schedule = .{
+//             .execution_model = .work_stealing,
+//             .backend_config = .{
+//                 .work_stealing = .{
+//                     .local_queue_size = 100, // Invalid: not power of 2
+//                 },
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }
+
+// --- Error 14: work_stealing worker_count exceeds max ---
+// Expected: "work_stealing: worker_count maximum is 256"
+//
+// test "comptime error: work_stealing worker count exceeds max" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .schedule = .{
+//             .execution_model = .work_stealing,
+//             .backend_config = .{
+//                 .work_stealing = .{
+//                     .worker_count = 300, // Invalid: > 256
+//                 },
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }
+
+// --- Error 15: work_stealing steal_batch exceeds queue ---
+// Expected: "work_stealing: steal_batch exceeds local_queue_size"
+//
+// test "comptime error: work_stealing steal_batch exceeds queue" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .schedule = .{
+//             .execution_model = .work_stealing,
+//             .backend_config = .{
+//                 .work_stealing = .{
+//                     .local_queue_size = 64,
+//                     .steal_batch = 100, // Invalid: > local_queue_size
+//                 },
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }
+
+// --- Error 16: adaptive imbalance_threshold out of range ---
+// Expected: "adaptive: imbalance_threshold must be between 0 and 1 (exclusive)"
+//
+// test "comptime error: adaptive imbalance threshold invalid" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .schedule = .{
+//             .execution_model = .adaptive_hybrid,
+//             .backend_config = .{
+//                 .adaptive = .{
+//                     .imbalance_threshold = 1.5, // Invalid: > 1
+//                 },
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }
+
+// --- Error 17: adaptive batch_threshold zero ---
+// Expected: "adaptive: batch_threshold must be at least 1"
+//
+// test "comptime error: adaptive batch_threshold zero" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .schedule = .{
+//             .execution_model = .adaptive_hybrid,
+//             .backend_config = .{
+//                 .adaptive = .{
+//                     .batch_threshold = 0, // Invalid: must be > 0
+//                 },
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }
+
+// --- Error 18: adaptive switch_cooldown >= window_size ---
+// Expected: "adaptive: switch_cooldown should be less than window_size"
+//
+// test "comptime error: adaptive cooldown exceeds window" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .schedule = .{
+//             .execution_model = .adaptive_hybrid,
+//             .backend_config = .{
+//                 .adaptive = .{
+//                     .window_size = 50,
+//                     .switch_cooldown = 100, // Invalid: >= window_size
+//                 },
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }
+
+// --- Error 19: adaptive initial_backend is adaptive_hybrid ---
+// Expected: "adaptive: initial_backend cannot be adaptive_hybrid"
+//
+// test "comptime error: adaptive initial_backend recursive" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .schedule = .{
+//             .execution_model = .adaptive_hybrid,
+//             .backend_config = .{
+//                 .adaptive = .{
+//                     .initial_backend = .adaptive_hybrid, // Invalid: recursive
+//                 },
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }

@@ -1,8 +1,8 @@
 //! Huge Page Allocator
 //!
 //! Provides huge page allocation for reduced TLB misses on large allocations.
-//! Supports 2MB and 1GB huge pages on Linux, with automatic fallback to
-//! regular pages when huge pages are unavailable.
+//! Supports 2MB and 1GB huge pages on Linux, Windows large pages (with privileges),
+//! and macOS superpages, with automatic fallback to regular pages when unavailable.
 //!
 //! Tiger Style: Configurable thresholds, graceful fallback, platform detection.
 
@@ -10,6 +10,90 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("../config.zig");
 const HugePageConfig = config.HugePageConfig;
+
+// ─────────────────────────────────────────────────────────────────
+// Windows API declarations for large page support
+// ─────────────────────────────────────────────────────────────────
+
+/// Windows-specific constants and extern declarations for large page allocation.
+/// These are only used when comptime builtin.os.tag == .windows.
+const WindowsLargePages = struct {
+    // Memory allocation flags
+    const MEM_LARGE_PAGES: u32 = 0x20000000;
+    const MEM_COMMIT: u32 = 0x00001000;
+    const MEM_RESERVE: u32 = 0x00002000;
+    const MEM_RELEASE: u32 = 0x00008000;
+
+    // Page protection
+    const PAGE_READWRITE: u32 = 0x04;
+
+    // Windows BOOL type
+    const BOOL = c_int;
+
+    // Extern function declarations using .winapi calling convention
+    extern "kernel32" fn GetLargePageMinimum() callconv(.winapi) usize;
+    extern "kernel32" fn VirtualAlloc(
+        lpAddress: ?*anyopaque,
+        dwSize: usize,
+        flAllocationType: u32,
+        flProtect: u32,
+    ) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn VirtualFree(
+        lpAddress: *anyopaque,
+        dwSize: usize,
+        dwFreeType: u32,
+    ) callconv(.winapi) BOOL;
+
+    /// Get the system's large page minimum size.
+    /// Returns 0 if large pages are not supported.
+    fn getLargePageSize() usize {
+        return GetLargePageMinimum();
+    }
+
+    /// Allocate memory using Windows large pages.
+    /// Returns null if allocation fails (typically due to missing SeLockMemoryPrivilege).
+    fn allocate(size: usize) ?[*]u8 {
+        const large_page_size = getLargePageSize();
+        if (large_page_size == 0) {
+            // Large pages not supported on this system
+            return null;
+        }
+
+        // Round up to large page boundary
+        const aligned_size = std.mem.alignForward(usize, size, large_page_size);
+
+        // Attempt allocation with MEM_LARGE_PAGES
+        // This will fail with ERROR_PRIVILEGE_NOT_HELD if SeLockMemoryPrivilege is not enabled
+        const result = VirtualAlloc(
+            null, // Let system choose address
+            aligned_size,
+            MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+            PAGE_READWRITE,
+        );
+
+        if (result) |ptr| {
+            return @ptrCast(ptr);
+        }
+
+        // Allocation failed - likely ERROR_PRIVILEGE_NOT_HELD (1314)
+        // or ERROR_NO_SYSTEM_RESOURCES (1450)
+        // Caller should fall back to regular allocation
+        return null;
+    }
+
+    /// Free memory allocated with Windows large pages.
+    fn deallocate(ptr: [*]u8) void {
+        // For MEM_RELEASE, dwSize must be 0
+        _ = VirtualFree(@ptrCast(ptr), 0, MEM_RELEASE);
+    }
+
+    /// Check if large pages appear to be available.
+    /// Note: This checks if the system supports large pages, but actual allocation
+    /// may still fail if SeLockMemoryPrivilege is not granted to the process.
+    fn isAvailable() bool {
+        return getLargePageSize() > 0;
+    }
+};
 
 /// Huge page allocator wrapper.
 /// Routes large allocations through huge pages for reduced TLB pressure.
@@ -217,24 +301,24 @@ pub fn HugePageAllocator(comptime cfg: HugePageConfig) type {
         }
 
         fn hugeAllocWindows(len: usize) ?[*]u8 {
-            // Windows large page allocation via VirtualAlloc
-            // Note: Requires SeLockMemoryPrivilege which most processes don't have
-            // This is a stub - Windows huge pages require explicit privilege setup
-            // Applications should use the fallback mechanism when huge pages fail
+            // Windows large page allocation via VirtualAlloc with MEM_LARGE_PAGES.
+            // Requirements:
+            // 1. SeLockMemoryPrivilege must be granted to the user
+            //    (via Local Security Policy → User Rights → Lock pages in memory)
+            // 2. Process must have sufficient virtual address space
+            //
+            // If privilege is not available, allocation fails gracefully and
+            // returns null, allowing caller to fall back to regular pages.
             if (comptime builtin.os.tag != .windows) return null;
-            _ = len;
 
-            // Windows huge pages require:
-            // 1. SeLockMemoryPrivilege granted to the user
-            // 2. VirtualAlloc with MEM_LARGE_PAGES flag
-            // Since these require admin setup, return null to trigger fallback
-            return null;
+            return WindowsLargePages.allocate(len);
         }
 
         fn hugeFreeWindows(ptr: [*]u8) void {
-            // Stub for Windows - see hugeAllocWindows comment
+            // Free Windows large page allocation using VirtualFree
             if (comptime builtin.os.tag != .windows) return;
-            _ = ptr;
+
+            WindowsLargePages.deallocate(ptr);
         }
 
         fn hugeAllocMacos(len: usize) ?[*]u8 {
@@ -299,9 +383,13 @@ fn checkLinuxHugePages(page_size: HugePageConfig.PageSize) bool {
 }
 
 fn checkWindowsLargePages() bool {
-    // On Windows, we just return true and let VirtualAlloc fail if not available
-    // Proper check requires privilege verification
-    return builtin.os.tag == .windows;
+    // Check if Windows large pages are available.
+    // This verifies GetLargePageMinimum() returns a non-zero value.
+    // Note: Even if this returns true, actual allocation may fail if
+    // SeLockMemoryPrivilege is not granted to the process user.
+    if (comptime builtin.os.tag != .windows) return false;
+
+    return WindowsLargePages.isAvailable();
 }
 
 fn checkMacosSuperpages() bool {
@@ -310,13 +398,17 @@ fn checkMacosSuperpages() bool {
 }
 
 /// Get the system's minimum huge page size.
+/// On Windows, queries GetLargePageMinimum() for the actual system value.
+/// On other platforms, returns the known default (typically 2MB).
 pub fn getMinimumHugePageSize() usize {
     if (comptime builtin.os.tag == .linux) {
         // Most Linux systems support 2MB
         return 2 * 1024 * 1024;
     } else if (comptime builtin.os.tag == .windows) {
-        // Windows large page size is typically 2MB
-        return 2 * 1024 * 1024;
+        // Query actual Windows large page size
+        const size = WindowsLargePages.getLargePageSize();
+        // If large pages not supported, return typical value for compatibility
+        return if (size > 0) size else 2 * 1024 * 1024;
     } else if (comptime builtin.os.tag == .macos) {
         // macOS superpage size is 2MB
         return 2 * 1024 * 1024;

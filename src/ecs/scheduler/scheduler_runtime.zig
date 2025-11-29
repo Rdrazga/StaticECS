@@ -36,6 +36,9 @@ const IoBackend = system_context.IoBackend;
 const BackendOptions = system_context.BackendOptions;
 const ConcurrentCommandBuffers = system_context.ConcurrentCommandBuffers;
 
+const context_mod = @import("../context/mod.zig");
+const ComponentRegistry = context_mod.ComponentRegistry;
+
 // ============================================================================
 // System Executor
 // ============================================================================
@@ -92,10 +95,12 @@ pub fn SystemExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type 
 // ============================================================================
 
 /// Processes deferred commands after system execution.
-/// Tiger Style: Uses config-based CommandBuffer type.
+/// Tiger Style: Uses config-based CommandBuffer type and ComponentRegistry for type dispatch.
 pub fn CommandExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
     const SysCtx = SystemContext(cfg, WorldType);
     const CmdBuf = SysCtx.CmdBuf;
+    const archetype_count = cfg.archetypes.archetypes.len;
+    const CompRegistry = ComponentRegistry(cfg, WorldType);
 
     return struct {
         const Self = @This();
@@ -109,23 +114,12 @@ pub fn CommandExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type
                         world.despawn(handle) catch {};
                     },
                     .spawn => |spawn_cmd| {
-                        // For basic spawn without data, we can't do much here
-                        // since we don't know the component values
-                        // This would typically be handled by typed spawn helpers
-                        _ = spawn_cmd;
+                        // Tiger Style: Execute spawn with archetype dispatch
+                        executeSpawnCommand(world, spawn_cmd);
                     },
                     .set_component => |set_cmd| {
-                        // Component set commands are handled generically
-                        // The actual component type resolution happens at the call site
-                        // Here we just validate the entity is alive
-                        if (!world.isAlive(set_cmd.entity)) {
-                            // Entity no longer exists, skip silently
-                            continue;
-                        }
-                        // Note: Generic component set requires runtime type info
-                        // which we don't have. The actual work is done through
-                        // compile-time typed wrappers in SystemContext.
-                        // Future: implement runtime component registry for deferred ops
+                        // Tiger Style: Use ComponentRegistry for typed dispatch
+                        executeSetComponentCommand(world, set_cmd);
                     },
                     .custom => |custom_cmd| {
                         // Custom commands would be handled by user-defined handlers
@@ -134,6 +128,103 @@ pub fn CommandExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type
                 }
             }
             commands.clear();
+        }
+
+        /// Execute a spawn command, creating an entity in the specified archetype.
+        /// Tiger Style: Uses inline for to dispatch to correct archetype at comptime.
+        fn executeSpawnCommand(world: *WorldType, spawn_cmd: CmdBuf.CommandT.spawn) void {
+            const arch_idx = spawn_cmd.archetype_index;
+
+            // Validate archetype index
+            if (arch_idx >= archetype_count) {
+                // Invalid archetype index - skip silently (fail-safe)
+                // Tiger Style: In debug builds, this would be caught by assertions
+                if (@import("builtin").mode == .Debug) {
+                    std.debug.print("spawn command: invalid archetype index {}\n", .{arch_idx});
+                }
+                return;
+            }
+
+            // Allocate entity
+            const handle = world.entities.create() orelse {
+                // Capacity exhausted - skip silently (fail-safe)
+                if (@import("builtin").mode == .Debug) {
+                    std.debug.print("spawn command: entity capacity exhausted\n", .{});
+                }
+                return;
+            };
+
+            // Dispatch to correct archetype using comptime inline for
+            inline for (0..archetype_count) |i| {
+                if (arch_idx == i) {
+                    const table = &world.storage[i];
+                    const TableType = @TypeOf(table.*);
+
+                    // Add entity with component data
+                    const row = blk: {
+                        if (spawn_cmd.data_size > 0) {
+                            // Has component data - unpack from bytes
+                            const expected_size = TableType.packedComponentSize();
+                            std.debug.assert(spawn_cmd.data_size == expected_size);
+
+                            break :blk table.addEntityFromBytes(
+                                handle.toId(),
+                                spawn_cmd.data[0..spawn_cmd.data_size],
+                            ) catch {
+                                // Failed to add entity - destroy handle and skip
+                                _ = world.entities.destroy(handle);
+                                return;
+                            };
+                        } else {
+                            // No component data - use default values
+                            // Create a zeroed component tuple
+                            var default_data: [TableType.packedComponentSize()]u8 = undefined;
+                            @memset(&default_data, 0);
+
+                            break :blk table.addEntityFromBytes(
+                                handle.toId(),
+                                &default_data,
+                            ) catch {
+                                _ = world.entities.destroy(handle);
+                                return;
+                            };
+                        }
+                    };
+
+                    // Update entity metadata with location
+                    _ = world.entities.setLocation(handle, @intCast(i), row);
+                    return;
+                }
+            }
+        }
+
+        /// Execute a set_component command using the ComponentRegistry for type dispatch.
+        /// Tiger Style: Uses comptime-generated registry for O(log N) component_id lookup.
+        fn executeSetComponentCommand(world: *WorldType, set_cmd: CmdBuf.CommandT.set_component) void {
+            // Validate entity is alive before attempting to set component
+            if (!world.isAlive(set_cmd.entity)) {
+                // Entity no longer exists, skip silently (common case for despawned entities)
+                return;
+            }
+
+            // Use ComponentRegistry to dispatch to typed setter
+            const success = CompRegistry.executeSetComponent(
+                world,
+                set_cmd.entity,
+                set_cmd.component_id,
+                &set_cmd.data,
+                set_cmd.size,
+            );
+
+            // Tiger Style: In debug mode, report failures for debugging
+            if (!success) {
+                if (@import("builtin").mode == .Debug) {
+                    std.debug.print(
+                        "set_component: failed for entity {} component_id {}\n",
+                        .{ set_cmd.entity.id.toU32(), set_cmd.component_id },
+                    );
+                }
+            }
         }
     };
 }
@@ -203,6 +294,106 @@ pub fn StageExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
             return executeStage(ctx, stage, policy, errors);
         }
 
+        // ==================================================================
+        // Parallel Execution Helpers (Tiger Style: pure leaves, ≤70 lines)
+        // ==================================================================
+
+        /// Concurrent command buffers type alias for parallel execution.
+        const ConcBufs = ConcurrentCommandBuffers(
+            cfg.options.max_systems_per_stage,
+            cfg.options.max_commands_per_frame,
+            cfg.options.max_component_data_size,
+        );
+
+        /// Decision helper: determines if parallel execution should be used.
+        /// Returns false if IoContext is unavailable or lacks concurrency.
+        fn shouldUseParallel(ctx: *const SysCtx) bool {
+            return ctx.io != null and ctx.hasConcurrency();
+        }
+
+        /// Check if all systems have completed execution.
+        fn allCompleted(completed: []const bool) bool {
+            for (completed) |c| {
+                if (!c) return false;
+            }
+            return true;
+        }
+
+        /// Schedule and execute all systems in a stage for parallel execution.
+        /// In stub mode, systems execute immediately but use isolated command buffers.
+        fn scheduleAndExecuteSystems(
+            ctx: *SysCtx,
+            io: *IoContext,
+            comptime stage: ConfigStage,
+            concurrent_cmds: *ConcBufs,
+            system_errors: *[stage.system_count]?FrameError,
+            completed: *[stage.system_count]bool,
+        ) void {
+            inline for (0..stage.system_count) |i| {
+                const sys_idx = stage.system_indices[i];
+                const per_system_cmds = concurrent_cmds.getForSystem(@intCast(i));
+
+                // Schedule system through IoBackend (stub: called immediately)
+                const SystemTask = struct {
+                    fn execute(task_ctx: *const anyopaque) void {
+                        _ = task_ctx;
+                    }
+                };
+                io.scheduleAsync(SystemTask.execute, @ptrCast(&sys_idx)) catch {};
+
+                // Stub: execute system immediately
+                SysExec.executeSystem(ctx, sys_idx) catch |err| {
+                    system_errors[i] = err;
+                };
+                completed[i] = true;
+                _ = per_system_cmds;
+            }
+        }
+
+        /// Poll IoBackend until all systems report completion.
+        fn waitForCompletion(io: *IoContext, completed: []const bool) void {
+            if (io.getBackend()) |backend| {
+                while (!allCompleted(completed)) {
+                    _ = backend.poll() catch break;
+                }
+            }
+        }
+
+        /// Collect errors from system execution and add to aggregate.
+        /// Returns true if all systems succeeded, false otherwise.
+        fn collectErrors(
+            comptime stage: ConfigStage,
+            system_errors: *const [stage.system_count]?FrameError,
+            policy: FramePolicy,
+            errors: *AggregateErrors,
+            time_ns: u64,
+        ) bool {
+            var all_success = true;
+            for (0..stage.system_count) |i| {
+                if (system_errors[i]) |err| {
+                    all_success = false;
+                    errors.add(err, stage.system_indices[i], time_ns);
+                    if (policy == .default) {
+                        // Note: Can't stop already-running systems in true parallel
+                    }
+                }
+            }
+            return all_success;
+        }
+
+        /// Merge per-system command buffers and execute deferred commands.
+        fn mergeAndFlushCommands(
+            ctx: *SysCtx,
+            concurrent_cmds: *ConcBufs,
+        ) void {
+            _ = concurrent_cmds.mergeInto(ctx.commands);
+            CmdExec.executeCommands(ctx.world, ctx.commands);
+        }
+
+        // ==================================================================
+        // Main Parallel Executor (Tiger Style: central control, ≤70 lines)
+        // ==================================================================
+
         /// Execute all systems in a stage with potential parallelism.
         ///
         /// In threadpool mode, systems in a stage can run concurrently because
@@ -219,98 +410,31 @@ pub fn StageExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
             policy: FramePolicy,
             errors: *AggregateErrors,
         ) bool {
-            // If no IoContext or not concurrent, fall back to sequential
-            if (ctx.io == null or !ctx.hasConcurrency()) {
+            // Fall back to sequential if parallel not available
+            if (!shouldUseParallel(ctx)) {
                 return executeStage(ctx, stage, policy, errors);
             }
 
             const io = ctx.io.?;
-            var all_success = true;
 
-            // Create per-system command buffers for concurrent isolation
-            const ConcBufs = ConcurrentCommandBuffers(
-                cfg.options.max_systems_per_stage,
-                cfg.options.max_commands_per_frame,
-                cfg.options.max_component_data_size,
-            );
+            // Setup: create per-system command buffers and tracking arrays
             var concurrent_cmds = ConcBufs.init();
-
-            // Track system completion and errors
             var system_errors: [stage.system_count]?FrameError = .{null} ** stage.system_count;
             var completed: [stage.system_count]bool = .{false} ** stage.system_count;
 
-            // Schedule all systems in the stage for concurrent execution
-            inline for (0..stage.system_count) |i| {
-                const sys_idx = stage.system_indices[i];
+            // Schedule and execute all systems
+            scheduleAndExecuteSystems(ctx, io, stage, &concurrent_cmds, &system_errors, &completed);
 
-                // Create per-system context with isolated command buffer
-                // Note: In a real concurrent implementation, each system would get
-                // its own context. For the stub, we schedule sequentially.
-                const per_system_cmds = concurrent_cmds.getForSystem(@intCast(i));
+            // Wait for completion (stub: immediate return)
+            waitForCompletion(io, &completed);
 
-                // Schedule system execution through IoBackend
-                // The callback captures context and writes results
-                const SystemTask = struct {
-                    fn execute(task_ctx: *const anyopaque) void {
-                        _ = task_ctx;
-                        // In stub mode, this is called immediately
-                        // Real implementation would capture ctx, sys_idx, per_system_cmds
-                        // and execute the system on a worker thread
-                    }
-                };
+            // Collect errors and determine success
+            const all_success = collectErrors(stage, &system_errors, policy, errors, ctx.time_ns);
 
-                io.scheduleAsync(SystemTask.execute, @ptrCast(&sys_idx)) catch |err| {
-                    _ = err;
-                    // If scheduling fails, execute inline
-                };
-
-                // For stub implementation: execute system immediately
-                SysExec.executeSystem(ctx, sys_idx) catch |err| {
-                    system_errors[i] = err;
-                };
-                completed[i] = true;
-
-                // Copy commands from main buffer to per-system buffer (for stub mode)
-                // In real concurrent mode, system would write directly to per-system buffer
-                _ = per_system_cmds;
-            }
-
-            // Poll IoBackend until all systems complete
-            // For stub, this returns immediately since all are already done
-            if (io.getBackend()) |backend| {
-                while (!allCompleted(&completed)) {
-                    _ = backend.poll() catch break;
-                }
-            }
-
-            // Collect errors and update aggregate
-            for (0..stage.system_count) |i| {
-                if (system_errors[i]) |err| {
-                    all_success = false;
-                    errors.add(err, stage.system_indices[i], ctx.time_ns);
-
-                    if (policy == .default) {
-                        // Note: Can't stop other systems that may already be running
-                        // in true parallel mode. With stub, we continue collecting.
-                    }
-                }
-            }
-
-            // Merge per-system command buffers into main buffer
-            _ = concurrent_cmds.mergeInto(ctx.commands);
-
-            // Process deferred commands
-            CmdExec.executeCommands(ctx.world, ctx.commands);
+            // Merge commands and execute deferred operations
+            mergeAndFlushCommands(ctx, &concurrent_cmds);
 
             return all_success;
-        }
-
-        /// Check if all systems have completed.
-        fn allCompleted(completed: []const bool) bool {
-            for (completed) |c| {
-                if (!c) return false;
-            }
-            return true;
         }
     };
 }

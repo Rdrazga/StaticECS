@@ -53,7 +53,8 @@ pub fn ConcurrentCommandBuffers(
         buffers: [max_systems]PerSystemBuffer = .{PerSystemBuffer.init()} ** max_systems,
 
         /// Number of systems actively using buffers.
-        active_count: u16 = 0,
+        /// Atomic to prevent race conditions when concurrent systems call getForSystem().
+        active_count: std.atomic.Value(u16) = std.atomic.Value(u16).init(0),
 
         /// Initialize concurrent command buffers.
         pub fn init() Self {
@@ -64,11 +65,12 @@ pub fn ConcurrentCommandBuffers(
         ///
         /// Tiger Style: System index must be < max_systems.
         /// Precondition: system_index < max_concurrent_systems
+        /// Thread-safe: Uses atomic fetchMax to update active_count.
         pub fn getForSystem(self: *Self, system_index: u16) *PerSystemBuffer {
             std.debug.assert(system_index < max_systems);
-            if (system_index >= self.active_count) {
-                self.active_count = system_index + 1;
-            }
+            // Atomically update active_count to max(active_count, system_index + 1)
+            // This ensures thread-safe tracking of highest system index used.
+            _ = self.active_count.fetchMax(system_index + 1, .release);
             return &self.buffers[system_index];
         }
 
@@ -78,10 +80,12 @@ pub fn ConcurrentCommandBuffers(
         /// After merge, all per-system buffers are cleared.
         ///
         /// Returns the number of commands merged, or 0 if target would overflow.
+        /// Note: This should only be called when no systems are concurrently using buffers.
         pub fn mergeInto(self: *Self, target: anytype) usize {
             var merged_count: usize = 0;
+            const current_active = self.active_count.load(.acquire);
 
-            for (0..self.active_count) |i| {
+            for (0..current_active) |i| {
                 const src = &self.buffers[i];
                 for (src.getCommands()) |cmd| {
                     // Check if target can accept more commands
@@ -99,22 +103,25 @@ pub fn ConcurrentCommandBuffers(
                 src.clear();
             }
 
-            self.active_count = 0;
+            self.active_count.store(0, .release);
             return merged_count;
         }
 
         /// Clear all per-system buffers.
+        /// Note: This should only be called when no systems are concurrently using buffers.
         pub fn clearAll(self: *Self) void {
-            for (0..self.active_count) |i| {
+            const current_active = self.active_count.load(.acquire);
+            for (0..current_active) |i| {
                 self.buffers[i].clear();
             }
-            self.active_count = 0;
+            self.active_count.store(0, .release);
         }
 
         /// Get total commands across all active buffers.
         pub fn totalCommands(self: *const Self) usize {
             var total: usize = 0;
-            for (0..self.active_count) |i| {
+            const current_active = self.active_count.load(.acquire);
+            for (0..current_active) |i| {
                 total += self.buffers[i].count;
             }
             return total;
@@ -122,7 +129,8 @@ pub fn ConcurrentCommandBuffers(
 
         /// Check if any buffer is approaching capacity.
         pub fn anyNearCapacity(self: *const Self, threshold: usize) bool {
-            for (0..self.active_count) |i| {
+            const current_active = self.active_count.load(.acquire);
+            for (0..current_active) |i| {
                 if (self.buffers[i].count >= threshold) {
                     return true;
                 }

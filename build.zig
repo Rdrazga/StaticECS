@@ -120,4 +120,39 @@ pub fn build(b: *std.Build) void {
     examples_step.dependOn(&game_example.step);
     examples_step.dependOn(&http_example.step);
     examples_step.dependOn(&pipeline_example.step);
+
+    // ======================================================================
+    // Benchmark Step
+    // ======================================================================
+    //
+    // Benchmark step:
+    //   zig build benchmark          - Run all benchmarks
+    //   zig build benchmark -- -h    - Show benchmark options (if implemented)
+    //
+    // Note: Benchmarks always run with ReleaseFast optimization
+    // regardless of the -Doptimize flag to ensure consistent timing.
+    //
+    // Reference: TC-L1 issue - benchmarks must run in ReleaseFast mode for
+    // accurate performance measurements, not debug mode.
+
+    const benchmark_exe = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ecs/benchmark.zig"),
+            .target = target,
+            .optimize = .ReleaseFast, // Always ReleaseFast for accurate benchmarks
+        }),
+    });
+    b.installArtifact(benchmark_exe);
+
+    const run_benchmark = b.addRunArtifact(benchmark_exe);
+    run_benchmark.step.dependOn(b.getInstallStep());
+
+    // Allow passing args to benchmark
+    if (b.args) |args| {
+        run_benchmark.addArgs(args);
+    }
+
+    const benchmark_step = b.step("benchmark", "Run performance benchmarks in ReleaseFast mode");
+    benchmark_step.dependOn(&run_benchmark.step);
 }

@@ -56,16 +56,37 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
         // Fast-Path Queue
         // ====================================================================
 
-        /// Ring buffer queue for fast-path entities.
+        /// Thread-safe ring buffer queue for fast-path entities.
+        ///
+        /// ## Thread Safety Model: SPSC (Single-Producer Single-Consumer)
+        ///
+        /// This queue is designed for scenarios where exactly ONE thread
+        /// produces (calls `push`) and exactly ONE thread consumes (calls `pop`).
+        /// This is the common pattern for fast-path processing where:
+        /// - Main/request thread pushes items to the queue
+        /// - Worker/processing thread pops and processes items
+        ///
+        /// ### Atomic Operations:
+        /// - `head`: Modified only by consumer via `pop()`, read by producer
+        /// - `tail`: Modified only by producer via `push()`, read by consumer
+        /// - `count`: Derived atomically from head and tail positions
+        ///
+        /// ### Memory Ordering:
+        /// - Release semantics on writes ensure data visibility before index update
+        /// - Acquire semantics on reads ensure seeing the latest data after index read
+        ///
+        /// ### NOT Safe For:
+        /// - Multiple producers (MPSC) - use lock-free queue from coordination module
+        /// - Multiple consumers (SPMC/MPMC) - requires additional synchronization
+        ///
+        /// Tiger Style: Fixed capacity, no dynamic allocation, bounded queue.
         pub const FastPathQueue = struct {
             /// Storage for fast-path items.
             items: [fast_path_capacity]FastPathItem = undefined,
-            /// Head index (read position).
-            head: u32 = 0,
-            /// Tail index (write position).
-            tail: u32 = 0,
-            /// Number of items in queue.
-            count: u32 = 0,
+            /// Head index (read position) - modified only by consumer.
+            head: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+            /// Tail index (write position) - modified only by producer.
+            tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
             /// Single fast-path item containing input and callback.
             pub const FastPathItem = struct {
@@ -84,57 +105,94 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
                 return .{};
             }
 
-            /// Push item to queue.
+            /// Push item to queue (producer-side operation).
+            ///
+            /// Thread Safety: Only ONE thread should call push() concurrently.
+            /// Uses acquire-release ordering to ensure item data is visible
+            /// to consumer after tail update.
+            ///
             /// Returns false if queue is full.
             pub fn push(self: *FastPathQueue, item: FastPathItem) bool {
-                if (self.count >= fast_path_capacity) {
+                const current_tail = self.tail.load(.acquire);
+                const current_head = self.head.load(.acquire);
+
+                // Calculate count from head/tail positions (handles wrap-around)
+                const count = current_tail -% current_head;
+                if (count >= fast_path_capacity) {
                     return false; // Queue full
                 }
 
-                self.items[self.tail] = item;
-                self.tail = (self.tail + 1) % fast_path_capacity;
-                self.count += 1;
+                // Write item at current tail position
+                self.items[current_tail % fast_path_capacity] = item;
+
+                // Release store ensures item write is visible before tail update
+                self.tail.store(current_tail +% 1, .release);
                 return true;
             }
 
-            /// Pop item from queue.
+            /// Pop item from queue (consumer-side operation).
+            ///
+            /// Thread Safety: Only ONE thread should call pop() concurrently.
+            /// Uses acquire-release ordering to ensure item data is read
+            /// before head update signals availability for reuse.
+            ///
             /// Returns null if queue is empty.
             pub fn pop(self: *FastPathQueue) ?*FastPathItem {
-                if (self.count == 0) {
+                const current_head = self.head.load(.acquire);
+                const current_tail = self.tail.load(.acquire);
+
+                // Calculate count from head/tail positions (handles wrap-around)
+                const count = current_tail -% current_head;
+                if (count == 0) {
                     return null; // Queue empty
                 }
 
-                const item = &self.items[self.head];
-                self.head = (self.head + 1) % fast_path_capacity;
-                self.count -= 1;
+                // Get item pointer at current head position
+                const item = &self.items[current_head % fast_path_capacity];
+
+                // Release store ensures item read completes before head update
+                self.head.store(current_head +% 1, .release);
                 return item;
             }
 
             /// Check if queue is empty.
+            /// Thread-safe read using atomic loads.
             pub fn isEmpty(self: *const FastPathQueue) bool {
-                return self.count == 0;
+                const current_tail = self.tail.load(.acquire);
+                const current_head = self.head.load(.acquire);
+                return current_tail == current_head;
             }
 
             /// Check if queue is full.
+            /// Thread-safe read using atomic loads.
             pub fn isFull(self: *const FastPathQueue) bool {
-                return self.count >= fast_path_capacity;
+                const current_tail = self.tail.load(.acquire);
+                const current_head = self.head.load(.acquire);
+                const count = current_tail -% current_head;
+                return count >= fast_path_capacity;
             }
 
             /// Get current queue size.
+            /// Thread-safe read using atomic loads.
             pub fn len(self: *const FastPathQueue) u32 {
-                return self.count;
+                const current_tail = self.tail.load(.acquire);
+                const current_head = self.head.load(.acquire);
+                return current_tail -% current_head;
             }
 
             /// Get remaining capacity.
+            /// Thread-safe read using atomic loads.
             pub fn remaining(self: *const FastPathQueue) u32 {
-                return fast_path_capacity - self.count;
+                return fast_path_capacity - self.len();
             }
 
             /// Clear all items from queue.
+            ///
+            /// WARNING: NOT thread-safe! Only call when no other threads
+            /// are accessing the queue (e.g., during initialization or shutdown).
             pub fn clear(self: *FastPathQueue) void {
-                self.head = 0;
-                self.tail = 0;
-                self.count = 0;
+                self.head.store(0, .release);
+                self.tail.store(0, .release);
             }
         };
 

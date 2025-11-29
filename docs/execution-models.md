@@ -64,12 +64,23 @@ pub const cfg = ecs.WorldConfig{
 Systems in blocking mode are straightforward:
 
 ```zig
-fn mySystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+const FrameError = ecs.FrameError;
+const World = ecs.World(cfg);
+const Context = ecs.SystemContext(cfg, World);
+
+// Helper to cast opaque pointer
+fn getContext(ctx_ptr: *anyopaque) *Context {
+    return @ptrCast(@alignCast(ctx_ptr));
+}
+
+fn mySystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
     // ctx.io is null - don't use I/O operations
     
     var query = ctx.world.query(.{ .include = &.{Position} });
     while (query.next()) |result| {
         // Process synchronously
+        _ = result;
     }
 }
 ```
@@ -77,8 +88,12 @@ fn mySystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 ### Frame Execution
 
 ```zig
-// Execute frame - blocks until complete
-const result = Scheduler.executeFrame(&world, delta, tick, null, allocator);
+// Create scheduler and execute frame - blocks until complete
+const Scheduler = ecs.Scheduler(cfg);
+var scheduler = Scheduler.init(&world, null, allocator);
+defer scheduler.deinit();
+
+const result = scheduler.tick(delta_time);
 // All systems have finished when this returns
 ```
 
@@ -131,7 +146,9 @@ pub const cfg = ecs.WorldConfig{
     // ...
 };
 
-fn networkSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn networkSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     // IoContext available when needs_io = true
     if (ctx.hasIo()) {
         const io = ctx.getIo();
@@ -140,6 +157,7 @@ fn networkSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
         if (io.hasAsync()) {
             // Can use async operations
             // io.async() - schedules without requiring concurrency
+            _ = io;
         }
         
         if (io.hasConcurrency()) {
@@ -161,11 +179,13 @@ In evented mode:
 - `io.asyncConcurrent()` - Returns error (no parallelism)
 
 ```zig
-fn serverSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
-    const io = ctx.getIo();
+fn serverSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    const io = ctx.getIo() orelse return;
     
     // OK: Async without concurrency requirement
-    io.async(handleRequest, .{request, io});
+    // io.async(handleRequest, .{request, io});
+    _ = io;
     
     // Would fail: Concurrent async not supported
     // io.asyncConcurrent(handleRequest, .{request, io}) catch |err| {
@@ -237,13 +257,15 @@ The scheduler automatically detects system conflicts based on component access:
 ### System Implementation
 
 ```zig
-fn parallelSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
-    const io = ctx.getIo();
+fn parallelSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    const io = ctx.getIo() orelse return;
     
     // Full concurrency available
     if (io.hasConcurrency()) {
         // Can use asyncConcurrent for true parallel ops
-        try io.asyncConcurrent(heavyComputation, .{data, io});
+        // try io.asyncConcurrent(heavyComputation, .{data, io});
+        _ = io;
     }
 }
 ```
@@ -300,7 +322,9 @@ Code written for blocking mode works in other models:
 
 ```zig
 // This system works in all execution models
-fn universalSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn universalSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{ .include = &.{Position} });
     while (query.next()) |result| {
         const pos = result.get(Position);
@@ -312,11 +336,14 @@ fn universalSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 I/O-aware systems should check capabilities:
 
 ```zig
-fn adaptiveSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn adaptiveSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     if (ctx.hasIo()) {
         const io = ctx.getIo();
         if (io.hasConcurrency()) {
             // Use parallel approach
+            _ = io;
         } else if (io.hasAsync()) {
             // Use async approach
         }
@@ -550,13 +577,15 @@ StaticECS uses Zig 0.16-dev's `std.Io` for async I/O operations. The IoBackend a
 ### Using std.Io in Systems
 
 ```zig
-fn networkSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
-    const io = ctx.getIo();
+fn networkSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    const io = ctx.getIo() orelse return;
     
     // Access the underlying std.Io instance
     if (io.getRawIo()) |raw_io| {
         // Use std.Io directly for advanced operations
         // See Zig std.Io documentation for full API
+        _ = raw_io;
     }
     
     // Capability checks
@@ -659,8 +688,9 @@ world.resources.insert(NetworkStats, .{
 });
 
 // Access with atomic operations
-fn networkSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn networkStatsSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
     if (ctx.getResource(NetworkStats)) |stats| {
-        _ = stats.bytes_sent.fetchAdd(bytes, .seq_cst);
+        _ = stats.bytes_sent.fetchAdd(1024, .seq_cst);
     }
 }

@@ -175,7 +175,7 @@ pub fn PipelineOrchestrator(comptime cfg: WorldConfig) type {
                 .external => {
                     // External mode: Commit pending imports
                     const created = self.external_pipeline.commitImport() catch return error.TickFailed;
-                    self.stats.external_imported += created.len;
+                    self.stats.external_imported += created.entities_created;
 
                     // Update external stats
                     const ext_stats = self.external_pipeline.getStats();

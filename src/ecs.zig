@@ -191,7 +191,11 @@ pub const ExecutorType = pipeline.executors.ExecutorType;
 pub const ExecutorStatus = pipeline.executors.ExecutorStatus;
 pub const GpuComputeConfig = pipeline.executors.GpuComputeConfig;
 pub const GpuComputeExecutor = pipeline.executors.GpuComputeExecutor;
+pub const BatchWorkerConfig = pipeline.executors.BatchWorkerConfig;
+pub const BatchWorkerPool = pipeline.executors.BatchWorkerPool;
+/// @deprecated Use `BatchWorkerConfig` instead.
 pub const SimdWorkerConfig = pipeline.executors.SimdWorkerConfig;
+/// @deprecated Use `BatchWorkerPool` instead.
 pub const SimdWorkerPool = pipeline.executors.SimdWorkerPool;
 pub const ExternalThreadPoolConfig = pipeline.executors.ExternalThreadPoolConfig;
 pub const ExternalThreadPool = pipeline.executors.ExternalThreadPool;

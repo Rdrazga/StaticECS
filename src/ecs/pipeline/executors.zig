@@ -52,7 +52,19 @@ pub const ExecutorStatus = enum {
 // ============================================================================
 
 /// GPU compute executor configuration.
-/// Placeholder for future GPU integration.
+///
+/// **EXPERIMENTAL**: Placeholder - not yet implemented.
+///
+/// Status: All operations return `error.GpuUnavailable`.
+/// This configuration struct exists to preserve the API design
+/// for future GPU compute integration.
+///
+/// Future plans:
+/// - SPIR-V compute shader generation
+/// - Vulkan/Metal backend support
+/// - Automatic CPU fallback for unsupported hardware
+///
+/// See: [`docs/EXPERIMENTAL.md`](../../../docs/EXPERIMENTAL.md) for status tracking.
 pub const GpuComputeConfig = struct {
     /// GPU device index to use (0 = default).
     device_index: u32 = 0,
@@ -64,8 +76,26 @@ pub const GpuComputeConfig = struct {
     shared_memory: bool = false,
 };
 
-/// GPU compute executor interface.
-/// Placeholder for GPU compute dispatch integration.
+/// **EXPERIMENTAL**: GPU compute executor.
+///
+/// Status: Placeholder - not yet implemented.
+/// Currently returns `error.GpuUnavailable` for all operations.
+///
+/// This executor interface is designed for future GPU compute dispatch
+/// but has no functional implementation. All methods immediately fail.
+///
+/// Future plans:
+/// - SPIR-V compute shader generation from component queries
+/// - Vulkan/Metal/WebGPU backend support
+/// - Automatic CPU fallback for unsupported hardware
+/// - GPU↔CPU memory transfer optimization
+///
+/// What doesn't work:
+/// - `init()` - Always returns `error.GpuUnavailable`
+/// - `dispatch()` - Always returns `error.GpuUnavailable`
+/// - `sync()` - Always returns `error.GpuUnavailable`
+///
+/// See: [`docs/EXPERIMENTAL.md`](../../../docs/EXPERIMENTAL.md) for status tracking.
 pub fn GpuComputeExecutor(comptime cfg: WorldConfig) type {
     return struct {
         const Self = @This();
@@ -109,14 +139,19 @@ pub fn GpuComputeExecutor(comptime cfg: WorldConfig) type {
 }
 
 // ============================================================================
-// SIMD Worker Pool Interface
+// Batch Worker Pool Interface
 // ============================================================================
 
-/// SIMD worker pool configuration.
-pub const SimdWorkerConfig = struct {
+/// **EXPERIMENTAL**: Batch worker pool configuration.
+///
+/// Configures batch processing of entity arrays. Provides cache-friendly
+/// sequential access patterns but does NOT use hardware SIMD intrinsics.
+///
+/// See: [`docs/EXPERIMENTAL.md`](../../../docs/EXPERIMENTAL.md) for status tracking.
+pub const BatchWorkerConfig = struct {
     /// Number of worker threads.
     worker_count: u32 = 0, // 0 = auto-detect
-    /// SIMD vector width to use (0 = auto-detect).
+    /// Vector width hint (reserved for future SIMD - currently unused).
     vector_width: u32 = 0,
     /// Chunk size for work distribution.
     chunk_size: u32 = 1024,
@@ -124,12 +159,41 @@ pub const SimdWorkerConfig = struct {
     prefetch: bool = true,
 };
 
-/// SIMD-optimized worker pool for data-parallel processing.
-pub fn SimdWorkerPool(comptime cfg: WorldConfig) type {
+/// @deprecated Use `BatchWorkerConfig` instead. Renamed for accuracy.
+pub const SimdWorkerConfig = BatchWorkerConfig;
+
+/// **EXPERIMENTAL**: Batch worker pool for parallel entity processing.
+///
+/// Processes entities in batches across threads but does NOT use hardware
+/// SIMD intrinsics. For true SIMD, implement custom processing with @Vector types.
+///
+/// What works:
+/// - `processArray()` - Processes arrays sequentially per batch
+/// - `processArrays()` - Processes paired arrays sequentially
+/// - `reduce()` - Performs reduction sequentially
+/// - Statistics tracking (items/batches processed)
+///
+/// Benefits of batch processing (without SIMD):
+/// - Sequential memory access for CPU prefetching
+/// - Reduced function call overhead via batching
+/// - Cache-line friendly access patterns
+///
+/// What doesn't work:
+/// - No actual SIMD intrinsics (`@Vector`) are used
+/// - No architecture-specific optimizations (SSE, AVX, NEON)
+/// - Performance is identical to scalar processing
+///
+/// Future plans:
+/// - `@Vector(N, T)` batch operations for numeric types
+/// - CPU feature detection (SSE4.2, AVX2, NEON)
+/// - Fallback to scalar for non-vectorizable types
+///
+/// See: [`docs/EXPERIMENTAL.md`](../../../docs/EXPERIMENTAL.md) for status tracking.
+pub fn BatchWorkerPool(comptime cfg: WorldConfig) type {
     return struct {
         const Self = @This();
 
-        config: SimdWorkerConfig,
+        config: BatchWorkerConfig,
         status: ExecutorStatus,
         allocator: Allocator,
 
@@ -137,11 +201,11 @@ pub fn SimdWorkerPool(comptime cfg: WorldConfig) type {
         items_processed: u64,
         batches_processed: u64,
 
-        /// Initialize SIMD worker pool.
-        pub fn init(allocator: Allocator, simd_config: SimdWorkerConfig) !Self {
+        /// Initialize batch worker pool.
+        pub fn init(allocator: Allocator, batch_config: BatchWorkerConfig) !Self {
             _ = cfg;
             return .{
-                .config = simd_config,
+                .config = batch_config,
                 .status = .idle,
                 .allocator = allocator,
                 .items_processed = 0,
@@ -149,9 +213,9 @@ pub fn SimdWorkerPool(comptime cfg: WorldConfig) type {
             };
         }
 
-        /// Process array with SIMD-optimized function.
+        /// Process array with batch-optimized function.
         ///
-        /// The process function should be vectorizable.
+        /// Processes each element sequentially. Future versions may use SIMD.
         pub fn processArray(
             self: *Self,
             comptime T: type,
@@ -161,8 +225,8 @@ pub fn SimdWorkerPool(comptime cfg: WorldConfig) type {
             self.status = .busy;
             defer self.status = .idle;
 
-            // Simple sequential implementation
-            // A full implementation would use SIMD intrinsics
+            // Sequential implementation - batch processing pattern
+            // Future: consider @Vector for numeric types
             for (data) |*item| {
                 ProcessFn(item);
             }
@@ -171,7 +235,7 @@ pub fn SimdWorkerPool(comptime cfg: WorldConfig) type {
             self.batches_processed += 1;
         }
 
-        /// Process two arrays with SIMD-optimized function.
+        /// Process two arrays with batch-optimized function.
         pub fn processArrays(
             self: *Self,
             comptime T1: type,
@@ -243,11 +307,22 @@ pub fn SimdWorkerPool(comptime cfg: WorldConfig) type {
     };
 }
 
+/// @deprecated Use `BatchWorkerPool` instead. Renamed for accuracy -
+/// no SIMD intrinsics are used.
+pub const SimdWorkerPool = BatchWorkerPool;
+
 // ============================================================================
 // External Thread Pool Interface
 // ============================================================================
 
-/// External thread pool configuration.
+/// **EXPERIMENTAL**: External thread pool configuration.
+///
+/// Status: Incomplete - configuration only, no functional dispatch.
+///
+/// This configuration is used by `ExternalThreadPool` which does not
+/// actually dispatch tasks to threads. See pool documentation for details.
+///
+/// See: [`docs/EXPERIMENTAL.md`](../../../docs/EXPERIMENTAL.md) for status tracking.
 pub const ExternalThreadPoolConfig = struct {
     /// Maximum concurrent tasks.
     max_tasks: u32 = 64,
@@ -272,7 +347,33 @@ pub const TaskStatus = enum {
     cancelled,
 };
 
-/// Interface for integrating with external thread pools.
+/// **EXPERIMENTAL**: External thread pool executor.
+///
+/// Status: Incomplete - task submission does not dispatch.
+/// Thread spawning structure exists but work items are never executed.
+///
+/// This interface is designed for integrating with external thread pools
+/// (OS thread pools, libuv, game engine job systems, etc.) but has no
+/// functional implementation.
+///
+/// What works:
+/// - `init()` - Creates pool structure
+/// - `submitTask()` - Creates `TaskHandle` with incrementing ID
+/// - `getTaskStatus()` - Returns handle's status field
+/// - `getStatus()` - Returns executor status
+///
+/// What doesn't work:
+/// - Submitted tasks are never executed
+/// - `waitTask()` is a no-op (returns immediately)
+/// - `cancelTask()` is a no-op
+/// - No actual thread management occurs
+///
+/// Future plans:
+/// - OS thread pool backends (Windows ThreadPool, GCD, etc.)
+/// - Integration with external libraries (libuv, tokio FFI)
+/// - Work-stealing coordination with internal scheduler
+///
+/// See: [`docs/EXPERIMENTAL.md`](../../../docs/EXPERIMENTAL.md) for status tracking.
 pub fn ExternalThreadPool(comptime cfg: WorldConfig) type {
     return struct {
         const Self = @This();
@@ -351,7 +452,7 @@ pub fn selectExecutor(comptime cfg: WorldConfig, comptime executor_type: Executo
     return switch (executor_type) {
         .cpu => void, // Use standard ECS scheduler
         .gpu => GpuComputeExecutor(cfg),
-        .simd => SimdWorkerPool(cfg),
+        .simd => BatchWorkerPool(cfg), // Note: despite enum name, uses batch processing not SIMD
         .thread_pool => ExternalThreadPool(cfg),
     };
 }
@@ -378,21 +479,21 @@ test "GpuComputeConfig defaults" {
     try std.testing.expectEqual(false, config.shared_memory);
 }
 
-test "SimdWorkerConfig defaults" {
-    const config = SimdWorkerConfig{};
+test "BatchWorkerConfig defaults" {
+    const config = BatchWorkerConfig{};
     try std.testing.expectEqual(@as(u32, 0), config.worker_count);
     try std.testing.expectEqual(@as(u32, 0), config.vector_width);
     try std.testing.expectEqual(@as(u32, 1024), config.chunk_size);
     try std.testing.expectEqual(true, config.prefetch);
 }
 
-test "SimdWorkerPool basic operations" {
+test "BatchWorkerPool basic operations" {
     const test_config = WorldConfig{
         .components = .{ .types = &.{struct { x: i32 }} },
         .archetypes = .{ .archetypes = &.{} },
     };
 
-    const Pool = SimdWorkerPool(test_config);
+    const Pool = BatchWorkerPool(test_config);
     var pool = try Pool.init(std.testing.allocator, .{});
     defer pool.deinit();
 
@@ -416,13 +517,13 @@ test "SimdWorkerPool basic operations" {
     try std.testing.expectEqual(@as(u64, 1), stats.batches_processed);
 }
 
-test "SimdWorkerPool reduce" {
+test "BatchWorkerPool reduce" {
     const test_config = WorldConfig{
         .components = .{ .types = &.{struct { x: i32 }} },
         .archetypes = .{ .archetypes = &.{} },
     };
 
-    const Pool = SimdWorkerPool(test_config);
+    const Pool = BatchWorkerPool(test_config);
     var pool = try Pool.init(std.testing.allocator, .{});
     defer pool.deinit();
 

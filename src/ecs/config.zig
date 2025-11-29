@@ -36,6 +36,7 @@ pub const ParallelismMode = config_mod.ParallelismMode;
 pub const ExecutionModel = config_mod.ExecutionModel;
 pub const TickMode = config_mod.TickMode;
 pub const LayoutMode = config_mod.LayoutMode;
+pub const CapacityMode = config_mod.CapacityMode;
 
 // ============================================================================
 // Policy Types (Error Handling)
@@ -125,7 +126,6 @@ pub const WorldConfigView = config_mod.WorldConfigView;
 // Validation
 // ============================================================================
 
-pub const ConfigValidationError = config_mod.ConfigValidationError;
 pub const validateWorldConfig = config_mod.validateWorldConfig;
 pub const validatePipelineConfig = config_mod.validatePipelineConfig;
 pub const validateCoordinationConfig = config_mod.validateCoordinationConfig;

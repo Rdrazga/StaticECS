@@ -323,4 +323,6 @@ pub fn SystemFn(comptime cfg: WorldConfig, comptime WorldType: type) type {
 test {
     // Run all context module tests
     _ = context;
+    // Run SystemContext unit tests
+    _ = @import("system_context_test.zig");
 }

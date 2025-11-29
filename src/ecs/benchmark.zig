@@ -13,8 +13,11 @@ const std = @import("std");
 const time = std.time;
 const testing = std.testing;
 
-const ecs = @import("../ecs.zig");
-const WorldConfig = ecs.WorldConfig;
+// Direct imports from within the ecs module (avoids circular dependency with ecs.zig)
+const config = @import("config.zig");
+const WorldConfig = config.WorldConfig;
+const world_mod = @import("world.zig");
+const entity = @import("world/entity.zig");
 
 // ============================================================================
 // Benchmark Components
@@ -68,7 +71,7 @@ const BenchConfig = WorldConfig{
     },
 };
 
-const BenchWorld = ecs.World(BenchConfig);
+const BenchWorld = world_mod.World(BenchConfig);
 
 // ============================================================================
 // Timing Utilities
@@ -139,7 +142,7 @@ test "bench: entity spawn throughput" {
     defer world.deinit();
 
     const iterations: u64 = 1000;
-    var handles: [1000]ecs.entity.EntityHandle = undefined;
+    var handles: [1000]entity.EntityHandle = undefined;
 
     const start = try time.Instant.now();
 
@@ -165,7 +168,7 @@ test "bench: entity despawn throughput" {
     defer world.deinit();
 
     const iterations: u64 = 1000;
-    var handles: [1000]ecs.entity.EntityHandle = undefined;
+    var handles: [1000]entity.EntityHandle = undefined;
 
     // Spawn first
     for (0..iterations) |i| {
@@ -191,7 +194,7 @@ test "bench: component access" {
     defer world.deinit();
 
     // Spawn entities
-    var handles: [100]ecs.entity.EntityHandle = undefined;
+    var handles: [100]entity.EntityHandle = undefined;
     for (0..100) |i| {
         handles[i] = try world.spawn("moving", .{
             Position{ .x = @floatFromInt(i), .y = 0, .z = 0 },
@@ -227,7 +230,7 @@ test "bench: component mutation" {
     defer world.deinit();
 
     // Spawn entities
-    var handles: [100]ecs.entity.EntityHandle = undefined;
+    var handles: [100]entity.EntityHandle = undefined;
     for (0..100) |i| {
         handles[i] = try world.spawn("moving", .{
             Position{ .x = @floatFromInt(i), .y = 0, .z = 0 },
@@ -257,7 +260,7 @@ test "bench: hasComponent check" {
     defer world.deinit();
 
     // Spawn entities
-    var handles: [100]ecs.entity.EntityHandle = undefined;
+    var handles: [100]entity.EntityHandle = undefined;
     for (0..100) |i| {
         handles[i] = try world.spawn("moving", .{
             Position{ .x = @floatFromInt(i), .y = 0, .z = 0 },
@@ -296,7 +299,7 @@ test "bench: isAlive check" {
     defer world.deinit();
 
     // Spawn entities
-    var handles: [100]ecs.entity.EntityHandle = undefined;
+    var handles: [100]entity.EntityHandle = undefined;
     for (0..100) |i| {
         handles[i] = try world.spawn("static", .{Position{}});
     }
@@ -329,7 +332,7 @@ test "bench: full entity with large component" {
     defer world.deinit();
 
     const iterations: u64 = 500;
-    var handles: [500]ecs.entity.EntityHandle = undefined;
+    var handles: [500]entity.EntityHandle = undefined;
 
     const start = try time.Instant.now();
 
@@ -372,4 +375,253 @@ test "bench: print summary" {
 
     try testing.expectEqual(@as(u64, 100), result.avgNs());
     try testing.expectEqual(@as(u64, 10_000_000), result.opsPerSec());
+}
+
+// ============================================================================
+// Executable Entry Point (for `zig build benchmark`)
+// ============================================================================
+
+/// Main entry point for benchmark executable.
+/// This allows benchmarks to run in ReleaseFast mode via `zig build benchmark`.
+pub fn main() !void {
+    const print = std.debug.print;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    print("\n", .{});
+    print("╔══════════════════════════════════════════════════════════════════╗\n", .{});
+    print("║               StaticECS Benchmark Suite                          ║\n", .{});
+    print("║               Running in ReleaseFast mode                        ║\n", .{});
+    print("╚══════════════════════════════════════════════════════════════════╝\n", .{});
+    print("\n", .{});
+
+    // Run all benchmarks and collect results
+    var results: [7]BenchResult = undefined;
+    var result_count: usize = 0;
+
+    // Benchmark: Entity spawn throughput
+    {
+        var world = BenchWorld.init(allocator);
+        defer world.deinit();
+
+        const iterations: u64 = 10000;
+        var handles: [10000]entity.EntityHandle = undefined;
+
+        const start = time.Instant.now() catch unreachable;
+        for (0..iterations) |i| {
+            handles[i] = world.spawn("static", .{Position{}}) catch break;
+        }
+        const end = time.Instant.now() catch unreachable;
+        const elapsed = end.since(start);
+
+        results[result_count] = .{
+            .name = "entity_spawn",
+            .iterations = iterations,
+            .total_ns = elapsed,
+            .min_ns = elapsed / iterations,
+            .max_ns = elapsed / iterations,
+        };
+        result_count += 1;
+
+        // Cleanup for despawn benchmark
+        const despawn_start = time.Instant.now() catch unreachable;
+        for (0..iterations) |i| {
+            world.despawn(handles[i]) catch break;
+        }
+        const despawn_end = time.Instant.now() catch unreachable;
+        const despawn_elapsed = despawn_end.since(despawn_start);
+
+        results[result_count] = .{
+            .name = "entity_despawn",
+            .iterations = iterations,
+            .total_ns = despawn_elapsed,
+            .min_ns = despawn_elapsed / iterations,
+            .max_ns = despawn_elapsed / iterations,
+        };
+        result_count += 1;
+    }
+
+    // Benchmark: Component access
+    {
+        var world = BenchWorld.init(allocator);
+        defer world.deinit();
+
+        var handles: [100]entity.EntityHandle = undefined;
+        for (0..100) |i| {
+            handles[i] = world.spawn("moving", .{
+                Position{ .x = @floatFromInt(i), .y = 0, .z = 0 },
+                Velocity{ .dx = 1, .dy = 0, .dz = 0 },
+            }) catch break;
+        }
+
+        const iterations: u64 = 100000;
+        var sum: f32 = 0;
+
+        const start = time.Instant.now() catch unreachable;
+        for (0..iterations) |i| {
+            const handle = handles[i % 100];
+            if (world.getComponent(handle, Position)) |pos| {
+                sum += pos.x;
+            }
+        }
+        const end = time.Instant.now() catch unreachable;
+        std.mem.doNotOptimizeAway(sum);
+
+        results[result_count] = .{
+            .name = "component_access",
+            .iterations = iterations,
+            .total_ns = end.since(start),
+            .min_ns = end.since(start) / iterations,
+            .max_ns = end.since(start) / iterations,
+        };
+        result_count += 1;
+    }
+
+    // Benchmark: Component mutation
+    {
+        var world = BenchWorld.init(allocator);
+        defer world.deinit();
+
+        var handles: [100]entity.EntityHandle = undefined;
+        for (0..100) |i| {
+            handles[i] = world.spawn("moving", .{
+                Position{ .x = @floatFromInt(i), .y = 0, .z = 0 },
+                Velocity{ .dx = 1, .dy = 0, .dz = 0 },
+            }) catch break;
+        }
+
+        const iterations: u64 = 100000;
+
+        const start = time.Instant.now() catch unreachable;
+        for (0..iterations) |i| {
+            const handle = handles[i % 100];
+            _ = world.setComponent(handle, Position, Position{ .x = @floatFromInt(i), .y = 0, .z = 0 });
+        }
+        const end = time.Instant.now() catch unreachable;
+
+        results[result_count] = .{
+            .name = "component_mutation",
+            .iterations = iterations,
+            .total_ns = end.since(start),
+            .min_ns = end.since(start) / iterations,
+            .max_ns = end.since(start) / iterations,
+        };
+        result_count += 1;
+    }
+
+    // Benchmark: hasComponent check
+    {
+        var world = BenchWorld.init(allocator);
+        defer world.deinit();
+
+        var handles: [100]entity.EntityHandle = undefined;
+        for (0..100) |i| {
+            handles[i] = world.spawn("moving", .{
+                Position{ .x = @floatFromInt(i), .y = 0, .z = 0 },
+                Velocity{ .dx = 1, .dy = 0, .dz = 0 },
+            }) catch break;
+        }
+
+        const iterations: u64 = 100000;
+        var has_count: u64 = 0;
+
+        const start = time.Instant.now() catch unreachable;
+        for (0..iterations) |i| {
+            const handle = handles[i % 100];
+            if (world.hasComponent(handle, Position)) {
+                has_count += 1;
+            }
+        }
+        const end = time.Instant.now() catch unreachable;
+        std.mem.doNotOptimizeAway(has_count);
+
+        results[result_count] = .{
+            .name = "hasComponent_check",
+            .iterations = iterations,
+            .total_ns = end.since(start),
+            .min_ns = end.since(start) / iterations,
+            .max_ns = end.since(start) / iterations,
+        };
+        result_count += 1;
+    }
+
+    // Benchmark: isAlive check
+    {
+        var world = BenchWorld.init(allocator);
+        defer world.deinit();
+
+        var handles: [100]entity.EntityHandle = undefined;
+        for (0..100) |i| {
+            handles[i] = world.spawn("static", .{Position{}}) catch break;
+        }
+
+        const iterations: u64 = 100000;
+        var alive_count: u64 = 0;
+
+        const start = time.Instant.now() catch unreachable;
+        for (0..iterations) |i| {
+            const handle = handles[i % 100];
+            if (world.isAlive(handle)) {
+                alive_count += 1;
+            }
+        }
+        const end = time.Instant.now() catch unreachable;
+        std.mem.doNotOptimizeAway(alive_count);
+
+        results[result_count] = .{
+            .name = "isAlive_check",
+            .iterations = iterations,
+            .total_ns = end.since(start),
+            .min_ns = end.since(start) / iterations,
+            .max_ns = end.since(start) / iterations,
+        };
+        result_count += 1;
+    }
+
+    // Benchmark: Full entity with large component
+    {
+        var world = BenchWorld.init(allocator);
+        defer world.deinit();
+
+        const iterations: u64 = 5000;
+        var handles: [5000]entity.EntityHandle = undefined;
+
+        const start = time.Instant.now() catch unreachable;
+        for (0..iterations) |i| {
+            handles[i] = world.spawn("full", .{
+                Position{},
+                Velocity{},
+                Health{},
+                Transform{},
+            }) catch break;
+        }
+        const end = time.Instant.now() catch unreachable;
+
+        results[result_count] = .{
+            .name = "full_entity_spawn",
+            .iterations = iterations,
+            .total_ns = end.since(start),
+            .min_ns = end.since(start) / iterations,
+            .max_ns = end.since(start) / iterations,
+        };
+        result_count += 1;
+    }
+
+    // Print results
+    print("┌────────────────────────┬───────────────┬───────────────┬───────────────┐\n", .{});
+    print("│ Benchmark              │ Iterations    │ ns/op         │ ops/sec       │\n", .{});
+    print("├────────────────────────┼───────────────┼───────────────┼───────────────┤\n", .{});
+
+    for (results[0..result_count]) |result| {
+        print("│ {s:<22} │ {d:>13} │ {d:>13} │ {d:>13} │\n", .{
+            result.name,
+            result.iterations,
+            result.avgNs(),
+            result.opsPerSec(),
+        });
+    }
+
+    print("└────────────────────────┴───────────────┴───────────────┴───────────────┘\n", .{});
+    print("\n", .{});
 }

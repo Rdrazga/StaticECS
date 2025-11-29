@@ -46,6 +46,15 @@ pub const CommandBufferType = command_buffer.CommandBufferType;
 pub const CommandBuffer = command_buffer.CommandBuffer;
 
 // ============================================================================
+// Component Registry
+// ============================================================================
+
+pub const component_registry = @import("component_registry.zig");
+
+/// Generate a component registry type for dispatching deferred setComponent operations.
+pub const ComponentRegistry = component_registry.ComponentRegistry;
+
+// ============================================================================
 // Concurrent Commands
 // ============================================================================
 
@@ -91,6 +100,7 @@ test {
     // Run all submodule tests
     _ = command_types;
     _ = command_buffer;
+    _ = component_registry;
     _ = concurrent_commands;
     _ = resources;
     _ = io_context;

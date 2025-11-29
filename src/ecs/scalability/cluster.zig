@@ -1,7 +1,31 @@
 //! Cluster Coordination Primitives
 //!
+//! **EXPERIMENTAL**: Framework only - no network transport.
+//!
 //! Provides horizontal scaling support through cluster coordination,
 //! entity ownership calculation, and shared state interfaces.
+//!
+//! Status: Currently provides in-memory coordination for single-process
+//! multi-world scenarios. Actual network transport (TCP/UDP/RDMA)
+//! is not yet implemented.
+//!
+//! What works:
+//! - Local multi-world coordination within a single process
+//! - Entity ownership calculation (hash-based, range-based, consistent-hash)
+//! - Transfer queue structures for cross-world entity migration
+//! - Statistics tracking for coordination operations
+//! - Peer state management and timeout detection
+//!
+//! What doesn't work:
+//! - Network transport (no TCP/UDP/RDMA implementation)
+//! - Remote node discovery
+//! - Cross-process or cross-machine communication
+//! - Actual heartbeat message send/receive
+//!
+//! The `join()`, `leave()`, and `tick()` methods update local state only.
+//! They do not establish network connections or send messages.
+//!
+//! See: [`docs/EXPERIMENTAL.md`](../../../docs/EXPERIMENTAL.md) for status tracking.
 //!
 //! Tiger Style: Configurable discovery, transport-agnostic, compiles out when disabled.
 
@@ -156,7 +180,43 @@ pub const ClusterStats = struct {
     connected_peers: u16 = 0,
 };
 
-/// Cluster coordinator for managing node membership and entity distribution.
+/// **EXPERIMENTAL**: Distributed cluster coordination.
+///
+/// Status: Framework only - no network transport.
+/// Currently provides in-memory coordination for single-process
+/// multi-world scenarios. Actual network transport (TCP/UDP/RDMA)
+/// not yet implemented.
+///
+/// What works:
+/// - `init()` - Creates coordinator with local state
+/// - `getEntityOwner()` - Calculates ownership based on config strategy
+/// - `isLocalEntity()` - Checks if entity belongs to this node
+/// - `getState()` - Returns current coordination state
+/// - `getStats()` - Returns coordination statistics
+/// - `getPeerState()` - Returns state for specific peer index
+/// - `countConnectedPeers()` - Counts peers marked connected
+/// - `isHealthy()` - Checks quorum based on connected peers
+/// - `receiveHeartbeat()` - Updates peer timestamp (call externally)
+/// - `markPeerConnected()` - Manually mark peer as connected (testing)
+///
+/// What doesn't work:
+/// - `join()` - Updates local state only, no network connection
+/// - `leave()` - Updates local state only, no departure notification
+/// - `tick()` - Checks timeouts but doesn't send/receive messages
+/// - Network transport - No TCP/UDP/RDMA socket code exists
+/// - Remote discovery - Cannot find nodes automatically
+///
+/// To use for testing or single-process coordination:
+/// ```
+/// var coord = ClusterCoordinator(cfg).init(allocator);
+/// // Manually simulate peer connections for testing:
+/// coord.markPeerConnected(0);
+/// coord.markPeerConnected(1);
+/// try coord.join();
+/// // Now coord.state == .active if quorum met
+/// ```
+///
+/// See: [`docs/EXPERIMENTAL.md`](../../../docs/EXPERIMENTAL.md) for status tracking.
 pub fn ClusterCoordinator(comptime cfg: ClusterConfig) type {
     return struct {
         const Self = @This();
@@ -197,6 +257,13 @@ pub fn ClusterCoordinator(comptime cfg: ClusterConfig) type {
         }
 
         /// Attempt to join the cluster.
+        ///
+        /// FRAMEWORK ONLY: No network transport implementation.
+        /// This method updates local state but does not establish actual
+        /// network connections. Peer discovery and heartbeat protocols
+        /// require a transport layer implementation.
+        ///
+        /// See: TODO - cluster_transport.zig for transport abstraction
         pub fn join(self: *Self) !void {
             if (comptime !cfg.enabled) return;
             if (cfg.peers.len == 0) {
@@ -224,6 +291,10 @@ pub fn ClusterCoordinator(comptime cfg: ClusterConfig) type {
         }
 
         /// Leave the cluster gracefully.
+        ///
+        /// FRAMEWORK ONLY: No network transport implementation.
+        /// This method updates local state but does not send departure
+        /// notifications to peers. Requires transport layer implementation.
         pub fn leave(self: *Self) !void {
             if (comptime !cfg.enabled) return;
 
@@ -236,6 +307,12 @@ pub fn ClusterCoordinator(comptime cfg: ClusterConfig) type {
         }
 
         /// Process cluster tick (heartbeats, message processing).
+        ///
+        /// FRAMEWORK ONLY: No network transport implementation.
+        /// This method checks local peer state timeouts but does not
+        /// send/receive actual heartbeat messages. The timeout logic
+        /// works correctly once `receiveHeartbeat()` is called externally
+        /// by a transport implementation.
         pub fn tick(self: *Self) !void {
             if (comptime !cfg.enabled) return;
             if (self.state == .stopped) return;

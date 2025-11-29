@@ -61,14 +61,54 @@ pub fn CommandBufferType(comptime max_commands: usize, comptime max_data_size: u
             return true;
         }
 
-        /// Queue a spawn command for a specific archetype.
+        /// Queue a spawn command for a specific archetype (without component data).
+        /// Tiger Style: Prefer spawnWithData() for spawns with component values.
         pub fn spawnInArchetype(self: *Self, archetype_index: u16) bool {
             if (self.count >= max_commands) return false;
             self.commands[self.count] = .{
                 .spawn = SpawnCmd{
                     .archetype_index = archetype_index,
+                    .data_size = 0, // No component data
                 },
             };
+            self.count += 1;
+            return true;
+        }
+
+        /// Queue a spawn command with component data for a specific archetype.
+        /// Components are packed in declaration order using the archetype table's layout.
+        /// Tiger Style: Use this for deferred spawns with component values.
+        ///
+        /// Parameters:
+        ///   - archetype_index: Index of the target archetype (from world.archIndex())
+        ///   - ArchTable: The ArchetypeTable type for the target archetype
+        ///   - components: Tuple/struct of component values to set
+        ///
+        /// Returns: true if command was queued, false if buffer is full
+        pub fn spawnWithData(
+            self: *Self,
+            archetype_index: u16,
+            comptime ArchTable: type,
+            components: anytype,
+        ) bool {
+            if (self.count >= max_commands) return false;
+
+            const packed_size = ArchTable.packedComponentSize();
+
+            // Validate at compile time that component data fits
+            if (packed_size > max_data_size) {
+                @compileError("Component data exceeds max_component_data_size from config");
+            }
+
+            var cmd = SpawnCmd{
+                .archetype_index = archetype_index,
+                .data_size = packed_size,
+            };
+
+            // Pack component data into command buffer
+            _ = ArchTable.packComponents(components, &cmd.data);
+
+            self.commands[self.count] = .{ .spawn = cmd };
             self.count += 1;
             return true;
         }
@@ -192,4 +232,54 @@ test "CommandBuffer setComponent" {
     const set_cmd = cmds[0].set_component;
     try std.testing.expectEqual(handle.id.toU32(), set_cmd.entity.id.toU32());
     try std.testing.expectEqual(@as(usize, @sizeOf(TestComponent)), set_cmd.size);
+}
+
+test "CommandBuffer spawnWithData" {
+    const archetype_table = @import("../world/archetype_table.zig");
+    const Position = struct { x: f32, y: f32 };
+    const Velocity = struct { dx: f32, dy: f32 };
+    const TestTable = archetype_table.ArchetypeTable(&.{ Position, Velocity }, .dynamic, 0);
+
+    const CmdBuf = CommandBuffer(10);
+    var buf = CmdBuf.init();
+
+    // Queue a spawn with component data
+    const result = buf.spawnWithData(0, TestTable, .{
+        Position{ .x = 1.5, .y = 2.5 },
+        Velocity{ .dx = 0.1, .dy = -0.1 },
+    });
+    try std.testing.expect(result);
+    try std.testing.expectEqual(@as(usize, 1), buf.count);
+
+    const cmds = buf.getCommands();
+    const Command = command_types.Command;
+    try std.testing.expectEqual(Command.spawn, std.meta.activeTag(cmds[0]));
+
+    const spawn_cmd = cmds[0].spawn;
+    try std.testing.expectEqual(@as(u16, 0), spawn_cmd.archetype_index);
+    try std.testing.expectEqual(TestTable.packedComponentSize(), spawn_cmd.data_size);
+
+    // Verify data is packed correctly by copying bytes to aligned storage
+    var pos: Position = undefined;
+    @memcpy(std.mem.asBytes(&pos), spawn_cmd.data[0..@sizeOf(Position)]);
+    try std.testing.expectEqual(@as(f32, 1.5), pos.x);
+    try std.testing.expectEqual(@as(f32, 2.5), pos.y);
+
+    const vel_offset = TestTable.componentOffset(1);
+    var vel: Velocity = undefined;
+    @memcpy(std.mem.asBytes(&vel), spawn_cmd.data[vel_offset .. vel_offset + @sizeOf(Velocity)]);
+    try std.testing.expectEqual(@as(f32, 0.1), vel.dx);
+    try std.testing.expectEqual(@as(f32, -0.1), vel.dy);
+}
+
+test "CommandBuffer spawnInArchetype sets data_size to zero" {
+    const CmdBuf = CommandBuffer(10);
+    var buf = CmdBuf.init();
+
+    try std.testing.expect(buf.spawnInArchetype(5));
+
+    const cmds = buf.getCommands();
+    const spawn_cmd = cmds[0].spawn;
+    try std.testing.expectEqual(@as(u16, 5), spawn_cmd.archetype_index);
+    try std.testing.expectEqual(@as(usize, 0), spawn_cmd.data_size);
 }

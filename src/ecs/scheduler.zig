@@ -111,6 +111,19 @@ pub fn Scheduler(comptime cfg: WorldConfig) type {
             };
         }
 
+        /// Deinitialize the scheduler, releasing all resources.
+        ///
+        /// This cleans up backend resources including:
+        /// - Thread pools (work_stealing backend)
+        /// - io_uring rings (io_uring_batch backend)
+        /// - Any other backend-specific resources
+        ///
+        /// Should be called when the scheduler is no longer needed,
+        /// typically in World.deinit() or at application shutdown.
+        pub fn deinit(self: *Self) void {
+            self.backend.deinit();
+        }
+
         /// Execute a single frame/tick.
         ///
         /// This runs all systems in phase order according to the built schedule.
@@ -262,6 +275,7 @@ test "Scheduler instantiation" {
     defer world.deinit();
 
     var scheduler = TestScheduler.init(&world, null, std.testing.allocator);
+    defer scheduler.deinit();
 
     try std.testing.expectEqual(@as(u64, 0), scheduler.getTickCount());
 }
@@ -285,6 +299,7 @@ test "Scheduler single tick" {
     defer world.deinit();
 
     var scheduler = TestScheduler.init(&world, null, std.testing.allocator);
+    defer scheduler.deinit();
 
     const result = scheduler.tick(0.016);
 
@@ -312,6 +327,7 @@ test "Scheduler multiple ticks" {
     defer world.deinit();
 
     var scheduler = TestScheduler.init(&world, null, std.testing.allocator);
+    defer scheduler.deinit();
 
     const result = scheduler.tickN(0.016, 10);
 
@@ -338,6 +354,7 @@ test "Scheduler statistics reset" {
     defer world.deinit();
 
     var scheduler = TestScheduler.init(&world, null, std.testing.allocator);
+    defer scheduler.deinit();
 
     _ = scheduler.tick(0.016);
     _ = scheduler.tick(0.016);

@@ -7,10 +7,12 @@
 //! - `scheduleAsync()`: Expresses asynchrony (tasks may complete out of order)
 //! - `scheduleConcurrent()`: Requires concurrent execution (may fail if unavailable)
 
+const std = @import("std");
 const io_backend = @import("../io/io_backend.zig");
 pub const IoBackend = io_backend.IoBackend;
 pub const IoBackendError = io_backend.IoBackendError;
 pub const BackendOptions = io_backend.BackendOptions;
+pub const Group = io_backend.Group;
 
 // ============================================================================
 // Error Types
@@ -106,21 +108,29 @@ pub const IoContext = struct {
         return self.backend;
     }
 
-    /// Schedule an async operation through the backend.
+    /// Schedule an async operation through the backend using a Group.
     ///
     /// In blocking mode: Executes immediately and synchronously.
     /// In evented mode: Queues for event loop execution.
     /// In threadpool mode: Queues for parallel execution.
+    ///
+    /// The caller must wait on or cancel the Group before it goes out of scope.
+    ///
+    /// Parameters:
+    ///   - group: Group to track the async operation
+    ///   - func: Function to execute asynchronously
+    ///   - args: Arguments tuple to pass to func
     pub fn scheduleAsync(
         self: *Self,
-        comptime callback: anytype,
-        context: anytype,
-    ) IoBackendError!void {
+        group: *Group,
+        comptime func: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) void {
         if (self.backend) |b| {
-            return b.scheduleAsync(callback, context);
+            b.scheduleAsync(group, func, args);
         } else {
             // Blocking fallback: execute synchronously
-            callback(context);
+            @call(.auto, func, args);
         }
     }
 
@@ -128,42 +138,42 @@ pub const IoContext = struct {
     ///
     /// Returns error.ConcurrencyUnavailable if backend doesn't support
     /// concurrent execution (blocking or evented mode).
+    ///
+    /// Parameters:
+    ///   - group: Group to track the concurrent operation
+    ///   - func: Function to execute concurrently
+    ///   - args: Arguments tuple to pass to func
     pub fn scheduleConcurrent(
         self: *Self,
-        comptime callback: anytype,
-        context: anytype,
-    ) IoBackendError!void {
+        group: *Group,
+        comptime func: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) error{ConcurrencyUnavailable}!void {
         if (self.backend) |b| {
-            return b.scheduleConcurrent(callback, context);
+            return b.scheduleConcurrent(group, func, args);
         } else {
             return error.ConcurrencyUnavailable;
         }
     }
 
-    /// Poll for completed operations.
-    /// Returns the number of operations completed.
-    pub fn poll(self: *Self) u32 {
+    /// Wait for all tasks in a group to complete.
+    pub fn waitGroup(self: *Self, group: *Group) void {
         if (self.backend) |b| {
-            return b.poll();
+            b.waitGroup(group);
         }
-        return 0;
     }
 
-    /// Poll with timeout.
-    /// Blocks up to timeout_ns nanoseconds waiting for events.
-    pub fn pollWithTimeout(self: *Self, timeout_ns: u64) u32 {
+    /// Cancel all tasks in a group.
+    pub fn cancelGroup(self: *Self, group: *Group) void {
         if (self.backend) |b| {
-            return b.pollWithTimeout(timeout_ns);
+            b.cancelGroup(group);
         }
-        return 0;
     }
 };
 
 // ============================================================================
 // Tests
 // ============================================================================
-
-const std = @import("std");
 
 test "IoContext creation and properties" {
     // Create blocking context (the standard way)

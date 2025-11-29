@@ -194,8 +194,18 @@ Systems are functions that process entities. Each system declares its phase, com
 
 ```zig
 const Phase = ecs.Phase;
+const FrameError = ecs.FrameError;
+const World = ecs.World(cfg);
+const Context = ecs.SystemContext(cfg, World);
 
-fn movementSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+// Helper to cast opaque pointer to typed context
+fn getContext(ctx_ptr: *anyopaque) *Context {
+    return @ptrCast(@alignCast(ctx_ptr));
+}
+
+fn movementSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{ Position, Velocity },
     });
@@ -265,7 +275,9 @@ pub const cfg = WorldConfig{
 ### Accessing Resources
 
 ```zig
-fn physicsSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn physicsSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     // Get mutable resource
     if (ctx.getResource(PhysicsConfig)) |physics| {
         physics.time_step = @floatCast(ctx.delta_time);
@@ -483,6 +495,8 @@ const MyPredicate = struct {
 ## Coordination
 
 Configure multi-world coordination for pipeline parallelism. Multiple worlds can process entities at different pipeline stages simultaneously.
+
+> **📖 See [Multi-World Coordination Guide](multi-world.md)** for comprehensive documentation on entity transfers, lock-free queues, and pipeline patterns.
 
 ```zig
 pub const cfg = WorldConfig{
@@ -740,8 +754,11 @@ const Health = struct { current: i32, max: i32 };
 // Resources
 const GameState = struct { paused: bool, score: u32 };
 
-// Systems
-fn movementSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+// Systems (using opaque pointer pattern)
+const FrameError = ecs.FrameError;
+
+fn movementSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
     var query = ctx.world.query(.{ .include = &.{ Position, Velocity } });
     while (query.next()) |r| {
         const pos = r.get(Position);
@@ -782,13 +799,19 @@ pub const cfg = ecs.WorldConfig{
 };
 
 const World = ecs.World(cfg);
+const Context = ecs.SystemContext(cfg, World);
+
+fn getContext(ctx_ptr: *anyopaque) *Context {
+    return @ptrCast(@alignCast(ctx_ptr));
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var world = try World.init(allocator);
+    // World.init does not return an error
+    var world = World.init(allocator);
     defer world.deinit();
 
     // Initialize resources

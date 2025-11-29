@@ -6,7 +6,7 @@ Built with the use of Kilo Code and Claude 4.5 Opus
 
 StaticECS is a compile-time configurable ECS framework that leverages Zig's comptime capabilities with the goals to generate highly optimized, zero-overhead entity component systems tailored to exact application needs.
 
-## Features (Verifying)
+## Features
 
 - **Full Comptime Configuration** - Define components, archetypes, systems, and all bounds at compile time
 - **Zero Runtime Overhead** - Type generation and validation happens entirely at compile time
@@ -36,7 +36,7 @@ pub const cfg = ecs.WorldConfig{
 const World = ecs.World(cfg);
 
 pub fn main() !void {
-    var world = try World.init(allocator);
+    var world = World.init(allocator);
     defer world.deinit();
     
     _ = try world.spawn("dynamic", .{
@@ -46,20 +46,39 @@ pub fn main() !void {
 }
 ```
 
+## Feature Status
+
+### Production Ready
+- ✅ Core ECS (World, Entity, Archetype, Query)
+- ✅ Blocking and evented execution backends
+- ✅ Work-stealing parallel scheduler
+- ✅ Command buffers and deferred operations
+- ✅ Multi-world coordination with lock-free transfers
+- ✅ Entity ownership calculation strategies
+
+### Experimental
+- ⚠️ **GPU compute executor** - Placeholder only, returns `error.GpuUnavailable`
+- ⚠️ **SIMD worker pool** - Sequential fallback, no actual SIMD intrinsics
+- ⚠️ **Cluster coordination** - Framework only, no network transport
+- ⚠️ **External thread pool** - Incomplete, tasks don't execute
+
+For details on experimental features, see [docs/EXPERIMENTAL.md](docs/EXPERIMENTAL.md).
+
 ## Documentation
 
 - [Quick Start Guide](docs/quick-start.md)
 - [Configuration Reference](docs/CONFIGURATION.md)
 - [System Authoring Guide](docs/systems.md)
 - [Execution Models Guide](docs/execution-models.md)
+- [Experimental Features](docs/EXPERIMENTAL.md)
 
 ## Version
 
-**0.1.1** - Code Review Remediation Release
+**0.2.0** - Review and Improve cycle 2
 
 ## Requirements
 
-- Zig 0.16.0-dev.1470+32dc46aae
+- Zig 0.16.x (development builds supported)
 
 ## Build
 

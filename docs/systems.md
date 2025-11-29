@@ -4,13 +4,25 @@ This guide covers advanced patterns for writing systems in StaticECS.
 
 ## System Fundamentals
 
-A system is a function with the signature:
+Systems receive an opaque pointer to the context for compile-time registration flexibility:
 
 ```zig
-fn mySystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+const FrameError = ecs.FrameError;
+const World = ecs.World(cfg);
+const Context = ecs.SystemContext(cfg, World);
+
+// Helper function to cast opaque pointer
+fn getContext(ctx_ptr: *anyopaque) *Context {
+    return @ptrCast(@alignCast(ctx_ptr));
+}
+
+fn mySystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
     // System logic here
 }
 ```
+
+> **Why opaque pointers?** This pattern enables compile-time system registration without circular type dependencies between the config and system definitions.
 
 Systems receive a `SystemContext` providing access to:
 - `ctx.world` - The world instance
@@ -75,7 +87,9 @@ Systems with conflicting component access are placed in separate stages and cann
 ### Basic Query
 
 ```zig
-fn movementSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn movementSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{ Position, Velocity },
     });
@@ -95,7 +109,9 @@ fn movementSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 Filter out entities with certain components:
 
 ```zig
-fn processActiveEntities(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn processActiveEntities(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{Position},
         .exclude = &.{Disabled},  // Skip entities with Disabled component
@@ -113,7 +129,9 @@ fn processActiveEntities(ctx: *ecs.SystemContext(cfg, World)) !void {
 Query entities that may or may not have certain components:
 
 ```zig
-fn renderSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn renderSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{Position, Sprite},
         .optional = &.{Tint},  // May or may not have Tint
@@ -139,7 +157,9 @@ fn renderSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 Get the entity handle during iteration:
 
 ```zig
-fn debugSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn debugSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{Position},
     });
@@ -163,7 +183,9 @@ Use the command buffer for operations that would invalidate iterators.
 ### Despawning Entities
 
 ```zig
-fn deathSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn deathSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{Health},
     });
@@ -183,7 +205,8 @@ fn deathSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 ### Spawning Entities
 
 ```zig
-fn spawnerSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn spawnerSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
     const spawn_timer = ctx.getResource(SpawnTimer) orelse return;
     
     spawn_timer.elapsed += ctx.delta_time;
@@ -199,7 +222,9 @@ fn spawnerSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 ### Modifying Components
 
 ```zig
-fn damageSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn damageSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{ Health, InDamageZone },
     });
@@ -223,7 +248,8 @@ fn damageSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 ### Reading Resources
 
 ```zig
-fn inputSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn inputSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
     const input = ctx.getResourceConst(InputState) orelse return;
     
     if (input.jump_pressed) {
@@ -235,7 +261,8 @@ fn inputSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 ### Modifying Resources
 
 ```zig
-fn scoreSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn scoreSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
     const score = ctx.getResource(GameScore) orelse return;
     
     var query = ctx.world.query(.{
@@ -303,11 +330,12 @@ fn scoreSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
 
 ### Returning Errors
 
-Systems can return errors via the `!void` return type:
+Systems can return errors via the `FrameError!void` return type:
 
 ```zig
-fn systemThatMayFail(ctx: *ecs.SystemContext(cfg, World)) !void {
-    const resource = ctx.getResource(CriticalResource) orelse 
+fn systemThatMayFail(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    const resource = ctx.getResource(CriticalResource) orelse
         return error.ResourceNotFound;
     
     // Continue processing...
@@ -329,7 +357,13 @@ Configure how errors are handled in `WorldConfig.policies`:
 ### Checking Frame Results
 
 ```zig
-const result = Scheduler.executeFrame(&world, delta, tick, null, allocator);
+// Create scheduler bound to world
+const Scheduler = ecs.Scheduler(cfg);
+var scheduler = Scheduler.init(&world, null, allocator);
+defer scheduler.deinit();
+
+// Execute frame and handle result
+const result = scheduler.tick(delta_time);
 
 switch (result) {
     .success => {},
@@ -358,7 +392,9 @@ switch (result) {
 Systems that operate on a single entity:
 
 ```zig
-fn playerControlSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn playerControlSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{ Position, Player },  // Player is marker component
     });
@@ -382,7 +418,9 @@ Process entities with related entities:
 const Parent = struct { entity: ecs.EntityHandle };
 const Child = struct { parent: ecs.EntityHandle };
 
-fn hierarchySystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn hierarchySystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     // First pass: update parents
     var parent_query = ctx.world.query(.{
         .include = &.{ Position, Parent },
@@ -419,7 +457,9 @@ const IdleState = struct {};
 const WalkingState = struct { direction: f32 };
 const JumpingState = struct { velocity_y: f32 };
 
-fn idleSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn idleSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     var query = ctx.world.query(.{
         .include = &.{ Position, IdleState },
     });
@@ -452,7 +492,8 @@ const DamageEvent = struct {
 // Global event queue (could also be a resource)
 var damage_events: ecs.EventQueue(DamageEvent, 256) = undefined;
 
-fn combatSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn combatSystem(ctx_ptr: *anyopaque) FrameError!void {
+    _ = ctx_ptr;
     // Process attack logic, queue damage events
     damage_events.push(.{
         .target = enemy,
@@ -461,7 +502,8 @@ fn combatSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
     }) catch {}; // Handle buffer overflow
 }
 
-fn damageApplicationSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn damageApplicationSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
     // Process damage events
     while (damage_events.pop()) |event| {
         if (ctx.world.getComponent(event.target, Health)) |health| {
@@ -505,7 +547,9 @@ pub const cfg = ecs.WorldConfig{
 Always check before using I/O:
 
 ```zig
-fn networkHandler(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn networkHandler(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    
     // Check if I/O context is available
     if (!ctx.hasIo()) {
         // Fallback to synchronous behavior
@@ -528,13 +572,15 @@ fn networkHandler(ctx: *ecs.SystemContext(cfg, World)) !void {
 ### Async Operation Patterns
 
 ```zig
-fn serverSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
-    const io = ctx.getIo();
+fn serverSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
+    const io = ctx.getIo() orelse return;
     
     // Get raw std.Io for advanced operations
     if (io.getRawIo()) |raw_io| {
         // Use std.Io API directly
         // Note: raw_io is *anyopaque, cast to correct type based on backend
+        _ = raw_io;
     }
     
     var query = ctx.world.query(.{
@@ -543,6 +589,7 @@ fn serverSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
     
     while (query.next()) |result| {
         const conn = result.get(Connection);
+        _ = conn;
         
         // Process connections asynchronously
         // The exact std.Io API depends on platform backend
@@ -587,7 +634,8 @@ for (entity_list) |entity| {
 
 ```zig
 // Good: Batch similar operations
-fn cleanupSystem(ctx: *ecs.SystemContext(cfg, World)) !void {
+fn cleanupSystem(ctx_ptr: *anyopaque) FrameError!void {
+    const ctx = getContext(ctx_ptr);
     var to_despawn: [64]ecs.EntityHandle = undefined;
     var count: usize = 0;
     

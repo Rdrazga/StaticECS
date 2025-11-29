@@ -229,3 +229,8 @@ test "getTimeNs returns value" {
     const t2 = getTimeNs();
     try std.testing.expect(t2 >= t1);
 }
+
+// Import backend functional tests
+test {
+    _ = @import("backends_test.zig");
+}

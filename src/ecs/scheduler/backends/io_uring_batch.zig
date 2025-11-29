@@ -17,6 +17,29 @@
 //! - **Best For**: High-throughput servers with many concurrent I/O operations
 //! - **Overhead**: io_uring setup cost, but amortized over batched operations
 //!
+//! ## I/O Intent System
+//!
+//! Systems can queue I/O operations for batched execution via the IoIntentQueue:
+//!
+//! ```zig
+//! fn mySystem(ctx: *SystemContext) !void {
+//!     // Get the intent queue from the backend (if available)
+//!     if (ctx.getIo()) |io| {
+//!         if (io.getIntentQueue()) |queue| {
+//!             var result: i32 = 0;
+//!             _ = queue.queue(.{
+//!                 .op_type = .read,
+//!                 .fd = my_fd,
+//!                 .buffer = buffer.ptr,
+//!                 .len = buffer.len,
+//!                 .offset = 0,
+//!                 .result_ptr = &result,  // Written on completion
+//!             });
+//!         }
+//!     }
+//! }
+//! ```
+//!
 //! ## Usage
 //!
 //! ```zig
@@ -71,6 +94,107 @@ const getTimeNs = interface.getTimeNs;
 pub const io_uring_available = builtin.os.tag == .linux;
 
 // ============================================================================
+// I/O Intent Types
+// ============================================================================
+
+/// Operation type for I/O intents.
+/// Matches io_uring supported operations.
+pub const IoOpType = enum(u8) {
+    nop,
+    read,
+    write,
+    accept,
+    connect,
+    close,
+    fsync,
+    poll_add,
+    poll_remove,
+    timeout,
+};
+
+/// Completion callback function type.
+/// Called when an I/O operation completes with the result.
+/// Parameters: result (negative = errno), user_data
+pub const IoCompletionCallback = *const fn (i32, u64) void;
+
+/// I/O Request that systems can submit for batched execution.
+///
+/// Tiger Style: All fields bounded/explicit, result delivered via pointer.
+pub const IoRequest = struct {
+    /// Operation type to perform.
+    op_type: IoOpType = .nop,
+    /// File descriptor for the operation.
+    fd: i32 = -1,
+    /// Buffer pointer for read/write operations.
+    buffer: [*]u8 = undefined,
+    /// Length of the buffer/operation.
+    len: usize = 0,
+    /// Offset for positioned read/write.
+    offset: u64 = 0,
+    /// Result written here on completion (negative = errno).
+    /// Must remain valid until completion is processed.
+    result_ptr: ?*volatile i32 = null,
+    /// Optional completion callback.
+    callback: ?IoCompletionCallback = null,
+    /// User data passed to callback.
+    user_data: u64 = 0,
+};
+
+/// Bounded queue for I/O intents from systems.
+///
+/// Systems queue requests during execution, then the scheduler
+/// collects and batches them for io_uring submission.
+///
+/// Tiger Style: Fixed capacity, fail-fast on overflow.
+pub fn IoIntentQueue(comptime max_requests: u16) type {
+    return struct {
+        const Self = @This();
+        pub const capacity = max_requests;
+
+        requests: [max_requests]IoRequest = [_]IoRequest{.{}} ** max_requests,
+        count: u16 = 0,
+
+        /// Initialize an empty queue.
+        pub fn init() Self {
+            return .{};
+        }
+
+        /// Queue an I/O request. Returns false if queue is full.
+        pub fn queue(self: *Self, request: IoRequest) bool {
+            if (self.count >= max_requests) return false;
+            self.requests[self.count] = request;
+            self.count += 1;
+            return true;
+        }
+
+        /// Get queued requests as a slice.
+        pub fn getRequests(self: *const Self) []const IoRequest {
+            return self.requests[0..self.count];
+        }
+
+        /// Clear all queued requests.
+        pub fn clear(self: *Self) void {
+            self.count = 0;
+        }
+
+        /// Check if queue is empty.
+        pub fn isEmpty(self: *const Self) bool {
+            return self.count == 0;
+        }
+
+        /// Check if queue is full.
+        pub fn isFull(self: *const Self) bool {
+            return self.count >= max_requests;
+        }
+
+        /// Get number of queued requests.
+        pub fn len(self: *const Self) u16 {
+            return self.count;
+        }
+    };
+}
+
+// ============================================================================
 // io_uring Batch Backend
 // ============================================================================
 
@@ -117,12 +241,16 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         /// When false, operates in degraded mode (no syscall batching).
         io_uring_active: bool,
 
-        /// Represents a pending I/O operation.
+        /// Shared I/O intent queue that systems can access.
+        /// Systems queue requests here, scheduler collects and processes them.
+        intent_queue: IntentQueue,
+
+        /// Represents a pending I/O operation with completion tracking.
         pub const PendingOp = struct {
             /// System index that initiated this operation.
             system_idx: u16,
-            /// Operation type.
-            op_type: OpType,
+            /// Operation type (uses shared IoOpType).
+            op_type: IoOpType,
             /// File descriptor for the operation.
             fd: i32,
             /// Buffer for read/write operations.
@@ -137,19 +265,10 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             result: i32,
             /// Whether this operation has completed.
             completed: bool,
-
-            pub const OpType = enum(u8) {
-                nop,
-                read,
-                write,
-                accept,
-                connect,
-                close,
-                fsync,
-                poll_add,
-                poll_remove,
-                timeout,
-            };
+            /// Result pointer to write completion result to.
+            result_ptr: ?*volatile i32,
+            /// Optional completion callback.
+            callback: ?IoCompletionCallback,
 
             pub fn init() PendingOp {
                 return .{
@@ -162,9 +281,31 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                     .user_data = 0,
                     .result = 0,
                     .completed = false,
+                    .result_ptr = null,
+                    .callback = null,
+                };
+            }
+
+            /// Create a PendingOp from an IoRequest.
+            pub fn fromRequest(request: IoRequest, system_idx: u16) PendingOp {
+                return .{
+                    .system_idx = system_idx,
+                    .op_type = request.op_type,
+                    .fd = request.fd,
+                    .buffer = request.buffer,
+                    .len = request.len,
+                    .offset = request.offset,
+                    .user_data = request.user_data,
+                    .result = 0,
+                    .completed = false,
+                    .result_ptr = request.result_ptr,
+                    .callback = request.callback,
                 };
             }
         };
+
+        /// I/O intent queue type for this backend.
+        pub const IntentQueue = IoIntentQueue(max_pending);
 
         /// Initialize the io_uring batch backend.
         ///
@@ -183,6 +324,7 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                 .pending_ops = [_]PendingOp{PendingOp.init()} ** max_pending,
                 .pending_count = 0,
                 .io_uring_active = false,
+                .intent_queue = IntentQueue.init(),
             };
 
             if (io_uring_available) {
@@ -309,6 +451,7 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         pub fn reset(self: *Self) void {
             self.tick_count = 0;
             self.pending_count = 0;
+            self.intent_queue.clear();
             self.stats.reset();
             // Note: io_uring_active state is preserved - it reflects hardware capability
         }
@@ -326,6 +469,22 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         /// Get tick count.
         pub fn getTickCount(self: *const Self) u64 {
             return self.tick_count;
+        }
+
+        /// Get the intent queue for systems to queue I/O operations.
+        ///
+        /// Systems can call this to queue I/O operations that will be
+        /// batched and submitted via io_uring at the end of each phase.
+        ///
+        /// Returns null if the backend is not active (degraded mode).
+        pub fn getIntentQueue(self: *Self) ?*IntentQueue {
+            if (!io_uring_available or !self.io_uring_active) return null;
+            return &self.intent_queue;
+        }
+
+        /// Check if io_uring is active and available for batching.
+        pub fn isActive(self: *const Self) bool {
+            return io_uring_available and self.io_uring_active;
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -353,6 +512,7 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
 
             // Reset pending operations for this phase
             self.pending_count = 0;
+            self.intent_queue.clear();
 
             // Get stages for this phase
             const phase_stages = Sched.stages_by_phase[phase_idx];
@@ -376,20 +536,49 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
 
                     result.systems_run += 1;
 
-                    // TODO: Check if system queued any I/O intents
-                    // This would require IoContext integration
+                    // Collect I/O intents queued by this system
+                    // Systems queue via getIntentQueue() which returns &self.intent_queue
+                    const intents_collected = self.collectIntentsFromQueue(
+                        @as(u16, @intCast(system_index)),
+                    );
+                    result.syscalls_batched += intents_collected;
                 }
             }
 
             // Phase 2: Submit batched I/O (if any pending)
             if (self.pending_count > 0) {
-                result.syscalls_batched += self.submitBatch();
+                _ = self.submitBatch();
             }
 
-            // Phase 3: Process completions
+            // Phase 3: Process completions and dispatch results
             self.processCompletions();
 
             return result;
+        }
+
+        /// Collect I/O intents from the shared queue into pending_ops.
+        ///
+        /// This is called after each system executes to move queued intents
+        /// into the pending operations array for batch submission.
+        fn collectIntentsFromQueue(self: *Self, system_idx: u16) u64 {
+            if (!io_uring_available or !self.io_uring_active) return 0;
+            if (self.intent_queue.isEmpty()) return 0;
+
+            var collected: u64 = 0;
+            for (self.intent_queue.getRequests()) |request| {
+                if (self.pending_count >= max_pending) break;
+
+                self.pending_ops[self.pending_count] = PendingOp.fromRequest(
+                    request,
+                    system_idx,
+                );
+                self.pending_count += 1;
+                collected += 1;
+            }
+
+            // Clear the intent queue after collection
+            self.intent_queue.clear();
+            return collected;
         }
 
         /// Submit all pending operations to io_uring.
@@ -428,6 +617,10 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         }
 
         /// Process completed operations from io_uring.
+        ///
+        /// Dispatches results back to requesters via:
+        /// 1. Writing result to result_ptr (if provided)
+        /// 2. Invoking callback (if provided)
         fn processCompletions(self: *Self) void {
             if (!io_uring_available or !self.io_uring_active) return;
 
@@ -445,10 +638,28 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                 op.result = cqe.res;
                 op.completed = true;
 
-                // TODO: Dispatch completion to appropriate handler
-                // This would notify the system that queued the operation
+                // Dispatch completion: write result and invoke callback
+                self.dispatchCompletion(op);
 
                 self.ring.cq_advance(1);
+            }
+        }
+
+        /// Dispatch a completed I/O operation to its requester.
+        ///
+        /// Tiger Style: Result delivery via pointer write (non-blocking),
+        /// optional callback for complex handling.
+        fn dispatchCompletion(_: *Self, op: *PendingOp) void {
+            // Write result to the result pointer if provided
+            // This allows the requesting system to poll for completion
+            if (op.result_ptr) |ptr| {
+                ptr.* = op.result;
+            }
+
+            // Invoke callback if provided
+            // This allows immediate handling of completions
+            if (op.callback) |callback| {
+                callback(op.result, op.user_data);
             }
         }
 
@@ -507,8 +718,36 @@ test "io_uring backend - PendingOp init" {
     const Backend = IoUringBatchBackend(cfg, DummyWorld);
     const op = Backend.PendingOp.init();
     try std.testing.expectEqual(@as(u16, 0), op.system_idx);
-    try std.testing.expectEqual(Backend.PendingOp.OpType.nop, op.op_type);
+    try std.testing.expectEqual(IoOpType.nop, op.op_type);
     try std.testing.expectEqual(@as(i32, -1), op.fd);
+    try std.testing.expect(!op.completed);
+    try std.testing.expect(op.result_ptr == null);
+    try std.testing.expect(op.callback == null);
+}
+
+test "io_uring backend - PendingOp fromRequest" {
+    const cfg = config_mod.WorldConfig{};
+    const Backend = IoUringBatchBackend(cfg, DummyWorld);
+
+    var result: i32 = 0;
+    var buffer: [64]u8 = undefined;
+    const request = IoRequest{
+        .op_type = .read,
+        .fd = 42,
+        .buffer = &buffer,
+        .len = buffer.len,
+        .offset = 100,
+        .result_ptr = &result,
+        .user_data = 12345,
+    };
+
+    const op = Backend.PendingOp.fromRequest(request, 7);
+    try std.testing.expectEqual(@as(u16, 7), op.system_idx);
+    try std.testing.expectEqual(IoOpType.read, op.op_type);
+    try std.testing.expectEqual(@as(i32, 42), op.fd);
+    try std.testing.expectEqual(@as(usize, 64), op.len);
+    try std.testing.expectEqual(@as(u64, 100), op.offset);
+    try std.testing.expectEqual(@as(u64, 12345), op.user_data);
     try std.testing.expect(!op.completed);
 }
 
@@ -544,6 +783,101 @@ test "io_uring backend - stats initialization" {
     const stats = BackendStats{};
     try std.testing.expectEqual(@as(u64, 0), stats.ticks_executed);
     try std.testing.expectEqual(@as(u64, 0), stats.syscalls_batched);
+}
+
+test "IoIntentQueue - basic operations" {
+    var queue = IoIntentQueue(8).init();
+
+    try std.testing.expect(queue.isEmpty());
+    try std.testing.expect(!queue.isFull());
+    try std.testing.expectEqual(@as(u16, 0), queue.len());
+
+    // Queue a request
+    const result1 = queue.queue(.{ .op_type = .read, .fd = 1 });
+    try std.testing.expect(result1);
+    try std.testing.expect(!queue.isEmpty());
+    try std.testing.expectEqual(@as(u16, 1), queue.len());
+
+    // Queue more
+    _ = queue.queue(.{ .op_type = .write, .fd = 2 });
+    _ = queue.queue(.{ .op_type = .close, .fd = 3 });
+    try std.testing.expectEqual(@as(u16, 3), queue.len());
+
+    // Check requests
+    const requests = queue.getRequests();
+    try std.testing.expectEqual(@as(usize, 3), requests.len);
+    try std.testing.expectEqual(IoOpType.read, requests[0].op_type);
+    try std.testing.expectEqual(IoOpType.write, requests[1].op_type);
+    try std.testing.expectEqual(IoOpType.close, requests[2].op_type);
+
+    // Clear
+    queue.clear();
+    try std.testing.expect(queue.isEmpty());
+    try std.testing.expectEqual(@as(u16, 0), queue.len());
+}
+
+test "IoIntentQueue - capacity limits" {
+    var queue = IoIntentQueue(4).init();
+
+    // Fill to capacity
+    try std.testing.expect(queue.queue(.{ .fd = 1 }));
+    try std.testing.expect(queue.queue(.{ .fd = 2 }));
+    try std.testing.expect(queue.queue(.{ .fd = 3 }));
+    try std.testing.expect(queue.queue(.{ .fd = 4 }));
+
+    try std.testing.expect(queue.isFull());
+    try std.testing.expectEqual(@as(u16, 4), queue.len());
+
+    // Should fail when full
+    try std.testing.expect(!queue.queue(.{ .fd = 5 }));
+    try std.testing.expectEqual(@as(u16, 4), queue.len());
+}
+
+test "IoRequest - default initialization" {
+    const req = IoRequest{};
+    try std.testing.expectEqual(IoOpType.nop, req.op_type);
+    try std.testing.expectEqual(@as(i32, -1), req.fd);
+    try std.testing.expectEqual(@as(usize, 0), req.len);
+    try std.testing.expectEqual(@as(u64, 0), req.offset);
+    try std.testing.expect(req.result_ptr == null);
+    try std.testing.expect(req.callback == null);
+}
+
+test "io_uring backend - completion dispatch" {
+    const cfg = config_mod.WorldConfig{};
+    const Backend = IoUringBatchBackend(cfg, DummyWorld);
+
+    var result: i32 = -999;
+
+    const callback = struct {
+        fn cb(res: i32, data: u64) void {
+            // Note: Can't directly modify outer vars in this test setup
+            // This test validates the callback signature works
+            _ = res;
+            _ = data;
+        }
+    }.cb;
+
+    var op = Backend.PendingOp{
+        .system_idx = 0,
+        .op_type = .read,
+        .fd = 1,
+        .buffer = undefined,
+        .len = 0,
+        .offset = 0,
+        .user_data = 42,
+        .result = 100,
+        .completed = true,
+        .result_ptr = &result,
+        .callback = callback,
+    };
+
+    // Test dispatchCompletion writes result
+    var backend = Backend.init(std.testing.allocator, null);
+    defer backend.deinit();
+
+    backend.dispatchCompletion(&op);
+    try std.testing.expectEqual(@as(i32, 100), result);
 }
 
 // Dummy world type for testing

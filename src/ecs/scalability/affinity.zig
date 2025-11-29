@@ -11,6 +11,19 @@ const builtin = @import("builtin");
 const config = @import("../config.zig");
 const AffinityConfig = config.AffinityConfig;
 
+/// Architecture-specific syscall numbers for affinity operations.
+/// Reference: https://syscall.sh/ and Linux kernel source
+/// Why: Syscall numbers vary by architecture; x86_64 != ARM64
+const SyscallNumbers = struct {
+    /// getcpu syscall - gets current CPU/NUMA node
+    /// x86_64: 309, ARM64: 168
+    const getcpu = switch (builtin.cpu.arch) {
+        .x86_64 => 309,
+        .aarch64 => 168,
+        else => @compileError("Unsupported architecture for affinity getcpu syscall"),
+    };
+};
+
 /// Thread affinity manager.
 /// Handles CPU topology detection and thread pinning.
 pub const AffinityManager = struct {
@@ -211,10 +224,12 @@ pub const AffinityManager = struct {
         return 1;
     }
 
+    /// Get actual NUMA node count from sysfs.
+    /// Counts /sys/devices/system/node/node* directories.
     fn detectNumaNodeCountLinux() u8 {
         var count: u8 = 0;
         var i: u8 = 0;
-        while (i < 64) : (i += 1) {
+        while (i < CpuTopology.MAX_NUMA_NODES) : (i += 1) {
             var buf: [64]u8 = undefined;
             const path = std.fmt.bufPrint(&buf, "/sys/devices/system/node/node{d}", .{i}) catch break;
             std.fs.accessAbsolute(path, .{}) catch break;
@@ -224,33 +239,65 @@ pub const AffinityManager = struct {
     }
 
     fn detectTopology(cpu_count: u16) !CpuTopology {
-        // Initialize all CPUs as both physical and logical
-        // A more sophisticated implementation would parse /sys/devices/system/cpu/
-        // to detect hyperthreading
-        var i: u16 = 0;
-        while (i < cpu_count and i < CpuTopology.MAX_CPUS) : (i += 1) {
-            CpuTopology.physical_buffer[i] = i;
-            CpuTopology.logical_buffer[i] = i;
+        if (comptime builtin.os.tag == .linux) {
+            return detectTopologyLinux(cpu_count);
+        }
+        // Fallback for non-Linux: treat all cores as physical
+        return detectTopologyFallback(cpu_count);
+    }
+
+    /// Detect topology from Linux sysfs.
+    /// Reads /sys/devices/system/cpu/cpuN/topology/core_id to distinguish
+    /// physical cores from hyperthreads, and /sys/devices/system/node/nodeM/cpulist
+    /// for accurate NUMA node mapping.
+    fn detectTopologyLinux(cpu_count: u16) !CpuTopology {
+        // Track which physical core IDs we've seen to identify hyperthreads.
+        // Key: (package_id << 16) | core_id, Value: first CPU with this core
+        var seen_cores: [CpuTopology.MAX_CPUS]u32 = undefined;
+        var seen_cores_count: usize = 0;
+
+        var physical_count: usize = 0;
+        var logical_count: usize = 0;
+
+        // Process each CPU
+        var cpu: u16 = 0;
+        while (cpu < cpu_count and cpu < CpuTopology.MAX_CPUS) : (cpu += 1) {
+            CpuTopology.logical_buffer[logical_count] = cpu;
+            logical_count += 1;
+
+            // Read core_id from sysfs
+            const core_info = getLinuxCoreInfo(cpu);
+            const core_key = (@as(u32, core_info.package_id) << 16) | core_info.core_id;
+
+            // Check if we've seen this physical core before
+            var is_hyperthread = false;
+            for (seen_cores[0..seen_cores_count]) |seen| {
+                if (seen == core_key) {
+                    is_hyperthread = true;
+                    break;
+                }
+            }
+
+            if (!is_hyperthread) {
+                // First thread on this physical core
+                if (seen_cores_count < CpuTopology.MAX_CPUS) {
+                    seen_cores[seen_cores_count] = core_key;
+                    seen_cores_count += 1;
+                }
+                CpuTopology.physical_buffer[physical_count] = cpu;
+                physical_count += 1;
+            }
         }
 
-        // Detect NUMA topology
+        // Detect NUMA topology from sysfs
         const numa_count = detectNumaNodeCount();
         var node: u8 = 0;
         while (node < numa_count and node < CpuTopology.MAX_NUMA_NODES) : (node += 1) {
-            // Simple round-robin assignment for now
-            // A real implementation would parse /sys/devices/system/node/nodeX/cpulist
-            var cpu: u16 = 0;
-            var node_cpu_count: usize = 0;
-            while (cpu < cpu_count) : (cpu += 1) {
-                if (cpu % numa_count == node) {
-                    CpuTopology.numa_buffer[node][node_cpu_count] = cpu;
-                    node_cpu_count += 1;
-                }
-            }
+            const node_cpu_count = getLinuxNodeCpus(node, cpu_count, &CpuTopology.numa_buffer[node]);
             CpuTopology.numa_sizes[node] = node_cpu_count;
         }
 
-        // Build slices
+        // Build NUMA slices
         var numa_slices: [CpuTopology.MAX_NUMA_NODES][]const u16 = undefined;
         node = 0;
         while (node < numa_count) : (node += 1) {
@@ -258,10 +305,201 @@ pub const AffinityManager = struct {
         }
 
         return .{
-            .physical_cores = CpuTopology.physical_buffer[0..cpu_count],
-            .logical_cores = CpuTopology.logical_buffer[0..cpu_count],
+            .physical_cores = CpuTopology.physical_buffer[0..physical_count],
+            .logical_cores = CpuTopology.logical_buffer[0..logical_count],
             .numa_nodes = numa_slices[0..numa_count],
         };
+    }
+
+    /// Fallback topology detection for non-Linux platforms.
+    /// Treats all CPUs as physical cores (no hyperthread detection).
+    fn detectTopologyFallback(cpu_count: u16) CpuTopology {
+        var i: u16 = 0;
+        while (i < cpu_count and i < CpuTopology.MAX_CPUS) : (i += 1) {
+            CpuTopology.physical_buffer[i] = i;
+            CpuTopology.logical_buffer[i] = i;
+        }
+
+        // Single NUMA node for non-Linux
+        var j: u16 = 0;
+        while (j < cpu_count) : (j += 1) {
+            CpuTopology.numa_buffer[0][j] = j;
+        }
+        CpuTopology.numa_sizes[0] = cpu_count;
+
+        var numa_slices: [CpuTopology.MAX_NUMA_NODES][]const u16 = undefined;
+        numa_slices[0] = CpuTopology.numa_buffer[0][0..cpu_count];
+
+        return .{
+            .physical_cores = CpuTopology.physical_buffer[0..cpu_count],
+            .logical_cores = CpuTopology.logical_buffer[0..cpu_count],
+            .numa_nodes = numa_slices[0..1],
+        };
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Linux sysfs helpers
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Core info from sysfs topology.
+    const CoreInfo = struct {
+        core_id: u16,
+        package_id: u16,
+    };
+
+    /// Get physical core ID and package ID for a CPU from sysfs.
+    /// Returns (0, 0) if sysfs unavailable (fallback behavior).
+    fn getLinuxCoreInfo(cpu_id: u16) CoreInfo {
+        if (comptime builtin.os.tag != .linux) {
+            return .{ .core_id = cpu_id, .package_id = 0 };
+        }
+
+        var path_buf: [128]u8 = undefined;
+
+        // Read core_id: /sys/devices/system/cpu/cpu{N}/topology/core_id
+        const core_path = std.fmt.bufPrint(
+            &path_buf,
+            "/sys/devices/system/cpu/cpu{d}/topology/core_id",
+            .{cpu_id},
+        ) catch return .{ .core_id = cpu_id, .package_id = 0 };
+
+        const core_id = readSysfsInt(core_path) orelse cpu_id;
+
+        // Read package_id: /sys/devices/system/cpu/cpu{N}/topology/physical_package_id
+        const pkg_path = std.fmt.bufPrint(
+            &path_buf,
+            "/sys/devices/system/cpu/cpu{d}/topology/physical_package_id",
+            .{cpu_id},
+        ) catch return .{ .core_id = core_id, .package_id = 0 };
+
+        const package_id = readSysfsInt(pkg_path) orelse 0;
+
+        return .{ .core_id = core_id, .package_id = package_id };
+    }
+
+    /// Get list of CPUs belonging to a NUMA node from sysfs.
+    /// Parses /sys/devices/system/node/node{N}/cpulist format (e.g., "0-7,16-23").
+    /// Returns number of CPUs written to output buffer.
+    fn getLinuxNodeCpus(node_id: u8, max_cpu: u16, output: []u16) usize {
+        if (comptime builtin.os.tag != .linux) {
+            return 0;
+        }
+
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(
+            &path_buf,
+            "/sys/devices/system/node/node{d}/cpulist",
+            .{node_id},
+        ) catch return 0;
+
+        var file_buf: [256]u8 = undefined;
+        const content = readSysfsString(path, &file_buf) orelse return fallbackNodeCpus(node_id, max_cpu, output);
+
+        return parseCpuList(content, max_cpu, output);
+    }
+
+    /// Fallback: distribute CPUs round-robin across nodes when sysfs unavailable.
+    fn fallbackNodeCpus(node_id: u8, max_cpu: u16, output: []u16) usize {
+        const numa_count = detectNumaNodeCount();
+        var count: usize = 0;
+        var cpu: u16 = 0;
+        while (cpu < max_cpu and count < output.len) : (cpu += 1) {
+            if (cpu % numa_count == node_id) {
+                output[count] = cpu;
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Read an integer from a sysfs path.
+    fn readSysfsInt(path: []const u8) ?u16 {
+        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+        defer file.close();
+
+        var buf: [64]u8 = undefined;
+        const len = file.readAll(&buf) catch return null;
+        if (len == 0) return null;
+
+        // Trim trailing newline and whitespace
+        var end: usize = len;
+        while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == ' ' or buf[end - 1] == '\r')) {
+            end -= 1;
+        }
+        if (end == 0) return null;
+
+        return std.fmt.parseInt(u16, buf[0..end], 10) catch null;
+    }
+
+    /// Read a string from a sysfs path into provided buffer.
+    fn readSysfsString(path: []const u8, buf: []u8) ?[]const u8 {
+        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+        defer file.close();
+
+        const len = file.readAll(buf) catch return null;
+        if (len == 0) return null;
+
+        // Trim trailing newline
+        var end: usize = len;
+        while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == ' ' or buf[end - 1] == '\r')) {
+            end -= 1;
+        }
+
+        return buf[0..end];
+    }
+
+    /// Parse a cpulist format string (e.g., "0-7,16-23") into CPU IDs.
+    /// Returns number of CPUs written to output buffer.
+    fn parseCpuList(cpulist: []const u8, max_cpu: u16, output: []u16) usize {
+        var count: usize = 0;
+        var pos: usize = 0;
+
+        while (pos < cpulist.len and count < output.len) {
+            // Skip leading whitespace
+            while (pos < cpulist.len and (cpulist[pos] == ' ' or cpulist[pos] == '\t')) {
+                pos += 1;
+            }
+            if (pos >= cpulist.len) break;
+
+            // Parse first number
+            const start_num_start = pos;
+            while (pos < cpulist.len and cpulist[pos] >= '0' and cpulist[pos] <= '9') {
+                pos += 1;
+            }
+            if (pos == start_num_start) break;
+
+            const start_num = std.fmt.parseInt(u16, cpulist[start_num_start..pos], 10) catch break;
+
+            // Check for range
+            if (pos < cpulist.len and cpulist[pos] == '-') {
+                pos += 1; // Skip '-'
+                const end_num_start = pos;
+                while (pos < cpulist.len and cpulist[pos] >= '0' and cpulist[pos] <= '9') {
+                    pos += 1;
+                }
+                const end_num = std.fmt.parseInt(u16, cpulist[end_num_start..pos], 10) catch break;
+
+                // Add range
+                var cpu = start_num;
+                while (cpu <= end_num and cpu < max_cpu and count < output.len) : (cpu += 1) {
+                    output[count] = cpu;
+                    count += 1;
+                }
+            } else {
+                // Single CPU
+                if (start_num < max_cpu) {
+                    output[count] = start_num;
+                    count += 1;
+                }
+            }
+
+            // Skip comma separator
+            if (pos < cpulist.len and cpulist[pos] == ',') {
+                pos += 1;
+            }
+        }
+
+        return count;
     }
 };
 
@@ -276,14 +514,15 @@ pub fn getCurrentCpu() ?u16 {
 fn getCurrentCpuLinux() ?u16 {
     if (comptime builtin.os.tag != .linux) return null;
 
-    // Use getcpu syscall
+    // Compile-time architecture check via SyscallNumbers prevents
+    // compilation on unsupported architectures
+    const syscall_num = comptime SyscallNumbers.getcpu;
+
     var cpu: u32 = undefined;
     var node: u32 = undefined;
 
-    // SYS_getcpu = 309 on x86_64
-    const SYS_getcpu = 309;
     const result = std.os.linux.syscall3(
-        @enumFromInt(SYS_getcpu),
+        @enumFromInt(syscall_num),
         @intFromPtr(&cpu),
         @intFromPtr(&node),
         0,
@@ -411,4 +650,93 @@ test "getCurrentCpu returns valid value or null" {
 test "AffinityConfig strategies are distinct" {
     try std.testing.expect(@intFromEnum(AffinityConfig.Strategy.sequential) != @intFromEnum(AffinityConfig.Strategy.physical_only));
     try std.testing.expect(@intFromEnum(AffinityConfig.Strategy.numa_spread) != @intFromEnum(AffinityConfig.Strategy.explicit));
+}
+
+test "parseCpuList single CPU" {
+    var output: [16]u16 = undefined;
+    const count = AffinityManager.parseCpuList("5", 32, &output);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(u16, 5), output[0]);
+}
+
+test "parseCpuList range" {
+    var output: [16]u16 = undefined;
+    const count = AffinityManager.parseCpuList("0-3", 32, &output);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(@as(u16, 0), output[0]);
+    try std.testing.expectEqual(@as(u16, 1), output[1]);
+    try std.testing.expectEqual(@as(u16, 2), output[2]);
+    try std.testing.expectEqual(@as(u16, 3), output[3]);
+}
+
+test "parseCpuList mixed ranges and singles" {
+    var output: [32]u16 = undefined;
+    const count = AffinityManager.parseCpuList("0-2,5,8-10", 32, &output);
+    try std.testing.expectEqual(@as(usize, 7), count);
+    try std.testing.expectEqual(@as(u16, 0), output[0]);
+    try std.testing.expectEqual(@as(u16, 1), output[1]);
+    try std.testing.expectEqual(@as(u16, 2), output[2]);
+    try std.testing.expectEqual(@as(u16, 5), output[3]);
+    try std.testing.expectEqual(@as(u16, 8), output[4]);
+    try std.testing.expectEqual(@as(u16, 9), output[5]);
+    try std.testing.expectEqual(@as(u16, 10), output[6]);
+}
+
+test "parseCpuList respects max_cpu" {
+    var output: [16]u16 = undefined;
+    // Range 0-10 but max_cpu is 4, so only 0-3 added
+    const count = AffinityManager.parseCpuList("0-10", 4, &output);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(@as(u16, 3), output[3]);
+}
+
+test "parseCpuList empty string" {
+    var output: [16]u16 = undefined;
+    const count = AffinityManager.parseCpuList("", 32, &output);
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "AffinityManager physical_only strategy" {
+    const cfg = AffinityConfig{
+        .enabled = true,
+        .strategy = .physical_only,
+    };
+    const manager = try AffinityManager.init(cfg);
+
+    // Physical-only should only use physical cores
+    const cpu0 = manager.getCpuForThread(0);
+    try std.testing.expect(cpu0 < manager.cpu_count);
+
+    // Verify physical cores are valid
+    for (manager.topology.physical_cores) |core| {
+        try std.testing.expect(core < manager.cpu_count);
+    }
+
+    // Physical cores should be subset of all CPUs
+    try std.testing.expect(manager.topology.physical_cores.len <= manager.cpu_count);
+    try std.testing.expect(manager.topology.physical_cores.len >= 1);
+}
+
+test "AffinityManager topology detection" {
+    const cfg = AffinityConfig{ .enabled = false };
+    const manager = try AffinityManager.init(cfg);
+
+    // Logical cores should include all CPUs
+    try std.testing.expectEqual(manager.cpu_count, @as(u16, @intCast(manager.topology.logical_cores.len)));
+
+    // Physical cores should be <= logical cores
+    try std.testing.expect(manager.topology.physical_cores.len <= manager.topology.logical_cores.len);
+
+    // Should have at least one NUMA node
+    try std.testing.expect(manager.topology.numa_nodes.len >= 1);
+
+    // NUMA node should have CPUs
+    if (manager.topology.numa_nodes.len > 0) {
+        var total_numa_cpus: usize = 0;
+        for (manager.topology.numa_nodes) |node_cpus| {
+            total_numa_cpus += node_cpus.len;
+        }
+        // All CPUs should be assigned to some NUMA node
+        try std.testing.expect(total_numa_cpus >= manager.cpu_count);
+    }
 }

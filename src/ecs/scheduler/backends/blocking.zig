@@ -101,100 +101,39 @@ pub fn BlockingBackend(comptime cfg: WorldConfig, comptime WorldType: type) type
         ///
         /// Runs all systems in phase order according to the built schedule.
         /// Systems within a stage may run in parallel if execution model permits.
+        /// Tiger Style: Orchestrator function delegates to pure helper functions.
         pub fn tick(self: *Self, world: *WorldType, delta_time: f64) FrameResultT {
             const start_time = getTimeNs();
-
-            // Initialize command buffer
             var commands = CmdBuf.init();
 
             // Create IoBackend and IoContext based on execution model
             const execution_model = cfg.schedule.execution_model;
             var io_backend = createIoBackend(self.allocator, execution_model);
             defer if (io_backend) |*b| b.deinit();
-
             var io_context = createIoContext(if (io_backend) |*b| b else null, execution_model);
 
-            // Create system context
-            // Note: When BlockingBackend is used as fallback for advanced backends
-            // (io_uring_batch, work_stealing, adaptive_hybrid), it uses blocking mode.
-            var ctx = switch (execution_model) {
-                .blocking_single_thread,
-                .io_uring_batch,
-                .work_stealing,
-                .adaptive_hybrid,
-                => SysCtx.init(
-                    world,
-                    &world.resources,
-                    delta_time,
-                    self.tick_count,
-                    start_time,
-                    &commands,
-                    self.allocator,
-                ),
-                .evented_single_thread, .concurrent_threadpool => SysCtx.initWithIo(
-                    world,
-                    &world.resources,
-                    delta_time,
-                    self.tick_count,
-                    start_time,
-                    &commands,
-                    self.allocator,
-                    &io_context,
-                ),
-            };
-
+            // Create system context and initialize frame state
+            var ctx = createSystemContext(self, world, delta_time, start_time, &commands, &io_context);
             const policy = cfg.policies.frame;
             var errors = AggregateErrors.init();
 
-            // Initialize tracing
+            // Initialize tracing and emit tick start
             var tracer = Tracer.init(self.trace_sink, @intFromPtr(world));
             tracer.emitTickStart(self.tick_count, start_time);
 
             // Execute all phases
-            var frame_success = true;
-            var systems_run: u64 = 0;
+            const result = executeFramePhases(self, &ctx, policy, &errors);
 
-            inline for (0..Sched.num_phases) |phase_idx| {
-                const phase_success = PhaseExec.executePhaseByIndex(&ctx, phase_idx, policy, &errors);
-                self.stats.phases_executed += 1;
-
-                // Count systems in this phase
-                const phase_stages = Sched.stages_by_phase[phase_idx];
-                inline for (0..phase_stages.stage_count) |stage_idx| {
-                    systems_run += phase_stages.stages[stage_idx].system_count;
-                }
-
-                if (!phase_success) {
-                    frame_success = false;
-                    if (policy == .default) break;
-                }
-            }
-
-            // Emit tick end
+            // Emit tick end and update statistics
             const end_time = getTimeNs();
             tracer.emitTickEnd(self.tick_count, end_time, end_time - start_time);
-
-            // Update statistics
             self.tick_count += 1;
             self.stats.ticks_executed += 1;
-            self.stats.systems_executed += systems_run;
+            self.stats.systems_executed += result.systems_run;
             self.stats.last_tick_time_ns = end_time - start_time;
             self.stats.total_tick_time_ns += end_time - start_time;
 
-            // Return result
-            if (frame_success) {
-                return .{ .success = {} };
-            }
-
-            if (policy == .aggregate) {
-                return .{ .aggregate_errors = errors };
-            }
-
-            if (errors.first()) |first_err| {
-                return .{ .single_error = first_err };
-            }
-
-            return .{ .success = {} };
+            return buildFrameResult(result.success, policy, &errors);
         }
 
         /// Reset backend state and statistics.
@@ -216,6 +155,89 @@ pub fn BlockingBackend(comptime cfg: WorldConfig, comptime WorldType: type) type
         /// Get tick count.
         pub fn getTickCount(self: *const Self) u64 {
             return self.tick_count;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Internal: Frame execution helpers (Tiger Style: pure leaves, ≤70 lines)
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// Result type for frame phase execution.
+        const FramePhaseResult = struct {
+            success: bool,
+            systems_run: u64,
+        };
+
+        /// Create system context based on execution model.
+        /// Tiger Style: Isolates complex switch logic for context initialization.
+        fn createSystemContext(
+            self: *Self,
+            world: *WorldType,
+            delta_time: f64,
+            start_time: u64,
+            commands: *CmdBuf,
+            io_context: *IoContext,
+        ) SysCtx {
+            const execution_model = cfg.schedule.execution_model;
+            return switch (execution_model) {
+                .blocking_single_thread,
+                .io_uring_batch,
+                .work_stealing,
+                .adaptive_hybrid,
+                => SysCtx.init(world, &world.resources, delta_time, self.tick_count, start_time, commands, self.allocator),
+                .evented_single_thread, .concurrent_threadpool => SysCtx.initWithIo(world, &world.resources, delta_time, self.tick_count, start_time, commands, self.allocator, io_context),
+            };
+        }
+
+        /// Execute all phases and accumulate results.
+        /// Tiger Style: Central loop extracted as pure computation over phases.
+        fn executeFramePhases(
+            self: *Self,
+            ctx: *SysCtx,
+            policy: FramePolicy,
+            errors: *AggregateErrors,
+        ) FramePhaseResult {
+            var frame_success = true;
+            var systems_run: u64 = 0;
+
+            inline for (0..Sched.num_phases) |phase_idx| {
+                const phase_success = PhaseExec.executePhaseByIndex(ctx, phase_idx, policy, errors);
+                self.stats.phases_executed += 1;
+
+                // Count systems in this phase
+                const phase_stages = Sched.stages_by_phase[phase_idx];
+                inline for (0..phase_stages.stage_count) |stage_idx| {
+                    systems_run += phase_stages.stages[stage_idx].system_count;
+                }
+
+                if (!phase_success) {
+                    frame_success = false;
+                    if (policy == .default) break;
+                }
+            }
+
+            return .{ .success = frame_success, .systems_run = systems_run };
+        }
+
+        /// Build frame result from execution outcome.
+        /// Tiger Style: Pure function mapping success/errors to result union.
+        fn buildFrameResult(
+            frame_success: bool,
+            policy: FramePolicy,
+            errors: *const AggregateErrors,
+        ) FrameResultT {
+            if (frame_success) {
+                return .{ .success = {} };
+            }
+
+            if (policy == .aggregate) {
+                return .{ .aggregate_errors = errors.* };
+            }
+
+            if (errors.first()) |first_err| {
+                return .{ .single_error = first_err };
+            }
+
+            return .{ .success = {} };
         }
 
         // ─────────────────────────────────────────────────────────────────────

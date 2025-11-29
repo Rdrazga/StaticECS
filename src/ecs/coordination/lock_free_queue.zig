@@ -660,3 +660,12 @@ test "SPSCQueue: interleaved push/pop" {
     try std.testing.expectEqual(@as(?u32, 5), queue.pop());
     try std.testing.expect(queue.isEmpty());
 }
+
+// ============================================================================
+// Stress Tests Import
+// ============================================================================
+
+test {
+    // Import concurrent stress tests for lock-free queue verification
+    _ = @import("lock_free_queue_stress_test.zig");
+}
