@@ -13,12 +13,19 @@ const std = @import("std");
 const testing = std.testing;
 const builtin = @import("builtin");
 
-const ecs = @import("../../../ecs.zig");
-const WorldConfig = ecs.WorldConfig;
-const Phase = ecs.Phase;
-
+// Use direct module imports instead of ecs.zig to avoid module path issues
+// when this file is imported from different roots (e.g., benchmark.zig)
 const config_mod = @import("../../config.zig");
+const WorldConfig = config_mod.WorldConfig;
+const Phase = config_mod.Phase;
 const ExecutionModel = config_mod.ExecutionModel;
+const asSystemFn = config_mod.asSystemFn;
+
+const world_mod = @import("../../world.zig");
+const World = world_mod.World;
+
+const scheduler_mod = @import("../../scheduler.zig");
+const Scheduler = scheduler_mod.Scheduler;
 
 const error_types = @import("../../error/error_types.zig");
 const FrameError = error_types.FrameError;
@@ -155,7 +162,7 @@ const single_system_config = WorldConfig{
             .phase = Phase.update.index(),
             .read_components = &.{},
             .write_components = &.{Counter},
-            .func = ecs.asSystemFn(incrementSystem),
+            .func = asSystemFn(incrementSystem),
         },
     } },
     .options = .{ .max_entities = 100 },
@@ -174,21 +181,21 @@ const multi_system_config = WorldConfig{
             .phase = Phase.update.index(),
             .read_components = &.{},
             .write_components = &.{Counter},
-            .func = ecs.asSystemFn(system1),
+            .func = asSystemFn(system1),
         },
         .{
             .name = "sys2",
             .phase = Phase.update.index(),
             .read_components = &.{},
             .write_components = &.{Counter},
-            .func = ecs.asSystemFn(system2),
+            .func = asSystemFn(system2),
         },
         .{
             .name = "sys3",
             .phase = Phase.update.index(),
             .read_components = &.{},
             .write_components = &.{Counter},
-            .func = ecs.asSystemFn(system3),
+            .func = asSystemFn(system3),
         },
     } },
     .options = .{ .max_entities = 100 },
@@ -207,21 +214,21 @@ const multi_phase_config = WorldConfig{
             .phase = Phase.pre_update.index(),
             .read_components = &.{},
             .write_components = &.{Counter},
-            .func = ecs.asSystemFn(system1),
+            .func = asSystemFn(system1),
         },
         .{
             .name = "main",
             .phase = Phase.update.index(),
             .read_components = &.{Counter},
             .write_components = &.{Position},
-            .func = ecs.asSystemFn(system2),
+            .func = asSystemFn(system2),
         },
         .{
             .name = "late",
             .phase = Phase.post_update.index(),
             .read_components = &.{Position},
             .write_components = &.{},
-            .func = ecs.asSystemFn(system3),
+            .func = asSystemFn(system3),
         },
     } },
     .options = .{ .max_entities = 100 },
@@ -251,7 +258,7 @@ const failing_system_config = WorldConfig{
             .phase = Phase.update.index(),
             .read_components = &.{},
             .write_components = &.{Counter},
-            .func = ecs.asSystemFn(failingSystem),
+            .func = asSystemFn(failingSystem),
         },
     } },
     .options = .{ .max_entities = 100 },
@@ -265,13 +272,13 @@ const failing_system_config = WorldConfig{
 test "blocking backend - executes single system" {
     resetTestState();
 
-    const World = ecs.World(single_system_config);
-    const Scheduler = ecs.Scheduler(single_system_config);
+    const TestWorld = World(single_system_config);
+    const TestScheduler = Scheduler(single_system_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     // Execute one tick
@@ -285,13 +292,13 @@ test "blocking backend - executes single system" {
 test "blocking backend - executes multiple systems" {
     resetTestState();
 
-    const World = ecs.World(multi_system_config);
-    const Scheduler = ecs.Scheduler(multi_system_config);
+    const TestWorld = World(multi_system_config);
+    const TestScheduler = Scheduler(multi_system_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     const result = scheduler.tick(0.016);
@@ -304,13 +311,13 @@ test "blocking backend - executes multiple systems" {
 test "blocking backend - respects phase ordering" {
     resetTestState();
 
-    const World = ecs.World(multi_phase_config);
-    const Scheduler = ecs.Scheduler(multi_phase_config);
+    const TestWorld = World(multi_phase_config);
+    const TestScheduler = Scheduler(multi_phase_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     const result = scheduler.tick(0.016);
@@ -334,13 +341,13 @@ test "blocking backend - respects phase ordering" {
 test "blocking backend - handles empty schedule" {
     resetTestState();
 
-    const World = ecs.World(empty_systems_config);
-    const Scheduler = ecs.Scheduler(empty_systems_config);
+    const TestWorld = World(empty_systems_config);
+    const TestScheduler = Scheduler(empty_systems_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     // Should not crash with empty schedule
@@ -354,13 +361,13 @@ test "blocking backend - handles empty schedule" {
 test "blocking backend - handles failing system" {
     resetTestState();
 
-    const World = ecs.World(failing_system_config);
-    const Scheduler = ecs.Scheduler(failing_system_config);
+    const TestWorld = World(failing_system_config);
+    const TestScheduler = Scheduler(failing_system_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     const result = scheduler.tick(0.016);
@@ -372,13 +379,13 @@ test "blocking backend - handles failing system" {
 test "blocking backend - multiple ticks accumulate" {
     resetTestState();
 
-    const World = ecs.World(single_system_config);
-    const Scheduler = ecs.Scheduler(single_system_config);
+    const TestWorld = World(single_system_config);
+    const TestScheduler = Scheduler(single_system_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     // Execute 5 ticks
@@ -397,13 +404,13 @@ test "blocking backend - multiple ticks accumulate" {
 test "blocking backend - stats tracking" {
     resetTestState();
 
-    const World = ecs.World(multi_system_config);
-    const Scheduler = ecs.Scheduler(multi_system_config);
+    const TestWorld = World(multi_system_config);
+    const TestScheduler = Scheduler(multi_system_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     // Execute 3 ticks
@@ -444,13 +451,13 @@ test "BackendStats - initialization and reset" {
 test "blocking backend - tickN executes multiple ticks" {
     resetTestState();
 
-    const World = ecs.World(single_system_config);
-    const Scheduler = ecs.Scheduler(single_system_config);
+    const TestWorld = World(single_system_config);
+    const TestScheduler = Scheduler(single_system_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     // Execute 10 ticks at once
@@ -467,10 +474,10 @@ test "blocking backend - tickN executes multiple ticks" {
 test "blocking backend - world with spawned entities" {
     resetTestState();
 
-    const World = ecs.World(single_system_config);
-    const Scheduler = ecs.Scheduler(single_system_config);
+    const TestWorld = World(single_system_config);
+    const TestScheduler = Scheduler(single_system_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
     // Spawn some entities
@@ -478,7 +485,7 @@ test "blocking backend - world with spawned entities" {
     _ = try world.spawn("counter", .{Counter{ .value = 2 }});
     _ = try world.spawn("counter", .{Counter{ .value = 3 }});
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     const result = scheduler.tick(0.016);
@@ -491,13 +498,13 @@ test "blocking backend - world with spawned entities" {
 test "blocking backend - accumulated time tracking" {
     resetTestState();
 
-    const World = ecs.World(single_system_config);
-    const Scheduler = ecs.Scheduler(single_system_config);
+    const TestWorld = World(single_system_config);
+    const TestScheduler = Scheduler(single_system_config);
 
-    var world = World.init(testing.allocator);
+    var world = TestWorld.init(testing.allocator);
     defer world.deinit();
 
-    var scheduler = Scheduler.init(&world, null, testing.allocator);
+    var scheduler = TestScheduler.init(&world, null, testing.allocator);
     defer scheduler.deinit();
 
     // Execute ticks with known delta times

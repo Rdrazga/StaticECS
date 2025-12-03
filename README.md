@@ -81,6 +81,7 @@ For details on experimental features, see [docs/EXPERIMENTAL.md](docs/EXPERIMENT
 ```bash
 zig build
 zig build test
+zig build benchmark
 ```
 
 ## Project Status

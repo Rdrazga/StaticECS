@@ -180,6 +180,13 @@ const WARMUP_ITERATIONS: u32 = 100;
 /// Bounded by stats.MAX_STACK_SAMPLES for stack-based processing.
 const MEASUREMENT_ITERATIONS: u32 = 1000;
 
+/// Batch size for fast operations (sub-microsecond).
+/// Why: time.Instant has ~100ns resolution on Windows; operations faster
+/// than this measure as 0ns. Batching amortizes timer overhead.
+/// Typical fast ops (getComponent, hasComponent, isAlive) take ~10-50ns,
+/// so 100 ops ≈ 1-5μs, well above timer resolution.
+const FAST_OP_BATCH_SIZE: u32 = 100;
+
 // ============================================================================
 // Benchmark Tests (run as part of test suite for verification)
 // ============================================================================
@@ -522,7 +529,7 @@ fn runEntityBenchmarks(allocator: std.mem.Allocator) [2]BenchResult {
         }
     }
 
-    // Run despawn benchmark with warm-up
+    // Run despawn benchmark with warm-up (batched for timer resolution)
     {
         // Warm-up phase
         for (0..WARMUP_ITERATIONS) |_| {
@@ -532,26 +539,42 @@ fn runEntityBenchmarks(allocator: std.mem.Allocator) [2]BenchResult {
             world.deinit();
         }
 
-        // Measurement phase: collect individual despawn timings
+        // Measurement phase: batch despawns to overcome timer resolution
+        // Despawn is fast (~30-100ns), so we batch FAST_OP_BATCH_SIZE operations
         for (0..MEASUREMENT_ITERATIONS) |i| {
             var world = BenchWorld.init(allocator);
-            const h = world.spawn("static", .{Position{}}) catch {
+
+            // Pre-spawn entities to despawn
+            var batch_handles: [FAST_OP_BATCH_SIZE]entity.EntityHandle = undefined;
+            var spawned_count: u32 = 0;
+            for (0..FAST_OP_BATCH_SIZE) |j| {
+                batch_handles[j] = world.spawn("static", .{Position{}}) catch break;
+                spawned_count += 1;
+            }
+
+            if (spawned_count == 0) {
                 despawn_samples[i] = 0;
                 world.deinit();
                 continue;
-            };
+            }
+
+            // Time the batch of despawns
             const start = time.Instant.now() catch {
                 despawn_samples[i] = 0;
                 world.deinit();
                 continue;
             };
-            world.despawn(h) catch {};
+            for (0..spawned_count) |j| {
+                world.despawn(batch_handles[j]) catch {};
+            }
             const end = time.Instant.now() catch {
                 despawn_samples[i] = 0;
                 world.deinit();
                 continue;
             };
-            despawn_samples[i] = end.since(start);
+
+            // Per-operation time = total / batch_size
+            despawn_samples[i] = end.since(start) / spawned_count;
             world.deinit();
         }
     }
@@ -592,15 +615,19 @@ fn runComponentAccessBenchmark(allocator: std.mem.Allocator) BenchResult {
         }
     }
 
-    // Measurement phase: time each access individually
+    // Measurement phase: batch accesses to overcome timer resolution
+    // getComponent is very fast (~10-30ns), so batch FAST_OP_BATCH_SIZE operations
     for (0..MEASUREMENT_ITERATIONS) |i| {
-        const h = handles[i % ENTITY_POOL_SIZE];
         const start = time.Instant.now() catch continue;
-        if (world.getComponent(h, Position)) |pos| {
-            std.mem.doNotOptimizeAway(pos.x);
+        for (0..FAST_OP_BATCH_SIZE) |j| {
+            const h = handles[(i * FAST_OP_BATCH_SIZE + j) % ENTITY_POOL_SIZE];
+            if (world.getComponent(h, Position)) |pos| {
+                std.mem.doNotOptimizeAway(pos.x);
+            }
         }
         const end = time.Instant.now() catch continue;
-        samples[i] = end.since(start);
+        // Per-operation time = total / batch_size
+        samples[i] = end.since(start) / FAST_OP_BATCH_SIZE;
     }
 
     return BenchResult{
@@ -633,13 +660,18 @@ fn runComponentMutationBenchmark(allocator: std.mem.Allocator) BenchResult {
         _ = world.setComponent(h, Position, Position{ .x = @floatFromInt(i), .y = 0, .z = 0 });
     }
 
-    // Measurement phase
+    // Measurement phase: batch mutations to overcome timer resolution
+    // setComponent is very fast (~10-30ns), so batch FAST_OP_BATCH_SIZE operations
     for (0..MEASUREMENT_ITERATIONS) |i| {
-        const h = handles[i % ENTITY_POOL_SIZE];
         const start = time.Instant.now() catch continue;
-        _ = world.setComponent(h, Position, Position{ .x = @floatFromInt(i), .y = 0, .z = 0 });
+        for (0..FAST_OP_BATCH_SIZE) |j| {
+            const idx = (i * FAST_OP_BATCH_SIZE + j);
+            const h = handles[idx % ENTITY_POOL_SIZE];
+            _ = world.setComponent(h, Position, Position{ .x = @floatFromInt(idx), .y = 0, .z = 0 });
+        }
         const end = time.Instant.now() catch continue;
-        samples[i] = end.since(start);
+        // Per-operation time = total / batch_size
+        samples[i] = end.since(start) / FAST_OP_BATCH_SIZE;
     }
 
     return BenchResult{
@@ -679,13 +711,17 @@ fn runHasComponentBenchmark(allocator: std.mem.Allocator) BenchResult {
         std.mem.doNotOptimizeAway(world.hasComponent(h, Position));
     }
 
-    // Measurement phase
+    // Measurement phase: batch checks to overcome timer resolution
+    // hasComponent is very fast (~10-20ns), so batch FAST_OP_BATCH_SIZE operations
     for (0..MEASUREMENT_ITERATIONS) |i| {
-        const h = handles[i % ENTITY_POOL_SIZE];
         const start = time.Instant.now() catch continue;
-        std.mem.doNotOptimizeAway(world.hasComponent(h, Position));
+        for (0..FAST_OP_BATCH_SIZE) |j| {
+            const h = handles[(i * FAST_OP_BATCH_SIZE + j) % ENTITY_POOL_SIZE];
+            std.mem.doNotOptimizeAway(world.hasComponent(h, Position));
+        }
         const end = time.Instant.now() catch continue;
-        samples[i] = end.since(start);
+        // Per-operation time = total / batch_size
+        samples[i] = end.since(start) / FAST_OP_BATCH_SIZE;
     }
 
     return BenchResult{
@@ -713,13 +749,17 @@ fn runIsAliveBenchmark(allocator: std.mem.Allocator) BenchResult {
         std.mem.doNotOptimizeAway(world.isAlive(h));
     }
 
-    // Measurement phase
+    // Measurement phase: batch checks to overcome timer resolution
+    // isAlive is very fast (~10-20ns), so batch FAST_OP_BATCH_SIZE operations
     for (0..MEASUREMENT_ITERATIONS) |i| {
-        const h = handles[i % ENTITY_POOL_SIZE];
         const start = time.Instant.now() catch continue;
-        std.mem.doNotOptimizeAway(world.isAlive(h));
+        for (0..FAST_OP_BATCH_SIZE) |j| {
+            const h = handles[(i * FAST_OP_BATCH_SIZE + j) % ENTITY_POOL_SIZE];
+            std.mem.doNotOptimizeAway(world.isAlive(h));
+        }
         const end = time.Instant.now() catch continue;
-        samples[i] = end.since(start);
+        // Per-operation time = total / batch_size
+        samples[i] = end.since(start) / FAST_OP_BATCH_SIZE;
     }
 
     return BenchResult{
