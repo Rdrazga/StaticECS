@@ -6,14 +6,10 @@ Built with the use of Kilo Code and Claude 4.5 Opus
 
 StaticECS is a compile-time configurable ECS framework that leverages Zig's comptime capabilities with the goals to generate highly optimized, zero-overhead entity component systems tailored to exact application needs.
 
-## Features
-
-- **Full Comptime Configuration** - Define components, archetypes, systems, and all bounds at compile time
-- **Zero Runtime Overhead** - Type generation and validation happens entirely at compile time
-- **Tiger Style Architecture** - All limits configurable, no hidden allocations, fail-fast error handling
-- **Six Execution Models** - From simple blocking to io_uring batching and work-stealing parallelism
-- **Multi-World Coordination** - Pipeline parallelism with lock-free entity transfers
-- **Advanced Scalability** - NUMA-aware allocation, huge pages, thread affinity, cluster support
+## Project Goals:
+This project is an attempt to leverage modern AI and Kilo Code to develop a pre-deisgned by a human ECS,
+Using comptimes and dead code elimination to allow it to work both as a general purpose single thread ECS in games, data pipelines, and simulations
+As well as provide abstractions to extreme performance multi-core systems and state management, to be used as a new "concept" of designing synchronous and asynchronous processes.
 
 ## Quick Example
 
@@ -46,21 +42,21 @@ pub fn main() !void {
 }
 ```
 
-## Feature Status
+## Feature Status (being verfied and tested)
 
 ### Production Ready
-- ✅ Core ECS (World, Entity, Archetype, Query)
-- ✅ Blocking and evented execution backends
-- ✅ Work-stealing parallel scheduler
-- ✅ Command buffers and deferred operations
-- ✅ Multi-world coordination with lock-free transfers
-- ✅ Entity ownership calculation strategies
+- [x] Core ECS (World, Entity, Archetype, Query)
+- [x] Blocking and evented execution backends
+- [x] Work-stealing parallel scheduler
+- [x] Command buffers and deferred operations
+- [x] Multi-world coordination with lock-free transfers
+- [x] Entity ownership calculation strategies
 
 ### Experimental
-- ⚠️ **GPU compute executor** - Placeholder only, returns `error.GpuUnavailable`
-- ⚠️ **SIMD worker pool** - Sequential fallback, no actual SIMD intrinsics
-- ⚠️ **Cluster coordination** - Framework only, no network transport
-- ⚠️ **External thread pool** - Incomplete, tasks don't execute
+- [ ] **GPU compute executor** - Placeholder only, returns `error.GpuUnavailable`
+- [ ] **SIMD worker pool** - Sequential fallback, no actual SIMD intrinsics
+- [ ] **Cluster coordination** - Framework only, no network transport
+- [ ] **External thread pool** - Incomplete, tasks don't execute
 
 For details on experimental features, see [docs/EXPERIMENTAL.md](docs/EXPERIMENTAL.md).
 
