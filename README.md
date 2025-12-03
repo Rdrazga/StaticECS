@@ -11,40 +11,9 @@ This project is an attempt to leverage modern AI and Kilo Code to develop a pre-
 Using comptimes and dead code elimination to allow it to work both as a general purpose single thread ECS in games, data pipelines, and simulations
 As well as provide abstractions to extreme performance multi-core systems and state management, to be used as a new "concept" of designing synchronous and asynchronous processes.
 
-## Quick Example
-
-```zig
-const ecs = @import("ecs");
-
-const Position = struct { x: f32, y: f32 };
-const Velocity = struct { x: f32, y: f32 };
-
-pub const cfg = ecs.WorldConfig{
-    .components = .{ .types = &.{ Position, Velocity } },
-    .archetypes = .{
-        .archetypes = &.{
-            .{ .name = "dynamic", .components = &.{ Position, Velocity } },
-        },
-    },
-    .options = .{ .max_entities = 10000 },
-};
-
-const World = ecs.World(cfg);
-
-pub fn main() !void {
-    var world = World.init(allocator);
-    defer world.deinit();
-    
-    _ = try world.spawn("dynamic", .{
-        Position{ .x = 0, .y = 0 },
-        Velocity{ .x = 1, .y = 0.5 },
-    });
-}
-```
-
 ## Feature Status (being verfied and tested)
 
-### Production Ready
+### Ready
 - [x] Core ECS (World, Entity, Archetype, Query)
 - [x] Blocking and evented execution backends
 - [x] Work-stealing parallel scheduler
@@ -52,7 +21,7 @@ pub fn main() !void {
 - [x] Multi-world coordination with lock-free transfers
 - [x] Entity ownership calculation strategies
 
-### Experimental
+### Experimental or Not Implemented
 - [ ] **GPU compute executor** - Placeholder only, returns `error.GpuUnavailable`
 - [ ] **SIMD worker pool** - Sequential fallback, no actual SIMD intrinsics
 - [ ] **Cluster coordination** - Framework only, no network transport
@@ -89,9 +58,8 @@ zig build benchmark
 This is an experimental project exploring the boundaries of compile-time ECS architecture. The framework demonstrates:
 
 - Comptime type generation for zero-cost abstractions
-- Lock-free coordination primitives
 - Platform-specific optimizations (io_uring, NUMA, huge pages)
-- Adaptive runtime backend selection
+- Optional adaptive runtime backend selection
 
 ## License
 
