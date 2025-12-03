@@ -120,16 +120,50 @@ pub const IoCompletionCallback = *const fn (i32, u64) void;
 /// I/O Request that systems can submit for batched execution.
 ///
 /// Tiger Style: All fields bounded/explicit, result delivered via pointer.
+///
+/// ## Socket Operations
+///
+/// For `.accept` operations:
+/// - `fd`: Listening socket file descriptor
+/// - `buffer`: Optional pointer to sockaddr for client address (can be undefined if not needed)
+/// - `len`: Size of sockaddr buffer (0 if buffer not provided)
+/// - `offset`: Accept4 flags (e.g., SOCK_NONBLOCK, SOCK_CLOEXEC) or 0
+/// - `result_ptr`: Receives new client fd on success, negative errno on failure
+///
+/// For `.connect` operations:
+/// - `fd`: Socket file descriptor
+/// - `buffer`: Pointer to sockaddr with destination address (REQUIRED)
+/// - `len`: Size of sockaddr structure (REQUIRED, must be > 0)
+/// - `result_ptr`: Receives 0 on success, negative errno on failure
+///
+/// For `.poll_add` operations:
+/// - `fd`: File descriptor to poll
+/// - `offset`: Poll events mask (POLLIN, POLLOUT, etc.)
+/// - `result_ptr`: Receives triggered events or negative errno
+///
+/// For `.poll_remove` operations:
+/// - `fd`: File descriptor to remove poll for
+/// - `user_data`: Must match the user_data from the original poll_add
+///
+/// For `.timeout` operations:
+/// - `buffer`: Pointer to kernel_timespec structure
+/// - `len`: 1 for relative timeout, 0 for absolute
+/// - `offset`: Number of completions to wait for (0 = just timeout)
 pub const IoRequest = struct {
     /// Operation type to perform.
     op_type: IoOpType = .nop,
     /// File descriptor for the operation.
     fd: i32 = -1,
     /// Buffer pointer for read/write operations.
+    /// For socket ops: points to sockaddr structure.
+    /// For timeout: points to kernel_timespec.
     buffer: [*]u8 = undefined,
     /// Length of the buffer/operation.
+    /// For socket ops: sizeof(sockaddr).
     len: usize = 0,
     /// Offset for positioned read/write.
+    /// For accept: accept4 flags.
+    /// For poll_add: poll event mask.
     offset: u64 = 0,
     /// Result written here on completion (negative = errno).
     /// Must remain valid until completion is processed.
@@ -335,9 +369,20 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                 }
 
                 // Attempt io_uring init - on failure, operate in degraded mode
-                self.ring = std.os.linux.IoUring.init(batch_cfg.sq_entries, flags) catch {
+                self.ring = std.os.linux.IoUring.init(batch_cfg.sq_entries, flags) catch |err| {
                     // io_uring unavailable (permission denied, kernel too old, etc.)
                     // Continue in degraded mode - systems still execute, just without batching
+                    //
+                    // Tiger Style: Log degradation for production visibility. This is
+                    // intentionally logged even in release builds since it affects
+                    // performance characteristics that operators should be aware of.
+                    if (cfg.tracing.level != .none) {
+                        std.log.warn(
+                            "io_uring initialization failed (error: {}), falling back to blocking mode. " ++
+                                "I/O batching disabled; systems will execute without syscall batching.",
+                            .{err},
+                        );
+                    }
                     return self;
                 };
 
@@ -369,13 +414,15 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         ///    c. Execute non-I/O systems
         ///    d. Wait for and process completions
         /// 2. Apply deferred commands
+        ///
+        /// Tiger Style: Central control flow, delegates to pure helpers.
         pub fn tick(self: *Self, world: *WorldType, delta_time: f64) FrameResultT {
+            // Pre-conditions: valid state
+            std.debug.assert(delta_time >= 0.0);
+            std.debug.assert(self.tick_count < std.math.maxInt(u64));
+
             const start_time = getTimeNs();
-
-            // Initialize command buffer
             var commands = CmdBuf.init();
-
-            // Create system context
             var ctx = SysCtx.init(
                 world,
                 &world.resources,
@@ -388,24 +435,16 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
 
             const policy = cfg.policies.frame;
             var errors = AggregateErrors.init();
-
-            // Initialize tracing
             var tracer = Tracer.init(self.trace_sink, @intFromPtr(world));
             tracer.emitTickStart(self.tick_count, start_time);
 
-            // Execute all phases with batched I/O
+            // Execute phases and accumulate stats
             var frame_success = true;
             var systems_run: u64 = 0;
             var syscalls_batched: u64 = 0;
 
             inline for (0..Sched.num_phases) |phase_idx| {
-                const phase_result = self.executePhaseWithBatching(
-                    &ctx,
-                    phase_idx,
-                    policy,
-                    &errors,
-                );
-
+                const phase_result = self.executePhaseWithBatching(&ctx, phase_idx, policy, &errors);
                 systems_run += phase_result.systems_run;
                 syscalls_batched += phase_result.syscalls_batched;
                 self.stats.phases_executed += 1;
@@ -416,34 +455,36 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                 }
             }
 
-            // Apply deferred commands
+            // Finalize: apply commands, emit tracing, update stats
             self.applyCommands(world, &commands);
-
-            // Emit tick end
             const end_time = getTimeNs();
-            tracer.emitTickEnd(self.tick_count, end_time, end_time - start_time);
+            const tick_duration = end_time - start_time;
+            tracer.emitTickEnd(self.tick_count, end_time, tick_duration);
+            self.updateTickStats(systems_run, syscalls_batched, tick_duration);
 
-            // Update statistics
+            // Post-condition: tick count incremented
+            std.debug.assert(self.stats.ticks_executed > 0);
+
+            return buildTickResult(frame_success, policy, &errors);
+        }
+
+        /// Update tick statistics after frame execution.
+        /// Tiger Style: Pure helper - no control flow, just data updates.
+        fn updateTickStats(self: *Self, systems_run: u64, syscalls_batched: u64, tick_duration: u64) void {
             self.tick_count += 1;
             self.stats.ticks_executed += 1;
             self.stats.systems_executed += systems_run;
             self.stats.syscalls_batched += syscalls_batched;
-            self.stats.last_tick_time_ns = end_time - start_time;
-            self.stats.total_tick_time_ns += end_time - start_time;
+            self.stats.last_tick_time_ns = tick_duration;
+            self.stats.total_tick_time_ns += tick_duration;
+        }
 
-            // Return result
-            if (frame_success) {
-                return .{ .success = {} };
-            }
-
-            if (policy == .aggregate) {
-                return .{ .aggregate_errors = errors };
-            }
-
-            if (errors.first()) |first_err| {
-                return .{ .single_error = first_err };
-            }
-
+        /// Build the tick result based on success state and policy.
+        /// Tiger Style: Pure function - deterministic output from inputs.
+        fn buildTickResult(success: bool, policy: FramePolicy, errors: *AggregateErrors) FrameResultT {
+            if (success) return .{ .success = {} };
+            if (policy == .aggregate) return .{ .aggregate_errors = errors.* };
+            if (errors.first()) |first_err| return .{ .single_error = first_err };
             return .{ .success = {} };
         }
 
@@ -582,10 +623,15 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         }
 
         /// Submit all pending operations to io_uring.
+        ///
+        /// Tiger Style: Central control in parent, operation prep in pure helper.
         fn submitBatch(self: *Self) u64 {
+            // Pre-conditions
+            std.debug.assert(self.pending_count <= max_pending);
             if (!io_uring_available or !self.io_uring_active) return 0;
 
             var submitted: u64 = 0;
+            const initial_pending = self.pending_count;
 
             for (self.pending_ops[0..self.pending_count]) |*op| {
                 const sqe = self.ring.get_sqe() orelse {
@@ -594,26 +640,74 @@ pub fn IoUringBatchBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                     continue;
                 };
 
-                // Prepare operation based on type
-                switch (op.op_type) {
-                    .nop => sqe.prep_nop(),
-                    .read => sqe.prep_read(op.fd, @as([*]u8, @ptrCast(op.buffer))[0..op.len], op.offset),
-                    .write => sqe.prep_write(op.fd, @as([*]const u8, @ptrCast(op.buffer))[0..op.len], op.offset),
-                    .close => sqe.prep_close(op.fd),
-                    .fsync => sqe.prep_fsync(op.fd, 0),
-                    // Other operations would go here
-                    else => sqe.prep_nop(),
-                }
-
-                // Set user data for correlation
+                prepareSqeForOp(sqe, op);
                 sqe.user_data = @intFromPtr(op);
                 submitted += 1;
             }
 
-            // Submit the batch
             _ = self.ring.submit() catch {};
 
+            // Post-condition: submitted ops don't exceed pending
+            std.debug.assert(submitted <= initial_pending);
             return submitted;
+        }
+
+        /// Prepare a submission queue entry for the given pending operation.
+        ///
+        /// Tiger Style: Pure helper function - maps op type to io_uring prep call.
+        /// Handles all I/O operation types with graceful fallback for invalid params.
+        fn prepareSqeForOp(sqe: *std.os.linux.io_uring_sqe, op: *PendingOp) void {
+            switch (op.op_type) {
+                .nop => sqe.prep_nop(),
+                .read => sqe.prep_read(op.fd, @as([*]u8, @ptrCast(op.buffer))[0..op.len], op.offset),
+                .write => sqe.prep_write(op.fd, @as([*]const u8, @ptrCast(op.buffer))[0..op.len], op.offset),
+                .close => sqe.prep_close(op.fd),
+                .fsync => sqe.prep_fsync(op.fd, 0),
+                .accept => prepareAcceptOp(sqe, op),
+                .connect => prepareConnectOp(sqe, op),
+                .poll_add => sqe.prep_poll_add(op.fd, @truncate(op.offset)),
+                .poll_remove => sqe.prep_poll_remove(op.user_data),
+                .timeout => prepareTimeoutOp(sqe, op),
+            }
+        }
+
+        /// Prepare accept operation on listening socket.
+        /// buffer/len optionally receive client address; offset contains accept4 flags.
+        fn prepareAcceptOp(sqe: *std.os.linux.io_uring_sqe, op: *PendingOp) void {
+            if (op.len > 0) {
+                // With address capture: buffer points to sockaddr, len stores size
+                const addr_ptr: *std.posix.sockaddr = @ptrCast(@alignCast(op.buffer));
+                var addrlen: std.posix.socklen_t = @intCast(op.len);
+                sqe.prep_accept(op.fd, addr_ptr, &addrlen, @truncate(op.offset));
+            } else {
+                // Without address capture: just get the new fd
+                sqe.prep_accept(op.fd, null, null, @truncate(op.offset));
+            }
+        }
+
+        /// Prepare connect operation to remote address.
+        /// buffer MUST point to sockaddr, len MUST be sizeof(sockaddr).
+        fn prepareConnectOp(sqe: *std.os.linux.io_uring_sqe, op: *PendingOp) void {
+            if (op.len == 0) {
+                // Invalid connect request - sockaddr required; fallback to nop
+                sqe.prep_nop();
+            } else {
+                const addr_ptr: *const std.posix.sockaddr = @ptrCast(@alignCast(op.buffer));
+                sqe.prep_connect(op.fd, addr_ptr, @intCast(op.len));
+            }
+        }
+
+        /// Prepare timeout operation.
+        /// buffer points to kernel_timespec; len indicates relative(1)/absolute(0).
+        fn prepareTimeoutOp(sqe: *std.os.linux.io_uring_sqe, op: *PendingOp) void {
+            if (op.len > 0) {
+                const ts_ptr: *const std.os.linux.kernel_timespec = @ptrCast(@alignCast(op.buffer));
+                const flags: u32 = if (op.len == 1) 0 else std.os.linux.IORING_TIMEOUT_ABS;
+                sqe.prep_timeout(ts_ptr, @truncate(op.offset), flags);
+            } else {
+                // Invalid timeout - needs timespec; fallback to nop
+                sqe.prep_nop();
+            }
         }
 
         /// Process completed operations from io_uring.
@@ -878,6 +972,139 @@ test "io_uring backend - completion dispatch" {
 
     backend.dispatchCompletion(&op);
     try std.testing.expectEqual(@as(i32, 100), result);
+}
+
+test "IoRequest - accept operation configuration" {
+    // Test accept without address capture
+    const req_no_addr = IoRequest{
+        .op_type = .accept,
+        .fd = 5, // listening socket
+        .len = 0, // no address capture
+        .offset = 0, // no special flags
+    };
+    try std.testing.expectEqual(IoOpType.accept, req_no_addr.op_type);
+    try std.testing.expectEqual(@as(i32, 5), req_no_addr.fd);
+    try std.testing.expectEqual(@as(usize, 0), req_no_addr.len);
+
+    // Test accept with address capture
+    var addr_buffer: [128]u8 = undefined; // sockaddr storage
+    const req_with_addr = IoRequest{
+        .op_type = .accept,
+        .fd = 5,
+        .buffer = &addr_buffer,
+        .len = @sizeOf(std.posix.sockaddr.storage), // size of sockaddr_storage
+        .offset = std.posix.SOCK.NONBLOCK, // accept4 flags
+    };
+    try std.testing.expectEqual(IoOpType.accept, req_with_addr.op_type);
+    try std.testing.expectEqual(@as(i32, 5), req_with_addr.fd);
+    try std.testing.expect(req_with_addr.len > 0);
+}
+
+test "IoRequest - connect operation configuration" {
+    // Connect requires a sockaddr buffer
+    var addr_buffer: [128]u8 = undefined;
+    const req = IoRequest{
+        .op_type = .connect,
+        .fd = 6, // client socket
+        .buffer = &addr_buffer,
+        .len = @sizeOf(std.posix.sockaddr.in), // IPv4 address size
+    };
+    try std.testing.expectEqual(IoOpType.connect, req.op_type);
+    try std.testing.expectEqual(@as(i32, 6), req.fd);
+    try std.testing.expect(req.len > 0);
+}
+
+test "IoRequest - poll_add operation configuration" {
+    const req = IoRequest{
+        .op_type = .poll_add,
+        .fd = 7,
+        .offset = std.posix.POLL.IN | std.posix.POLL.OUT, // poll events
+    };
+    try std.testing.expectEqual(IoOpType.poll_add, req.op_type);
+    try std.testing.expectEqual(@as(i32, 7), req.fd);
+    try std.testing.expect(req.offset != 0);
+}
+
+test "IoIntentQueue - socket operations" {
+    var queue = IoIntentQueue(8).init();
+
+    // Queue accept operation
+    const accept_result = queue.queue(.{
+        .op_type = .accept,
+        .fd = 10,
+        .len = 0, // no address capture
+    });
+    try std.testing.expect(accept_result);
+
+    // Queue connect operation
+    var addr_buffer: [64]u8 = undefined;
+    const connect_result = queue.queue(.{
+        .op_type = .connect,
+        .fd = 11,
+        .buffer = &addr_buffer,
+        .len = 16,
+    });
+    try std.testing.expect(connect_result);
+
+    // Queue poll operation
+    const poll_result = queue.queue(.{
+        .op_type = .poll_add,
+        .fd = 12,
+        .offset = std.posix.POLL.IN,
+    });
+    try std.testing.expect(poll_result);
+
+    try std.testing.expectEqual(@as(u16, 3), queue.len());
+
+    const requests = queue.getRequests();
+    try std.testing.expectEqual(IoOpType.accept, requests[0].op_type);
+    try std.testing.expectEqual(IoOpType.connect, requests[1].op_type);
+    try std.testing.expectEqual(IoOpType.poll_add, requests[2].op_type);
+}
+
+test "io_uring backend - PendingOp fromRequest with accept" {
+    const cfg = config_mod.WorldConfig{};
+    const Backend = IoUringBatchBackend(cfg, DummyWorld);
+
+    var result: i32 = 0;
+    const request = IoRequest{
+        .op_type = .accept,
+        .fd = 100, // listening socket
+        .len = 0, // no address capture
+        .offset = 0, // no flags
+        .result_ptr = &result,
+        .user_data = 999,
+    };
+
+    const op = Backend.PendingOp.fromRequest(request, 3);
+    try std.testing.expectEqual(@as(u16, 3), op.system_idx);
+    try std.testing.expectEqual(IoOpType.accept, op.op_type);
+    try std.testing.expectEqual(@as(i32, 100), op.fd);
+    try std.testing.expectEqual(@as(usize, 0), op.len);
+    try std.testing.expectEqual(@as(u64, 999), op.user_data);
+}
+
+test "io_uring backend - PendingOp fromRequest with connect" {
+    const cfg = config_mod.WorldConfig{};
+    const Backend = IoUringBatchBackend(cfg, DummyWorld);
+
+    var result: i32 = 0;
+    var addr_buf: [128]u8 = undefined;
+    const request = IoRequest{
+        .op_type = .connect,
+        .fd = 200, // client socket
+        .buffer = &addr_buf,
+        .len = 16, // sockaddr_in size
+        .result_ptr = &result,
+        .user_data = 888,
+    };
+
+    const op = Backend.PendingOp.fromRequest(request, 5);
+    try std.testing.expectEqual(@as(u16, 5), op.system_idx);
+    try std.testing.expectEqual(IoOpType.connect, op.op_type);
+    try std.testing.expectEqual(@as(i32, 200), op.fd);
+    try std.testing.expectEqual(@as(usize, 16), op.len);
+    try std.testing.expectEqual(@as(u64, 888), op.user_data);
 }
 
 // Dummy world type for testing

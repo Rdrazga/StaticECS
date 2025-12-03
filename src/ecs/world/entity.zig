@@ -8,7 +8,11 @@
 //! Default is 20-bit index, 12-bit generation (32 bits total).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
+const policy_types = @import("../config/policy_types.zig");
+const GenerationPolicy = policy_types.GenerationPolicy;
+const GenerationWrapAction = policy_types.GenerationWrapAction;
 
 // ============================================================================
 // Default Bit Widths (kept for backward compatibility and standalone tests)
@@ -23,6 +27,37 @@ pub const DEFAULT_GENERATION_BITS: u5 = 12;
 pub const DEFAULT_MAX_INDEX: u32 = (1 << DEFAULT_INDEX_BITS) - 1;
 /// Default maximum generation value before wrap.
 pub const DEFAULT_MAX_GENERATION: u32 = (1 << DEFAULT_GENERATION_BITS) - 1;
+
+// ============================================================================
+// Generation Statistics (EN-1: Wrap-around tracking)
+// ============================================================================
+
+/// Statistics for generation lifecycle tracking.
+/// Tracks wrap-around events (epoch), high-water marks, and warnings.
+/// Tiger Style: Observable metrics for monitoring long-running applications.
+pub const GenerationStats = struct {
+    /// Number of times any slot's generation has wrapped (epoch count).
+    /// Each increment means one slot went from MAX_GENERATION back to 0.
+    /// u8 allows 256 epochs before this counter wraps.
+    epoch_count: u8 = 0,
+
+    /// Highest generation value seen across all slots.
+    /// Useful for estimating how close to wrap-around the system is.
+    max_generation_seen: u32 = 0,
+
+    /// Number of slots that have triggered the warning threshold.
+    /// Indicates how many slots are approaching wrap-around.
+    slots_at_warn_threshold: u32 = 0,
+
+    /// Total number of generation increments performed.
+    /// Useful for understanding entity churn rate.
+    total_increments: u64 = 0,
+
+    /// Reset all statistics to zero.
+    pub fn reset(self: *GenerationStats) void {
+        self.* = GenerationStats{};
+    }
+};
 
 // ============================================================================
 // Legacy Type Aliases (for backward compatibility)
@@ -224,6 +259,12 @@ pub fn EntityManager(comptime max_entities: u32) type {
     return EntityManagerType(max_entities, DEFAULT_INDEX_BITS);
 }
 
+/// Entity manager with custom generation policy.
+/// For new code that needs generation wrap-around tracking.
+pub fn EntityManagerWithPolicy(comptime max_entities: u32, comptime gen_policy: GenerationPolicy) type {
+    return EntityManagerTypeWithPolicy(max_entities, DEFAULT_INDEX_BITS, gen_policy);
+}
+
 // ============================================================================
 // Configurable EntityManager Generator
 // ============================================================================
@@ -235,6 +276,22 @@ pub fn EntityManager(comptime max_entities: u32) type {
 /// - max_entities: Maximum number of entities this manager can hold.
 /// - index_bits: Number of bits for entity index (must accommodate max_entities).
 pub fn EntityManagerType(comptime max_entities: u32, comptime index_bits: u5) type {
+    // Default policy: debug_panic for safety-first development
+    return EntityManagerTypeWithPolicy(max_entities, index_bits, GenerationPolicy{});
+}
+
+/// Entity manager with configurable bit widths and generation policy.
+/// Tiger Style: All bounds, bit widths, and policies are configurable.
+///
+/// Parameters:
+/// - max_entities: Maximum number of entities this manager can hold.
+/// - index_bits: Number of bits for entity index (must accommodate max_entities).
+/// - gen_policy: Policy for handling generation overflow and tracking.
+pub fn EntityManagerTypeWithPolicy(
+    comptime max_entities: u32,
+    comptime index_bits: u5,
+    comptime gen_policy: GenerationPolicy,
+) type {
     const IdType = EntityIdType(index_bits);
     const HandleType = EntityHandleType(index_bits);
     const MetaType = EntityMetadataType(index_bits);
@@ -247,6 +304,9 @@ pub fn EntityManagerType(comptime max_entities: u32, comptime index_bits: u5) ty
             @compileError("EntityManager: max_entities exceeds capacity of index_bits");
         }
     }
+
+    // Compute warning threshold at compile time
+    const warn_threshold_value: u32 = gen_policy.computeWarnThreshold(IdType.MAX_GENERATION);
 
     return struct {
         const Self = @This();
@@ -261,6 +321,10 @@ pub fn EntityManagerType(comptime max_entities: u32, comptime index_bits: u5) ty
         pub const INDEX_BITS = index_bits;
         /// Maximum entities this manager can hold.
         pub const MAX_ENTITIES = max_entities;
+        /// Generation policy for this manager.
+        pub const GEN_POLICY = gen_policy;
+        /// Warning threshold (generation value at which warnings trigger).
+        pub const WARN_THRESHOLD = warn_threshold_value;
 
         /// Entity metadata array.
         metadata: [max_entities]MetaType,
@@ -268,16 +332,33 @@ pub fn EntityManagerType(comptime max_entities: u32, comptime index_bits: u5) ty
         free_head: u32,
         /// Number of currently alive entities.
         alive_count: u32,
+        /// Generation statistics (EN-1: wrap-around tracking).
+        /// Only updated when gen_policy.enable_stats is true.
+        stats: GenerationStats,
 
         /// Initialize a new entity manager.
+        ///
+        /// ## EN-2: Runtime Initialization Rationale
+        /// The metadata array is initialized at runtime rather than comptime because:
+        /// 1. **Free-list linkage**: Each slot's `archetype_row` field is set to `i + 1`
+        ///    to form a linked free-list, requiring per-slot index-based computation.
+        /// 2. **Compilation time**: Comptime initialization of potentially large arrays
+        ///    (up to 1M+ entities) would significantly slow compilation.
+        /// 3. **Single execution**: This init runs once per EntityManager lifetime,
+        ///    making runtime cost negligible compared to comptime benefits.
+        ///
+        /// Tiger Style: Runtime init is acceptable here as it's bounded O(max_entities)
+        /// and occurs only during initialization, not in hot paths.
         pub fn init() Self {
             var self = Self{
                 .metadata = undefined,
                 .free_head = 0,
                 .alive_count = 0,
+                .stats = GenerationStats{},
             };
 
-            // Initialize all metadata slots as dead
+            // Initialize all metadata slots as dead, linking them into a free-list
+            // where each slot's archetype_row points to the next free slot.
             for (&self.metadata, 0..) |*m, i| {
                 m.* = MetaType{
                     .generation = 0,
@@ -295,16 +376,43 @@ pub fn EntityManagerType(comptime max_entities: u32, comptime index_bits: u5) ty
         }
 
         /// Create a new entity. Returns null if capacity is exhausted.
+        ///
+        /// TigerStyle: Assertions verify pool state, generation safety, and
+        /// free list integrity. Fail-fast on invariant violations.
         pub fn create(self: *Self) ?HandleType {
+            // Pre-condition: Entity pool not exhausted (early return path)
             if (self.free_head >= max_entities) {
                 return null; // Capacity exhausted
             }
 
+            // Pre-condition assertion: free_head must point to a valid slot
+            // Why: Corrupted free_head would cause out-of-bounds access
+            assert(self.free_head < max_entities);
+
             const index: IdType.Index = @intCast(self.free_head);
             const meta = &self.metadata[index];
 
+            // Pre-condition assertion: Slot must be dead before allocation
+            // Why: Allocating an alive slot indicates free list corruption
+            assert(!meta.alive);
+
+            // Pre-condition assertion: Generation overflow check (policy-aware)
+            // Why: For non-wrapping policies, slot at MAX_GENERATION indicates error
+            // since debug_panic should have fired in destroy(). For silent_wrap,
+            // MAX_GENERATION is valid and will wrap to 0 on next destroy.
+            if (comptime gen_policy.on_wrap != .silent_wrap) {
+                assert(meta.generation < IdType.MAX_GENERATION);
+            }
+
+            // Capture next free before modifying for invariant check
+            const next_free = meta.archetype_row;
+
+            // Invariant assertion: Free list integrity - next pointer valid
+            // Why: Free list linkage must point to valid slot or sentinel (max_entities)
+            assert(next_free <= max_entities);
+
             // Update free list head
-            self.free_head = meta.archetype_row;
+            self.free_head = next_free;
 
             // Mark as alive
             meta.alive = true;
@@ -313,11 +421,27 @@ pub fn EntityManagerType(comptime max_entities: u32, comptime index_bits: u5) ty
 
             self.alive_count += 1;
 
-            return HandleType.fromId(IdType.init(index, meta.generation));
+            const handle = HandleType.fromId(IdType.init(index, meta.generation));
+
+            // Post-condition assertion: Returned entity ID is valid
+            // Why: Invalid handle would indicate corrupted construction
+            assert(handle.isValid());
+
+            // Post-condition assertion: Entity slot properly initialized
+            // Why: Slot must be alive after successful creation
+            assert(meta.alive);
+            assert(meta.archetype_index == MetaType.DEAD_ARCHETYPE);
+
+            return handle;
         }
 
         /// Destroy an entity. Returns false if the entity is invalid or already dead.
+        /// Implements EN-1 (generation wrap-around tracking) and EN-3 (near-overflow assertion).
+        ///
+        /// TigerStyle: Central control flow delegates to pure helpers for generation
+        /// policy handling and slot cleanup. Assertions verify entity validity.
         pub fn destroy(self: *Self, handle: HandleType) bool {
+            // Validate handle format
             if (!handle.isValid()) return false;
 
             const index = handle.index();
@@ -325,23 +449,132 @@ pub fn EntityManagerType(comptime max_entities: u32, comptime index_bits: u5) ty
 
             const meta = &self.metadata[index];
 
-            // Generation check
+            // Assertion: generation must match (detects stale handles)
+            assert(meta.generation == handle.generation() or !meta.alive);
+
+            // Generation check - stale handle detection
             if (meta.generation != handle.generation()) return false;
             if (!meta.alive) return false;
 
-            // Mark as dead
+            // Assertion: entity must be alive before destruction
+            assert(meta.alive);
+
+            // Mark as dead before any policy handling
             meta.alive = false;
 
-            // Increment generation (with wrap)
-            meta.generation +%= 1;
+            // Delegate generation policy handling (warnings, wrap-around)
+            const current_gen: u32 = @intCast(meta.generation);
+            const new_gen = handleGenerationPolicy(self, index, current_gen);
 
-            // Add to free list
+            // Assertion: generation must increment (or wrap correctly)
+            const expected_wrapped = (current_gen == IdType.MAX_GENERATION);
+            const actual_wrapped = @as(u32, @intCast(new_gen)) < current_gen;
+            assert(expected_wrapped == actual_wrapped);
+
+            meta.generation = new_gen;
+
+            // Update generation statistics
+            updateGenerationStats(self, new_gen);
+
+            // Recycle the entity slot into free list
+            cleanupEntitySlot(self, meta, index);
+
+            return true;
+        }
+
+        /// Handle generation policy: warnings for near-overflow, wrap-around actions.
+        /// Pure function for generation increment policy (EN-1, EN-3).
+        ///
+        /// Why: Centralizes wrap-around detection and policy actions, keeping
+        /// destroy() focused on control flow. Returns the new generation value.
+        fn handleGenerationPolicy(self: *Self, index: IdType.Index, current_gen: u32) MetaType.Generation {
+            const max_gen = IdType.MAX_GENERATION;
+
+            // EN-3: Check for near-overflow warning threshold
+            if (current_gen >= WARN_THRESHOLD and current_gen < max_gen) {
+                if (builtin.mode == .Debug) {
+                    std.debug.print(
+                        "Warning: Entity slot {d} generation near overflow ({d}/{d})\n",
+                        .{ index, current_gen, max_gen },
+                    );
+                }
+                // Track first crossing of warning threshold
+                if (gen_policy.enable_stats and current_gen == WARN_THRESHOLD) {
+                    self.stats.slots_at_warn_threshold +|= 1;
+                }
+            }
+
+            // Compute new generation with wrapping arithmetic
+            const old_gen: MetaType.Generation = @intCast(current_gen);
+            const new_gen = old_gen +% 1;
+            const wrapped = @as(u32, @intCast(new_gen)) < current_gen;
+
+            // EN-1: Handle wrap-around per policy
+            if (wrapped) {
+                handleWrapAction(self, index);
+            }
+
+            // Assertion: new generation is valid
+            assert(@as(u32, @intCast(new_gen)) <= max_gen);
+
+            return new_gen;
+        }
+
+        /// Handle wrap-around action per configured policy.
+        /// Why: Isolates policy-specific actions for wrap events.
+        fn handleWrapAction(self: *Self, index: IdType.Index) void {
+            switch (gen_policy.on_wrap) {
+                .silent_wrap => {},
+                .log_and_wrap => {
+                    std.debug.print(
+                        "Warning: Entity generation wrapped for slot {d} (epoch: {d})\n",
+                        .{ index, self.stats.epoch_count +| 1 },
+                    );
+                },
+                .debug_panic => {
+                    if (builtin.mode == .Debug) {
+                        @panic("Entity generation overflow - slot has wrapped around");
+                    }
+                    std.debug.print("Warning: Entity generation wrapped for slot {d}\n", .{index});
+                },
+                .always_panic => {
+                    @panic("Entity generation overflow - slot has wrapped around");
+                },
+            }
+            // Update epoch count (EN-1 tracking)
+            if (gen_policy.enable_stats) {
+                self.stats.epoch_count +|= 1;
+            }
+        }
+
+        /// Update generation statistics after increment.
+        /// Why: Keeps stats update logic separate from main control flow.
+        fn updateGenerationStats(self: *Self, new_gen: MetaType.Generation) void {
+            if (gen_policy.enable_stats) {
+                self.stats.total_increments +|= 1;
+                const new_gen_u32: u32 = @intCast(new_gen);
+                if (new_gen_u32 > self.stats.max_generation_seen) {
+                    self.stats.max_generation_seen = new_gen_u32;
+                }
+            }
+        }
+
+        /// Cleanup entity slot: add to free list and update alive count.
+        /// Pure function for slot recycling.
+        ///
+        /// Why: Isolates free-list management from main destruction logic.
+        /// Assertion verifies slot is properly dead before recycling.
+        fn cleanupEntitySlot(self: *Self, meta: *MetaType, index: IdType.Index) void {
+            // Assertion: slot must be dead before recycling
+            assert(!meta.alive);
+
+            // Link into free list (archetype_row used as next-pointer for dead slots)
             meta.archetype_row = self.free_head;
             self.free_head = index;
 
+            // Assertion: alive count must be positive before decrement
+            assert(self.alive_count > 0);
             self.alive_count -= 1;
-
-            return true;
         }
 
         /// Check if an entity handle is still valid (alive and matching generation).
@@ -400,6 +633,21 @@ pub fn EntityManagerType(comptime max_entities: u32, comptime index_bits: u5) ty
         pub fn capacity(self: *const Self) u32 {
             _ = self;
             return max_entities;
+        }
+
+        /// Get generation statistics snapshot.
+        /// Returns null if stats tracking is disabled.
+        pub fn getStats(self: *const Self) ?GenerationStats {
+            if (!gen_policy.enable_stats) return null;
+            return self.stats;
+        }
+
+        /// Reset generation statistics.
+        /// No-op if stats tracking is disabled.
+        pub fn resetStats(self: *Self) void {
+            if (gen_policy.enable_stats) {
+                self.stats.reset();
+            }
         }
     };
 }
@@ -586,4 +834,197 @@ test "EntityIdType - round trip through u32" {
     const restored24 = Id24.fromU32(raw24);
     try std.testing.expectEqual(id24.index, restored24.index);
     try std.testing.expectEqual(id24.generation, restored24.generation);
+}
+
+// ============================================================================
+// Tests for Generation Overflow Detection (EN-1, EN-3)
+// ============================================================================
+
+test "GenerationStats - initial values" {
+    const stats = GenerationStats{};
+    try std.testing.expectEqual(@as(u8, 0), stats.epoch_count);
+    try std.testing.expectEqual(@as(u32, 0), stats.max_generation_seen);
+    try std.testing.expectEqual(@as(u32, 0), stats.slots_at_warn_threshold);
+    try std.testing.expectEqual(@as(u64, 0), stats.total_increments);
+}
+
+test "GenerationStats - reset" {
+    var stats = GenerationStats{
+        .epoch_count = 5,
+        .max_generation_seen = 100,
+        .slots_at_warn_threshold = 3,
+        .total_increments = 1000,
+    };
+    stats.reset();
+    try std.testing.expectEqual(@as(u8, 0), stats.epoch_count);
+    try std.testing.expectEqual(@as(u32, 0), stats.max_generation_seen);
+}
+
+test "GenerationPolicy - warn threshold computation" {
+    const policy = GenerationPolicy{
+        .warn_threshold = 0.9,
+    };
+
+    // Test with max_gen = 100
+    const threshold100 = policy.computeWarnThreshold(100);
+    try std.testing.expectEqual(@as(u32, 90), threshold100);
+
+    // Test with max_gen = 4095 (default 12-bit)
+    const threshold4095 = policy.computeWarnThreshold(4095);
+    try std.testing.expectEqual(@as(u32, 3685), threshold4095); // 0.9 * 4095 = 3685.5
+
+    // Test edge cases
+    const policy_disable = GenerationPolicy{ .warn_threshold = 1.0 };
+    try std.testing.expectEqual(@as(u32, 255), policy_disable.computeWarnThreshold(255));
+
+    const policy_zero = GenerationPolicy{ .warn_threshold = 0.0 };
+    try std.testing.expectEqual(@as(u32, 0), policy_zero.computeWarnThreshold(255));
+}
+
+test "EntityManager with policy - stats tracking enabled" {
+    // Use silent_wrap to avoid panic in tests
+    const policy = GenerationPolicy{
+        .on_wrap = .silent_wrap,
+        .warn_threshold = 0.9,
+        .enable_stats = true,
+    };
+    const EM = EntityManagerTypeWithPolicy(10, DEFAULT_INDEX_BITS, policy);
+    var em = EM.init();
+
+    // Initial stats should be empty
+    const initial_stats = em.getStats().?;
+    try std.testing.expectEqual(@as(u8, 0), initial_stats.epoch_count);
+    try std.testing.expectEqual(@as(u64, 0), initial_stats.total_increments);
+
+    // Create and destroy should increment stats
+    const e1 = em.create().?;
+    _ = em.destroy(e1);
+
+    const stats_after = em.getStats().?;
+    try std.testing.expectEqual(@as(u64, 1), stats_after.total_increments);
+    try std.testing.expectEqual(@as(u32, 1), stats_after.max_generation_seen);
+}
+
+test "EntityManager with policy - stats tracking disabled" {
+    const policy = GenerationPolicy{
+        .on_wrap = .silent_wrap,
+        .enable_stats = false,
+    };
+    const EM = EntityManagerTypeWithPolicy(10, DEFAULT_INDEX_BITS, policy);
+    var em = EM.init();
+
+    // Stats should return null when disabled
+    try std.testing.expectEqual(@as(?GenerationStats, null), em.getStats());
+}
+
+test "EntityManager with policy - generation wrap with silent_wrap" {
+    // Use 8-bit generation (max 255) with 24-bit index for fast wrap testing
+    const policy = GenerationPolicy{
+        .on_wrap = .silent_wrap,
+        .warn_threshold = 0.9,
+        .enable_stats = true,
+    };
+    const EM = EntityManagerTypeWithPolicy(1, 24, policy);
+    var em = EM.init();
+
+    // Max generation for 24-bit index is 255 (8-bit generation)
+    // Cycle through enough times to trigger wrap
+    const max_gen = EM.EntityIdT.MAX_GENERATION;
+    try std.testing.expectEqual(@as(u32, 255), max_gen);
+
+    // Create/destroy entity until we wrap
+    for (0..257) |_| {
+        const e = em.create().?;
+        _ = em.destroy(e);
+    }
+
+    // Should have wrapped at least once
+    const stats = em.getStats().?;
+    try std.testing.expect(stats.epoch_count >= 1);
+}
+
+test "EntityManager with policy - epoch count accuracy" {
+    // Use 8-bit generation for fast wrap testing
+    const policy = GenerationPolicy{
+        .on_wrap = .silent_wrap,
+        .warn_threshold = 1.0, // Disable warnings to avoid spam
+        .enable_stats = true,
+    };
+    const EM = EntityManagerTypeWithPolicy(1, 24, policy);
+    var em = EM.init();
+
+    // 256 destroys should cause exactly 1 wrap (gen 0->255, then 255->0)
+    for (0..256) |_| {
+        const e = em.create().?;
+        _ = em.destroy(e);
+    }
+
+    const stats = em.getStats().?;
+    try std.testing.expectEqual(@as(u8, 1), stats.epoch_count);
+    try std.testing.expectEqual(@as(u64, 256), stats.total_increments);
+
+    // Another 256 destroys = another wrap
+    for (0..256) |_| {
+        const e = em.create().?;
+        _ = em.destroy(e);
+    }
+
+    const stats2 = em.getStats().?;
+    try std.testing.expectEqual(@as(u8, 2), stats2.epoch_count);
+    try std.testing.expectEqual(@as(u64, 512), stats2.total_increments);
+}
+
+test "EntityManager with policy - resetStats" {
+    const policy = GenerationPolicy{
+        .on_wrap = .silent_wrap,
+        .enable_stats = true,
+    };
+    const EM = EntityManagerTypeWithPolicy(10, DEFAULT_INDEX_BITS, policy);
+    var em = EM.init();
+
+    // Generate some stats
+    const e1 = em.create().?;
+    _ = em.destroy(e1);
+    const e2 = em.create().?;
+    _ = em.destroy(e2);
+
+    try std.testing.expectEqual(@as(u64, 2), em.getStats().?.total_increments);
+
+    // Reset and verify
+    em.resetStats();
+    const stats_after = em.getStats().?;
+    try std.testing.expectEqual(@as(u64, 0), stats_after.total_increments);
+    try std.testing.expectEqual(@as(u8, 0), stats_after.epoch_count);
+}
+
+test "EntityManagerWithPolicy - convenience wrapper" {
+    const policy = GenerationPolicy{
+        .on_wrap = .log_and_wrap,
+        .enable_stats = true,
+    };
+    const EM = EntityManagerWithPolicy(100, policy);
+    var em = EM.init();
+
+    const e1 = em.create().?;
+    try std.testing.expect(em.isAlive(e1));
+    _ = em.destroy(e1);
+    try std.testing.expect(!em.isAlive(e1));
+
+    // Verify policy was applied
+    try std.testing.expectEqual(GenerationWrapAction.log_and_wrap, EM.GEN_POLICY.on_wrap);
+}
+
+test "EntityManager default policy - has stats enabled" {
+    // Default EntityManager should still have stats enabled
+    const EM = EntityManager(100);
+    var em = EM.init();
+
+    // Create and destroy
+    const e1 = em.create().?;
+    _ = em.destroy(e1);
+
+    // Should be able to get stats with default policy
+    const stats = em.getStats();
+    try std.testing.expect(stats != null);
+    try std.testing.expectEqual(@as(u64, 1), stats.?.total_increments);
 }

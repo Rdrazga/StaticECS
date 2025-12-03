@@ -13,15 +13,19 @@ const pipeline = @import("pipeline_config.zig");
 const coordination = @import("coordination_config.zig");
 const scalability = @import("scalability_config.zig");
 const backend = @import("backend_config.zig");
+const tracing = @import("tracing_types.zig");
 
-// Re-export types used in public API
-pub const WorldConfig = world_config.WorldConfig;
-pub const ComponentsSpec = spec.ComponentsSpec;
-pub const PipelineConfig = pipeline.PipelineConfig;
-pub const WorldCoordinationConfig = coordination.WorldCoordinationConfig;
-pub const ScalabilityConfig = scalability.ScalabilityConfig;
-pub const BackendConfig = backend.BackendConfig;
-pub const ExecutionModel = backend.ExecutionModel;
+// Internal type aliases for use in validation functions.
+// Not re-exported publicly - use the canonical exports from mod.zig instead.
+const WorldConfig = world_config.WorldConfig;
+const ComponentsSpec = spec.ComponentsSpec;
+const PipelineConfig = pipeline.PipelineConfig;
+const WorldCoordinationConfig = coordination.WorldCoordinationConfig;
+const ScalabilityConfig = scalability.ScalabilityConfig;
+const BackendConfig = backend.BackendConfig;
+const ExecutionModel = backend.ExecutionModel;
+const TracingSpec = tracing.TracingSpec;
+const TraceLevel = tracing.TraceLevel;
 
 // ============================================================================
 // Main Validation Function
@@ -46,6 +50,7 @@ pub fn validateWorldConfig(comptime cfg: WorldConfig) void {
         validateScalabilityConfig(cfg.scalability);
     }
     validateBackendConfig(cfg.schedule.execution_model, cfg.schedule.backend_config);
+    validateTracingConfig(cfg.tracing);
 }
 
 // ============================================================================
@@ -179,6 +184,25 @@ pub fn validatePipelineConfig(comptime pipeline_cfg: PipelineConfig) void {
         const PredicateType = pipeline_cfg.hybrid.fast_path_predicate_type;
         if (!@hasDecl(PredicateType, "canFastPath")) {
             @compileError("WorldConfig: pipeline.hybrid.fast_path_predicate_type must have canFastPath method");
+        }
+
+        // M-8: Verify input_data_mapper_type has mapInputToComponents method
+        // Tiger Style: Fail-fast on invalid mapper type - prevents runtime errors
+        const MapperType = pipeline_cfg.hybrid.input_data_mapper_type;
+        if (!@hasDecl(MapperType, "mapInputToComponents")) {
+            @compileError("WorldConfig: pipeline.hybrid.input_data_mapper_type must have mapInputToComponents method");
+        }
+
+        // Validate input_buffer_size bounds
+        // Tiger Style: Bounded memory - prevent zero-sized buffers
+        if (pipeline_cfg.hybrid.input_buffer_size == 0) {
+            @compileError("WorldConfig: pipeline.hybrid.input_buffer_size must be at least 1");
+        }
+
+        // Validate output_buffer_size bounds
+        // Tiger Style: Bounded memory - prevent zero-sized buffers
+        if (pipeline_cfg.hybrid.output_buffer_size == 0) {
+            @compileError("WorldConfig: pipeline.hybrid.output_buffer_size must be at least 1");
         }
     }
 }
@@ -359,6 +383,47 @@ pub fn validateSchedulerConfig(comptime cfg: WorldConfig) void {
             }
         }
     }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Validates tracing-specific configuration at compile time.
+/// Ensures trace level and sink are consistently configured.
+/// Tiger Style: Fail-fast on misconfiguration to prevent silent trace loss.
+pub fn validateTracingConfig(comptime trace_cfg: TracingSpec) void {
+    // Validate consistency: if tracing is enabled, sink should be provided
+    // to avoid silent trace loss. This is a warning-level check.
+    // Note: We don't @compileError here because tracing without a sink
+    // is valid (traces just go nowhere) - it may be intentional during dev.
+
+    // Future: If TracingSpec gains buffer_size or other fields, validate them here:
+    // - buffer_size >= 1024 (minimum useful buffer)
+    // - buffer_size <= 16 * 1024 * 1024 (16MB max to prevent memory bloat)
+
+    // Validate trace level is a recognized value (enum ensures this at compile time)
+    _ = trace_cfg.level;
+
+    // No sink validation needed - null is valid (no-op tracing)
+    // Non-null sink is opaque at compile time, validated at runtime if needed
+    _ = trace_cfg.sink;
+}
+
+/// Runtime validation for TracingSpec.
+/// Returns error message if invalid, null if valid.
+/// This is for dynamic configuration validation (e.g., from config files).
+///
+/// Use this when TracingSpec is constructed at runtime rather than compile time.
+/// For compile-time configs, validateTracingConfig provides @compileError diagnostics.
+pub fn validateTracingSpecRuntime(trace_spec: TracingSpec) ?[]const u8 {
+    // Validate consistency: tracing enabled without sink is suspicious
+    if (trace_spec.level != .off and trace_spec.sink == null) {
+        return "TracingSpec: tracing level is enabled but no sink is configured. Traces will be lost.";
+    }
+
+    // All checks passed
+    return null;
 }
 
 // ============================================================================

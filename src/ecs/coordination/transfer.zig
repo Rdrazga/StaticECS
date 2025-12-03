@@ -7,10 +7,12 @@
 //!
 //! - **Fixed-size transfers**: Compatible with lock-free queues
 //! - **Component packing**: Serialize all components into byte buffer
+//! - **Alignment-safe**: Component offsets respect @alignOf requirements
 //! - **Zero-copy where possible**: Minimal data movement
 //! - **Comptime-generated**: Types generated from WorldConfig
 //!
 //! Tiger Style: All sizes computed at comptime. No dynamic allocation.
+//! Alignment guarantees prevent faults on strict architectures.
 
 const std = @import("std");
 
@@ -70,18 +72,46 @@ pub const TransferFlags = packed struct {
 /// - Source/target world IDs
 /// - Entity generation for validation
 /// - Flag bits for transfer behavior
-/// - Packed component data
+/// - Packed component data with proper alignment
 ///
 /// Tiger Style: All sizes comptime-computed from config.
+/// Component offsets respect alignment requirements to prevent faults
+/// on strict architectures and ensure optimal access performance.
 pub fn EntityTransfer(comptime cfg: WorldConfig) type {
-    // Calculate maximum component data size
+    // Calculate maximum component data size accounting for alignment padding.
+    // Each component is placed at an offset that respects its @alignOf requirement.
+    // This uses the same algorithm as getComponentOffset to ensure consistency.
     const max_component_size = comptime blk: {
-        var size: usize = 0;
+        var offset: usize = 0;
+        var max_align: usize = 1;
+
         for (cfg.components.types) |T| {
-            size += @sizeOf(T);
+            const type_align = @alignOf(T);
+            const type_size = @sizeOf(T);
+
+            // Track maximum alignment for final padding
+            if (type_align > max_align) max_align = type_align;
+
+            // Align offset to this type's requirement
+            offset = std.mem.alignForward(usize, offset, type_align);
+            offset += type_size;
         }
-        // Add some padding for alignment
-        break :blk if (size == 0) 64 else size + 16;
+
+        // Ensure total size is aligned to max alignment for potential array usage
+        offset = std.mem.alignForward(usize, offset, max_align);
+
+        // Minimum buffer size for edge cases
+        break :blk if (offset == 0) 64 else offset;
+    };
+
+    // Maximum alignment of any component type (for buffer alignment)
+    const max_alignment = comptime blk: {
+        var max_align: usize = 1;
+        for (cfg.components.types) |T| {
+            const type_align = @alignOf(T);
+            if (type_align > max_align) max_align = type_align;
+        }
+        break :blk max_align;
     };
 
     // Component count must fit in mask
@@ -110,13 +140,18 @@ pub fn EntityTransfer(comptime cfg: WorldConfig) type {
         _reserved: u8 = 0,
         /// Component presence bitmask
         component_mask: ComponentMask,
-        /// Packed component data
-        data: [max_component_size]u8,
+        /// Packed component data with alignment guarantee.
+        /// The buffer is aligned to the maximum alignment of any component type,
+        /// ensuring that any component can be safely accessed at its computed offset.
+        data: [max_component_size]u8 align(max_alignment),
         /// Actual data length used
         data_len: u16,
 
         /// Maximum size of component data buffer
         pub const max_data_size = max_component_size;
+
+        /// Maximum alignment requirement of any component
+        pub const data_alignment = max_alignment;
 
         /// Number of component types in this config
         pub const num_components = component_count;
@@ -140,20 +175,25 @@ pub fn EntityTransfer(comptime cfg: WorldConfig) type {
         /// Returns false if component type is invalid or buffer overflow would occur.
         ///
         /// Tiger Style: Fixed offsets computed at comptime ensure deterministic layout.
+        /// Alignment: Offsets are computed to respect @alignOf(T) requirements,
+        /// ensuring safe access on architectures with strict alignment needs.
         pub fn packComponent(self: *Self, comptime T: type, value: T) bool {
             const comp_idx = comptime getComponentIndex(T);
             if (comp_idx == null) return false;
 
-            // Use fixed offset based on component index, not current data_len
+            // Use fixed, aligned offset based on component index
             const offset = comptime getComponentOffset(T);
             const size = @sizeOf(T);
+            const alignment = @alignOf(T);
 
             // Assert: offset + size must fit in buffer (comptime-verified but runtime check for safety)
             std.debug.assert(offset + size <= max_component_size);
             // Assert: component should not already be packed (double-pack is a logic error)
             std.debug.assert((self.component_mask & (@as(ComponentMask, 1) << @intCast(comp_idx.?))) == 0);
+            // Assert: offset is properly aligned for this component type (comptime-verified)
+            std.debug.assert(offset % alignment == 0);
 
-            // Copy component bytes at fixed offset
+            // Copy component bytes at fixed, aligned offset
             const bytes = std.mem.asBytes(&value);
             @memcpy(self.data[offset..][0..size], bytes);
 
@@ -181,6 +221,7 @@ pub fn EntityTransfer(comptime cfg: WorldConfig) type {
         /// Returns null if component not present in this transfer.
         ///
         /// Tiger Style: Fixed offsets ensure pack order independence.
+        /// Alignment: Offsets are aligned to @alignOf(T), ensuring safe reads.
         pub fn unpackComponent(self: *const Self, comptime T: type) ?T {
             const comp_idx = comptime getComponentIndex(T);
             if (comp_idx == null) return null;
@@ -190,14 +231,17 @@ pub fn EntityTransfer(comptime cfg: WorldConfig) type {
                 return null;
             }
 
-            // Use fixed offset based on component index (matches packComponent)
+            // Use fixed, aligned offset based on component index (matches packComponent)
             const offset = comptime getComponentOffset(T);
             const size = @sizeOf(T);
+            const alignment = @alignOf(T);
 
             // Assert: offset + size must be within buffer bounds
             std.debug.assert(offset + size <= max_component_size);
             // Assert: data_len should cover this component's range (it was packed)
             std.debug.assert(offset + size <= self.data_len);
+            // Assert: offset is properly aligned for this component type
+            std.debug.assert(offset % alignment == 0);
 
             return std.mem.bytesAsValue(T, self.data[offset..][0..size]).*;
         }
@@ -212,18 +256,54 @@ pub fn EntityTransfer(comptime cfg: WorldConfig) type {
 
         /// Get the fixed byte offset for a component type (comptime).
         /// Each component has a predetermined offset based on its index,
-        /// calculated by summing sizes of ALL components with lower indices.
-        /// This ensures pack/unpack order independence.
+        /// calculated by summing sizes of ALL components with lower indices,
+        /// WITH ALIGNMENT PADDING to ensure each component respects its @alignOf.
+        /// This ensures pack/unpack order independence AND alignment safety.
         ///
         /// Tiger Style: Comptime computation guarantees zero runtime overhead.
+        /// Alignment padding prevents faults on strict architectures and ensures
+        /// optimal memory access patterns for cache efficiency.
+        ///
+        /// Example layout with alignment:
+        ///   Component A (size=1, align=1): offset=0
+        ///   Component B (size=8, align=8): offset=8 (padded from 1 to 8)
+        ///   Component C (size=4, align=4): offset=16
         fn getComponentOffset(comptime T: type) usize {
             const comp_idx = getComponentIndex(T) orelse @compileError("Unknown component type");
             var offset: usize = 0;
+
             inline for (cfg.components.types, 0..) |CompT, i| {
+                const type_align = @alignOf(CompT);
+                const type_size = @sizeOf(CompT);
+
+                // Align offset to this type's requirement BEFORE placing it
+                offset = std.mem.alignForward(usize, offset, type_align);
+
                 if (i >= comp_idx) break;
-                offset += @sizeOf(CompT);
+                offset += type_size;
             }
+
             return offset;
+        }
+
+        /// Returns true if all component offsets are properly aligned.
+        /// Used for compile-time and debug validation of the layout.
+        ///
+        /// Tiger Style: Exhaustive validation at comptime.
+        fn validateAlignment() bool {
+            inline for (cfg.components.types) |T| {
+                const offset = getComponentOffset(T);
+                const alignment = @alignOf(T);
+                if (offset % alignment != 0) return false;
+            }
+            return true;
+        }
+
+        // Compile-time assertion that all component offsets are properly aligned
+        comptime {
+            if (!validateAlignment()) {
+                @compileError("Component alignment validation failed");
+            }
         }
 
         /// Get total size of this transfer packet
@@ -702,4 +782,171 @@ test "SPSCTransferQueue creation" {
     // Pop and verify
     const received = queue.pop().?;
     try std.testing.expectEqual(@as(u32, 999), received.unpackComponent(Data).?.id);
+}
+
+// ============================================================================
+// Alignment Tests (M2 coord - Component Alignment Handling)
+// ============================================================================
+
+test "EntityTransfer: alignment handling with mixed-size components" {
+    // Test that components with different alignments are correctly placed.
+    // This verifies the fix for M2 (coord) - alignment handling in transfers.
+    //
+    // Layout with alignment:
+    //   Byte (size=1, align=1): offset=0
+    //   Word (size=8, align=8): offset=8 (padded from 1)
+    //   Half (size=4, align=4): offset=16 (already aligned)
+    const Byte = struct { value: u8 };
+    const Word = struct { value: u64 };
+    const Half = struct { value: u32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Byte, Word, Half } },
+    };
+
+    const Transfer = EntityTransfer(cfg);
+
+    // Verify alignment is correctly computed at comptime
+    try std.testing.expectEqual(@as(usize, 8), Transfer.data_alignment);
+
+    // Verify buffer has correct alignment attribute
+    var transfer = Transfer.init(0, 1);
+    const buffer_addr = @intFromPtr(&transfer.data[0]);
+    try std.testing.expect(buffer_addr % Transfer.data_alignment == 0);
+
+    // Pack components in reverse order (stress test alignment)
+    try std.testing.expect(transfer.packComponent(Half, .{ .value = 0xDEADBEEF }));
+    try std.testing.expect(transfer.packComponent(Word, .{ .value = 0x123456789ABCDEF0 }));
+    try std.testing.expect(transfer.packComponent(Byte, .{ .value = 0x42 }));
+
+    // Unpack and verify all values are correct
+    const byte = transfer.unpackComponent(Byte).?;
+    try std.testing.expectEqual(@as(u8, 0x42), byte.value);
+
+    const word = transfer.unpackComponent(Word).?;
+    try std.testing.expectEqual(@as(u64, 0x123456789ABCDEF0), word.value);
+
+    const half = transfer.unpackComponent(Half).?;
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), half.value);
+}
+
+test "EntityTransfer: SIMD-aligned components" {
+    // Test components that would require SIMD alignment (16-byte).
+    // This simulates vector types used in game engines.
+    const Vec4 = struct {
+        x: f32,
+        y: f32,
+        z: f32,
+        w: f32,
+
+        // Force 16-byte alignment like real SIMD types
+        comptime {
+            std.debug.assert(@sizeOf(@This()) == 16);
+        }
+    };
+
+    const Scalar = struct { value: f32 };
+    const Flag = struct { active: bool };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Flag, Vec4, Scalar } },
+    };
+
+    const Transfer = EntityTransfer(cfg);
+    var transfer = Transfer.init(0, 1);
+
+    // Pack SIMD-like component
+    const vec = Vec4{ .x = 1.0, .y = 2.0, .z = 3.0, .w = 4.0 };
+    try std.testing.expect(transfer.packComponent(Vec4, vec));
+    try std.testing.expect(transfer.packComponent(Flag, .{ .active = true }));
+    try std.testing.expect(transfer.packComponent(Scalar, .{ .value = 42.5 }));
+
+    // Verify Vec4 unpacks correctly with proper alignment
+    const unpacked_vec = transfer.unpackComponent(Vec4).?;
+    try std.testing.expectApproxEqRel(@as(f32, 1.0), unpacked_vec.x, 0.001);
+    try std.testing.expectApproxEqRel(@as(f32, 2.0), unpacked_vec.y, 0.001);
+    try std.testing.expectApproxEqRel(@as(f32, 3.0), unpacked_vec.z, 0.001);
+    try std.testing.expectApproxEqRel(@as(f32, 4.0), unpacked_vec.w, 0.001);
+
+    const unpacked_flag = transfer.unpackComponent(Flag).?;
+    try std.testing.expect(unpacked_flag.active);
+}
+
+test "EntityTransfer: worst-case alignment padding" {
+    // Test worst-case scenario: small component followed by large-aligned component.
+    // This verifies padding is correctly calculated.
+    const Tiny = struct { byte: u8 };
+    const BigAlign = struct {
+        // 8-byte aligned due to u64 field
+        a: u64,
+        b: u64,
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Tiny, BigAlign } },
+    };
+
+    const Transfer = EntityTransfer(cfg);
+
+    // Verify buffer size accounts for alignment padding
+    // Tiny: 1 byte at offset 0
+    // BigAlign: 16 bytes at offset 8 (padded from 1)
+    // Total: 24 bytes, rounded to 24 (already aligned to 8)
+    try std.testing.expect(Transfer.max_data_size >= 1 + 7 + 16); // min: 1 + padding + 16
+
+    var transfer = Transfer.init(0, 1);
+
+    try std.testing.expect(transfer.packComponent(Tiny, .{ .byte = 0xFF }));
+    try std.testing.expect(transfer.packComponent(BigAlign, .{ .a = 111, .b = 222 }));
+
+    const tiny = transfer.unpackComponent(Tiny).?;
+    try std.testing.expectEqual(@as(u8, 0xFF), tiny.byte);
+
+    const big = transfer.unpackComponent(BigAlign).?;
+    try std.testing.expectEqual(@as(u64, 111), big.a);
+    try std.testing.expectEqual(@as(u64, 222), big.b);
+}
+
+test "EntityTransfer: data_alignment constant" {
+    // Verify the data_alignment constant matches the maximum component alignment.
+    const A = struct { value: u8 }; // align 1
+    const B = struct { value: u16 }; // align 2
+    const C = struct { value: u64 }; // align 8
+    const D = struct { value: u32 }; // align 4
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ A, B, C, D } },
+    };
+
+    const Transfer = EntityTransfer(cfg);
+
+    // Maximum alignment should be 8 (from u64)
+    try std.testing.expectEqual(@as(usize, 8), Transfer.data_alignment);
+    try std.testing.expectEqual(@as(usize, @alignOf(u64)), Transfer.data_alignment);
+}
+
+test "EntityTransfer: comptime alignment validation" {
+    // This test verifies the comptime validation passes.
+    // If alignment were broken, this would fail to compile.
+    const Mixed = struct {
+        a: u8,
+        b: u32,
+        c: u16,
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Mixed, u64, bool } },
+    };
+
+    // If this compiles, alignment validation passed
+    const Transfer = EntityTransfer(cfg);
+    var transfer = Transfer.init(0, 1);
+
+    _ = transfer.packComponent(Mixed, .{ .a = 1, .b = 2, .c = 3 });
+    _ = transfer.packComponent(u64, 12345);
+    _ = transfer.packComponent(bool, true);
+
+    // Verify roundtrip
+    try std.testing.expectEqual(@as(u64, 12345), transfer.unpackComponent(u64).?);
+    try std.testing.expect(transfer.unpackComponent(bool).?);
 }

@@ -298,7 +298,7 @@ fn SystemExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
 
         pub fn executeSystem(ctx: *SysCtx, comptime system_index: u16) error_types.FrameError!void {
             const system_def = Sched.systems[system_index];
-            const func: SystemFn = @ptrCast(@alignCast(system_def.func));
+            const func: SystemFn = @ptrCast(@alignCast(system_def.func.rawPtr()));
             try func(ctx);
         }
 
@@ -310,7 +310,8 @@ fn SystemExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
         ) bool {
             _ = policy;
             Self.executeSystem(ctx, system_index) catch |err| {
-                errors.add(err, system_index, ctx.time_ns);
+                // Return value indicates if stored; overflow count tracked internally
+                _ = errors.add(err, system_index, ctx.time_ns);
                 return false;
             };
             return true;
@@ -335,6 +336,27 @@ fn CommandExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
                     },
                     .set_component => |set_cmd| {
                         if (!world.isAlive(set_cmd.entity)) continue;
+                    },
+                    .add_component => |add_cmd| {
+                        // TODO: Implement archetype migration for add_component
+                        // This requires moving the entity to a new archetype that includes
+                        // the component. For now, we check entity validity but don't migrate.
+                        if (!world.isAlive(add_cmd.entity)) continue;
+                        // Full implementation would:
+                        // 1. Find/create target archetype with the new component
+                        // 2. Copy existing component data
+                        // 3. Add new component data from add_cmd.data
+                        // 4. Move entity to new archetype
+                    },
+                    .remove_component => |remove_cmd| {
+                        // TODO: Implement archetype migration for remove_component
+                        // This requires moving the entity to a new archetype that excludes
+                        // the component. For now, we check entity validity but don't migrate.
+                        if (!world.isAlive(remove_cmd.entity)) continue;
+                        // Full implementation would:
+                        // 1. Find/create target archetype without the component
+                        // 2. Copy existing component data (except removed)
+                        // 3. Move entity to new archetype
                     },
                     .custom => |custom_cmd| {
                         _ = custom_cmd;

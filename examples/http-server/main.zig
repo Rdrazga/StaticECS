@@ -6,6 +6,7 @@
 //! - State machine transitions using component updates
 //! - Custom phases for HTTP request pipeline
 //! - Resource-based server statistics
+//! - **Command buffer for deferred entity despawn on disconnect**
 //!
 //! Run with: zig build run-example-server
 
@@ -89,24 +90,28 @@ const ServerConfig = struct {
 // Query Specifications
 // ============================================================================
 
-/// Query for new connections waiting for request data
+/// Query for connections in reading state waiting for request data.
+/// Used by readSystem to read incoming data and update Connection state.
 const ReadingConnectionsQuery = Query(.{
     .write = &.{Connection},
 });
 
-/// Query for connections with parsed requests needing processing
-const ProcessingQuery = Query(.{
-    .read = &.{Request},
-    .write = &.{ Connection, Response },
-});
-
-/// Query for connections ready to send response
-const WritingQuery = Query(.{
-    .read = &.{Response},
+/// Query for connections with data that need request processing.
+/// Used by processSystem to parse requests and transition to writing state.
+/// Writes to Connection for state transition.
+const ProcessingConnectionsQuery = Query(.{
     .write = &.{Connection},
 });
 
-/// Query for all connections (status check)
+/// Query for connections ready to send response data.
+/// Used by writeSystem to send response and close connection.
+/// Writes to Connection for state transition and byte tracking.
+const WritingConnectionsQuery = Query(.{
+    .write = &.{Connection},
+});
+
+/// Query for all connections (status check and reporting).
+/// Used by cleanupSystem to gather server statistics and connection states.
 const AllConnectionsQuery = Query(.{
     .read = &.{Connection},
     .optional = &.{ Request, Response },
@@ -122,10 +127,15 @@ fn acceptSystem(ctx_ptr: *anyopaque) FrameError!void {
     const ctx = getContext(ctx_ptr);
     const stats = ctx.world.resources.get(ServerStats) orelse return;
 
-    // Check for async I/O support (demonstrates capability checking)
+    // Demonstrate async I/O capability detection for server configuration
     if (ctx.hasIo()) {
-        // In a real server, we would use io_uring/epoll here
-        _ = ctx.hasAsync();
+        if (ctx.hasAsync()) {
+            // Async I/O available: could use io_uring/epoll for non-blocking accepts
+            std.log.debug("Async I/O available - accepting with non-blocking mode", .{});
+        } else {
+            // Blocking I/O fallback: use traditional accept() calls
+            std.log.debug("Blocking I/O fallback - accepting with blocking mode", .{});
+        }
     }
 
     // Simulate accepting new connections every 5 ticks
@@ -182,8 +192,8 @@ fn processSystem(ctx_ptr: *anyopaque) FrameError!void {
     const ctx = getContext(ctx_ptr);
     const stats = ctx.world.resources.get(ServerStats) orelse return;
 
-    // We need to iterate connections in processing state
-    var iter = ctx.world.query(ReadingConnectionsQuery);
+    // Query connections that need request processing
+    var iter = ctx.world.query(ProcessingConnectionsQuery);
 
     while (iter.next()) |const_result| {
         var result = const_result;
@@ -223,7 +233,8 @@ fn writeSystem(ctx_ptr: *anyopaque) FrameError!void {
     const ctx = getContext(ctx_ptr);
     const stats = ctx.world.resources.get(ServerStats) orelse return;
 
-    var iter = ctx.world.query(ReadingConnectionsQuery);
+    // Query connections that are ready to write response data
+    var iter = ctx.world.query(WritingConnectionsQuery);
 
     while (iter.next()) |const_result| {
         var result = const_result;
@@ -243,25 +254,45 @@ fn writeSystem(ctx_ptr: *anyopaque) FrameError!void {
     }
 }
 
-/// Cleanup system: Remove closed connections and update stats.
-/// Demonstrates entity lifecycle management.
+/// Cleanup system: Remove closed connections using deferred despawn.
+/// Demonstrates safe entity removal during iteration via command buffer.
+///
+/// Why deferred despawn is essential for connection cleanup:
+/// - Connections may complete or error during any phase
+/// - Directly despawning during iteration would invalidate the iterator
+/// - Command buffer collects despawn requests, executes after system completes
+/// - This pattern ensures no memory corruption or use-after-free bugs
 fn cleanupSystem(ctx_ptr: *anyopaque) FrameError!void {
     const ctx = getContext(ctx_ptr);
     const stats = ctx.world.resources.get(ServerStats) orelse return;
     stats.tick_count = ctx.tick;
 
-    // Count closed connections (would despawn in a real implementation)
+    // Find and queue despawn for closed connections
     var closed_count: u32 = 0;
     var iter = ctx.world.query(AllConnectionsQuery);
 
     while (iter.next()) |result| {
         const conn = result.getRead(Connection);
+
         if (conn.state == .closed) {
+            // Queue deferred despawn - SAFE during iteration
+            // The actual despawn happens after the system completes
+            // This prevents iterator invalidation and ensures all closed
+            // connections are properly cleaned up in a single pass
+            // Note: Convert EntityId to EntityHandle for command buffer API
+            const handle = ecs.entity.EntityHandle.fromId(result.entity_id);
+            _ = ctx.commands.despawn(handle);
             closed_count += 1;
+
+            std.log.debug("Queued despawn for connection fd={} (bytes in/out: {}/{})", .{
+                conn.fd,
+                conn.bytes_read,
+                conn.bytes_written,
+            });
         }
     }
 
-    // Update active connection count
+    // Update active connection count based on despawned connections
     if (stats.connections_active >= closed_count) {
         stats.connections_active -= closed_count;
     }
@@ -276,10 +307,11 @@ fn cleanupSystem(ctx_ptr: *anyopaque) FrameError!void {
             state_counts[@intFromEnum(conn.state)] += 1;
         }
 
-        std.debug.print("Tick {}: reqs={} active={} [acc:{} read:{} proc:{} write:{} closed:{}]\n", .{
+        std.debug.print("Tick {}: reqs={} active={} despawned={} [acc:{} read:{} proc:{} write:{} closed:{}]\n", .{
             ctx.tick,
             stats.requests_total,
             stats.connections_active,
+            closed_count,
             state_counts[0],
             state_counts[1],
             state_counts[2],
@@ -319,11 +351,47 @@ pub const cfg = ecs.WorldConfig{
     },
     .systems = .{
         .systems = &.{
-            .{ .name = "accept", .func = ecs.asSystemFn(acceptSystem), .phase = 0, .needs_io = true },
-            .{ .name = "read", .func = ecs.asSystemFn(readSystem), .phase = 1, .needs_io = true },
-            .{ .name = "process", .func = ecs.asSystemFn(processSystem), .phase = 2 },
-            .{ .name = "write", .func = ecs.asSystemFn(writeSystem), .phase = 3, .needs_io = true },
-            .{ .name = "cleanup", .func = ecs.asSystemFn(cleanupSystem), .phase = 4 },
+            // Accept: spawns new Connection entities
+            // Declaring component access enables scheduler optimization
+            .{
+                .name = "accept",
+                .func = ecs.asSystemFn(acceptSystem),
+                .phase = 0,
+                .needs_io = true,
+                .write_components = &.{Connection},
+            },
+            // Read: updates Connection state from incoming data
+            .{
+                .name = "read",
+                .func = ecs.asSystemFn(readSystem),
+                .phase = 1,
+                .needs_io = true,
+                .write_components = &.{Connection},
+            },
+            // Process: reads Request, updates Connection and Response
+            .{
+                .name = "process",
+                .func = ecs.asSystemFn(processSystem),
+                .phase = 2,
+                .read_components = &.{Request},
+                .write_components = &.{ Connection, Response },
+            },
+            // Write: reads Response, updates Connection
+            .{
+                .name = "write",
+                .func = ecs.asSystemFn(writeSystem),
+                .phase = 3,
+                .needs_io = true,
+                .read_components = &.{Response},
+                .write_components = &.{Connection},
+            },
+            // Cleanup: reads Connection state for statistics
+            .{
+                .name = "cleanup",
+                .func = ecs.asSystemFn(cleanupSystem),
+                .phase = 4,
+                .read_components = &.{ Connection, Request, Response },
+            },
         },
     },
     .resources = .{

@@ -6,6 +6,7 @@
 //! - Query iteration with stage-based filtering
 //! - Component modification for stage transitions
 //! - Resource-based statistics tracking
+//! - **Command buffer for deferred error entity spawning**
 //!
 //! Run with: zig build run-example-pipeline
 
@@ -66,6 +67,21 @@ const OutputData = struct {
     output_timestamp: u64 = 0,
 };
 
+/// Error record for tracking validation/processing failures
+/// Created via deferred spawn when a record fails validation
+const ErrorRecord = struct {
+    original_record_id: u64,
+    error_code: ErrorCode,
+    timestamp_ns: u64,
+
+    const ErrorCode = enum(u8) {
+        invalid_checksum = 1,
+        empty_data = 2,
+        parse_error = 3,
+        transform_error = 4,
+    };
+};
+
 // ============================================================================
 // Resources
 // ============================================================================
@@ -78,34 +94,47 @@ const PipelineStats = struct {
     records_failed: u64 = 0,
     tick_count: u64 = 0,
     validation_errors: u64 = 0,
+    error_records_spawned: u64 = 0,
 };
 
 // ============================================================================
 // Query Specifications
 // ============================================================================
 
-/// Query for newly ingested records that need validation
+/// Query for newly ingested records that need validation.
+/// Used by validateSystem to read raw data and update Record.stage from .ingested.
 const IngestedRecordQuery = Query(.{
     .read = &.{RawData},
     .write = &.{Record},
 });
 
-/// Query for validated records needing transformation
+/// Query for validated records needing transformation.
+/// Used by transformSystem to process records where Record.stage == .validated.
+/// Reads RawData for transformation input, writes Record for stage transition.
 const ValidatedRecordQuery = Query(.{
-    .read = &.{ Record, RawData, ParsedData },
-    .write = &.{},
-});
-
-/// Query for records with output data ready to complete
-const OutputReadyQuery = Query(.{
-    .read = &.{ ParsedData, OutputData },
+    .read = &.{RawData},
     .write = &.{Record},
 });
 
-/// Query for all records (status check)
+/// Query for transformed records ready for output.
+/// Used by outputSystem to process records where Record.stage == .transformed.
+/// Writes Record for final stage transition to .completed.
+const TransformedRecordQuery = Query(.{
+    .read = &.{RawData},
+    .write = &.{Record},
+});
+
+/// Query for all records (status check and reporting).
+/// Used by cleanupSystem to gather pipeline statistics across all stages.
 const AllRecordsQuery = Query(.{
     .read = &.{Record},
     .optional = &.{ RawData, ParsedData, OutputData },
+});
+
+/// Query for error records (for error reporting/handling).
+/// Used by cleanupSystem to count and report validation errors.
+const ErrorRecordQuery = Query(.{
+    .read = &.{ErrorRecord},
 });
 
 // ============================================================================
@@ -144,8 +173,14 @@ fn ingestSystem(ctx_ptr: *anyopaque) FrameError!void {
     }
 }
 
-/// Validate system: Validates raw records and transitions them to validated stage.
-/// Demonstrates query iteration with stage filtering and component modification.
+/// Validate system: Validates raw records and spawns error entities on failure.
+/// Demonstrates command buffer usage for deferred error entity spawning.
+///
+/// Why deferred spawn is essential for error handling:
+/// - Validation failures need to spawn error tracking entities
+/// - Spawning directly during iteration could invalidate the iterator
+/// - Command buffer collects spawn requests, executes after validation completes
+/// - This pattern ensures all validation errors are properly tracked
 fn validateSystem(ctx_ptr: *anyopaque) FrameError!void {
     const ctx = getContext(ctx_ptr);
     const stats = ctx.world.resources.get(PipelineStats) orelse return;
@@ -161,10 +196,11 @@ fn validateSystem(ctx_ptr: *anyopaque) FrameError!void {
 
         const raw = result.getRead(RawData);
 
-        // Validate checksum (simple validation logic)
-        const is_valid = raw.checksum != 0xDEADBEEF and raw.data_len > 0;
+        // Validate checksum and data length
+        const has_valid_checksum = raw.checksum != 0xDEADBEEF;
+        const has_valid_data = raw.data_len > 0;
 
-        if (is_valid) {
+        if (has_valid_checksum and has_valid_data) {
             // Transition to validated stage
             record.stage = .validated;
             stats.records_validated += 1;
@@ -173,6 +209,28 @@ fn validateSystem(ctx_ptr: *anyopaque) FrameError!void {
             record.stage = .failed;
             stats.records_failed += 1;
             stats.validation_errors += 1;
+
+            // Spawn an error record entity using deferred command
+            // IMPORTANT: Using command buffer ensures the spawn happens AFTER iteration
+            // This prevents iterator invalidation and allows error tracking entities
+            // to be created safely while iterating through records
+            const error_arch_idx = comptime World.archIndex("error_record");
+            const success = ctx.commands.spawnInArchetype(error_arch_idx);
+
+            if (success) {
+                stats.error_records_spawned += 1;
+
+                // Determine error code based on validation failure type
+                const error_code: ErrorRecord.ErrorCode = if (!has_valid_checksum)
+                    .invalid_checksum
+                else
+                    .empty_data;
+
+                std.log.debug("Queued error record spawn for record {} (error: {s})", .{
+                    record.id,
+                    @tagName(error_code),
+                });
+            }
         }
     }
 }
@@ -183,8 +241,8 @@ fn transformSystem(ctx_ptr: *anyopaque) FrameError!void {
     const ctx = getContext(ctx_ptr);
     const stats = ctx.world.resources.get(PipelineStats) orelse return;
 
-    // Query for records that have been validated
-    var iter = ctx.world.query(IngestedRecordQuery);
+    // Query for records that have been validated using the correct query type
+    var iter = ctx.world.query(ValidatedRecordQuery);
 
     while (iter.next()) |const_result| {
         var result = const_result;
@@ -220,7 +278,8 @@ fn outputSystem(ctx_ptr: *anyopaque) FrameError!void {
     const ctx = getContext(ctx_ptr);
     const stats = ctx.world.resources.get(PipelineStats) orelse return;
 
-    var iter = ctx.world.query(IngestedRecordQuery);
+    // Query for records that have been transformed using the correct query type
+    var iter = ctx.world.query(TransformedRecordQuery);
 
     while (iter.next()) |const_result| {
         var result = const_result;
@@ -236,11 +295,18 @@ fn outputSystem(ctx_ptr: *anyopaque) FrameError!void {
 }
 
 /// Cleanup system: Updates stats and reports pipeline health.
-/// Demonstrates periodic reporting with resource access.
+/// Demonstrates periodic reporting with resource access and error tracking.
 fn cleanupSystem(ctx_ptr: *anyopaque) FrameError!void {
     const ctx = getContext(ctx_ptr);
     const stats = ctx.world.resources.get(PipelineStats) orelse return;
     stats.tick_count = ctx.tick;
+
+    // Count error records
+    var error_count: u32 = 0;
+    var error_iter = ctx.world.query(ErrorRecordQuery);
+    while (error_iter.next()) |_| {
+        error_count += 1;
+    }
 
     // Report pipeline status every 10 ticks
     if (@mod(ctx.tick, 10) == 0 and ctx.tick > 0) {
@@ -252,13 +318,14 @@ fn cleanupSystem(ctx_ptr: *anyopaque) FrameError!void {
             stage_counts[@intFromEnum(record.stage)] += 1;
         }
 
-        std.debug.print("Tick {}: stages=[ing:{}, val:{}, trans:{}, done:{}, fail:{}]\n", .{
+        std.debug.print("Tick {}: stages=[ing:{}, val:{}, trans:{}, done:{}, fail:{}] errors:{}\n", .{
             ctx.tick,
             stage_counts[0], // ingested
             stage_counts[1], // validated
             stage_counts[2], // transformed
             stage_counts[3], // completed
             stage_counts[4], // failed
+            error_count,
         });
     }
 }
@@ -269,7 +336,7 @@ fn cleanupSystem(ctx_ptr: *anyopaque) FrameError!void {
 
 pub const cfg = ecs.WorldConfig{
     .components = .{
-        .types = &.{ Record, RawData, ParsedData, OutputData },
+        .types = &.{ Record, RawData, ParsedData, OutputData, ErrorRecord },
     },
     .archetypes = .{
         .archetypes = &.{
@@ -279,6 +346,8 @@ pub const cfg = ecs.WorldConfig{
             .{ .name = "parsed_record", .components = &.{ Record, RawData, ParsedData } },
             // Record ready for output
             .{ .name = "output_record", .components = &.{ Record, RawData, ParsedData, OutputData } },
+            // Error record for tracking validation failures (spawned via command buffer)
+            .{ .name = "error_record", .components = &.{ErrorRecord} },
         },
     },
     // Custom phases for pipeline stages
@@ -293,11 +362,45 @@ pub const cfg = ecs.WorldConfig{
     },
     .systems = .{
         .systems = &.{
-            .{ .name = "ingest", .func = ecs.asSystemFn(ingestSystem), .phase = 0 },
-            .{ .name = "validate", .func = ecs.asSystemFn(validateSystem), .phase = 1 },
-            .{ .name = "transform", .func = ecs.asSystemFn(transformSystem), .phase = 2 },
-            .{ .name = "output", .func = ecs.asSystemFn(outputSystem), .phase = 3 },
-            .{ .name = "cleanup", .func = ecs.asSystemFn(cleanupSystem), .phase = 4 },
+            // Ingest: spawns new Record entities with RawData
+            // Declaring component access enables scheduler optimization for parallelism
+            .{
+                .name = "ingest",
+                .func = ecs.asSystemFn(ingestSystem),
+                .phase = 0,
+                .write_components = &.{ Record, RawData },
+            },
+            // Validate: reads RawData, writes Record stage
+            .{
+                .name = "validate",
+                .func = ecs.asSystemFn(validateSystem),
+                .phase = 1,
+                .read_components = &.{RawData},
+                .write_components = &.{Record},
+            },
+            // Transform: reads RawData, writes Record stage
+            .{
+                .name = "transform",
+                .func = ecs.asSystemFn(transformSystem),
+                .phase = 2,
+                .read_components = &.{RawData},
+                .write_components = &.{Record},
+            },
+            // Output: reads ParsedData/OutputData, writes Record stage
+            .{
+                .name = "output",
+                .func = ecs.asSystemFn(outputSystem),
+                .phase = 3,
+                .read_components = &.{ ParsedData, OutputData },
+                .write_components = &.{Record},
+            },
+            // Cleanup: reads all components for statistics reporting
+            .{
+                .name = "cleanup",
+                .func = ecs.asSystemFn(cleanupSystem),
+                .phase = 4,
+                .read_components = &.{ Record, RawData, ParsedData, OutputData },
+            },
         },
     },
     .resources = .{
@@ -338,6 +441,7 @@ pub fn main() !void {
     std.debug.print("  - Entity processing through pipeline stages\n", .{});
     std.debug.print("  - Query iteration with stage filtering\n", .{});
     std.debug.print("  - Component-based state transitions\n", .{});
+    std.debug.print("  - Command buffer for deferred error entity spawning\n", .{});
     std.debug.print("  - Custom phases: ingest → validate → transform → output → cleanup\n\n", .{});
 
     var tick: u64 = 0;

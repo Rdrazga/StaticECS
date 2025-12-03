@@ -1,11 +1,15 @@
-//! World Coordinator
+//! # World Coordinator
 //!
-//! Manages multiple ECS worlds in a pipeline configuration.
-//! Each world can process entities at different pipeline stages simultaneously,
-//! with entity transfers handled through lock-free queues.
+//! Purpose: Manages multiple ECS worlds in a pipeline configuration for
+//! horizontal scaling. Enables parallel processing across pipeline stages.
+//!
+//! ## Key Types
+//! - `WorldCoordinator` - Central coordinator managing N worlds
+//! - `Seqlock` - Sequence lock for atomic statistics snapshots
+//! - `CoordinatorStats` - Metrics snapshot type
+//! - `AtomicStats` - Lock-free updateable statistics
 //!
 //! ## Architecture
-//!
 //! ```
 //! ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 //! │   World 0   │ ──► │   World 1   │ ──► │   World 2   │
@@ -17,17 +21,40 @@
 //! ```
 //!
 //! ## Usage
-//!
 //! ```zig
-//! const Coordinator = ecs.WorldCoordinator(config, 3);
+//! const Coordinator = WorldCoordinator(cfg, 3);  // 3 worlds
 //! var coord = try Coordinator.init(allocator);
 //! defer coord.deinit();
 //!
-//! // Run coordination loop
-//! while (running) {
-//!     try coord.tick(delta_time);
+//! // Queue entity transfer between worlds
+//! const transfer = coord.createTransfer(entity, target_world);
+//! _ = coord.queueTransfer(source_world, target_world, transfer);
+//!
+//! // Process transfers and tick all worlds
+//! try coord.tick(delta_time);
+//!
+//! // Monitor coordination health
+//! const stats = coord.getStats();
+//! if (stats.queue_full_count > 0) {
+//!     log.warn("Transfer backpressure detected");
 //! }
 //! ```
+//!
+//! ## Threading Model
+//! - Each world can run on a dedicated thread
+//! - Transfer queues are lock-free (MPMC or SPSC based on config)
+//! - Statistics use seqlock for consistent snapshots
+//! - Queue full events are tracked atomically
+//!
+//! ## Backpressure
+//! - `queueTransfer()` returns `false` when queue is full
+//! - `queue_full_count` metric tracks rejected transfers
+//! - Caller decides retry/drop policy
+//!
+//! ## Related Modules
+//! - `lock_free_queue.zig` - Transfer queue implementation
+//! - `transfer.zig` - Entity transfer serialization
+//! - `../world.zig` - Individual world implementation
 //!
 //! Tiger Style: All bounds from config. Zero allocations after init.
 
@@ -45,6 +72,54 @@ const LockFreeQueue = lock_free_queue.LockFreeQueue;
 const transfer_mod = @import("transfer.zig");
 const EntityTransfer = transfer_mod.EntityTransfer;
 const TransferMarker = transfer_mod.TransferMarker;
+
+// ============================================================================
+// Seqlock for Atomic Snapshots
+// ============================================================================
+
+/// Sequence lock for atomic snapshot reads.
+/// Even version = stable, odd version = write in progress.
+///
+/// Writers increment version before AND after updating protected data.
+/// Readers spin if version is odd (write in progress) or changed during read.
+///
+/// Tiger Style: Wait-free writes, lock-free reads. Bounded retry with spinLoopHint.
+pub const Seqlock = struct {
+    version: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// Maximum retry attempts for snapshot reads before returning null.
+    /// Under normal conditions, retries should be 0-2.
+    pub const MAX_RETRIES: u32 = 100;
+
+    /// Begin a write operation (increments version to odd).
+    /// Must be paired with endWrite().
+    pub fn beginWrite(self: *Seqlock) void {
+        _ = self.version.fetchAdd(1, .release);
+    }
+
+    /// End a write operation (increments version to even).
+    /// Must be called after beginWrite().
+    pub fn endWrite(self: *Seqlock) void {
+        _ = self.version.fetchAdd(1, .release);
+    }
+
+    /// Read the current version for snapshot validation.
+    pub fn readVersion(self: *const Seqlock) u32 {
+        return self.version.load(.acquire);
+    }
+
+    /// Check if a snapshot taken at start_version is still valid.
+    /// Valid if: started on even (no write in progress) AND hasn't changed.
+    pub fn validateSnapshot(self: *const Seqlock, start_version: u32) bool {
+        const end_version = self.version.load(.acquire);
+        return (start_version & 1) == 0 and start_version == end_version;
+    }
+
+    /// Check if version indicates a write is in progress.
+    pub fn isWriteInProgress(version: u32) bool {
+        return (version & 1) != 0;
+    }
+};
 
 // ============================================================================
 // Coordinator Statistics
@@ -69,8 +144,17 @@ pub const CoordinatorStatsSnapshot = struct {
 
 /// Atomic statistics tracked by the coordinator.
 /// All fields are atomic to ensure thread-safe concurrent updates.
-/// Tiger Style: Using monotonic ordering for pure statistics (no synchronization purpose).
+///
+/// Uses a seqlock for atomic snapshot reads:
+/// - Individual counter updates use fetchAdd for lock-free writes
+/// - Batch writes (like reset) use beginWrite/endWrite for atomicity
+/// - Readers use getAtomicSnapshot() for consistent multi-field reads
+///
+/// Tiger Style: Using monotonic ordering for pure statistics, seqlock for snapshot consistency.
 pub const CoordinatorStats = struct {
+    /// Seqlock for atomic snapshot reads
+    seqlock: Seqlock = .{},
+
     /// Total ticks executed
     ticks: Atomic(u64),
     /// Transfers sent per world (indexed by source world)
@@ -87,6 +171,7 @@ pub const CoordinatorStats = struct {
     /// Initialize all atomic counters to zero.
     pub fn init() CoordinatorStats {
         return .{
+            .seqlock = .{},
             .ticks = Atomic(u64).init(0),
             .transfers_sent = [_]Atomic(u64){Atomic(u64).init(0)} ** MAX_WORLDS,
             .transfers_received = [_]Atomic(u64){Atomic(u64).init(0)} ** MAX_WORLDS,
@@ -95,8 +180,24 @@ pub const CoordinatorStats = struct {
         };
     }
 
+    /// Begin a write operation - call before updating multiple fields atomically.
+    /// Must be paired with endWrite().
+    pub fn beginWrite(self: *CoordinatorStats) void {
+        self.seqlock.beginWrite();
+    }
+
+    /// End a write operation - call after updating multiple fields atomically.
+    /// Must be called after beginWrite().
+    pub fn endWrite(self: *CoordinatorStats) void {
+        self.seqlock.endWrite();
+    }
+
     /// Reset all counters to zero atomically.
+    /// Uses seqlock to ensure readers see consistent state.
     pub fn reset(self: *CoordinatorStats) void {
+        self.seqlock.beginWrite();
+        defer self.seqlock.endWrite();
+
         self.ticks.store(0, .monotonic);
         for (&self.transfers_sent) |*counter| {
             counter.store(0, .monotonic);
@@ -108,7 +209,48 @@ pub const CoordinatorStats = struct {
         self.total_tick_time_ns.store(0, .monotonic);
     }
 
-    /// Create a non-atomic snapshot of current statistics.
+    /// Increment a single statistic without seqlock overhead.
+    /// Use for individual counter updates in hot paths.
+    /// For batch updates, use beginWrite/endWrite.
+    pub fn incrementTicks(self: *CoordinatorStats) void {
+        self.seqlock.beginWrite();
+        _ = self.ticks.fetchAdd(1, .monotonic);
+        self.seqlock.endWrite();
+    }
+
+    /// Add time to tick statistics with seqlock protection.
+    pub fn addTickTime(self: *CoordinatorStats, delta_ns: u64) void {
+        self.seqlock.beginWrite();
+        _ = self.total_tick_time_ns.fetchAdd(delta_ns, .monotonic);
+        self.seqlock.endWrite();
+    }
+
+    /// Increment transfer sent counter with seqlock protection.
+    pub fn incrementTransfersSent(self: *CoordinatorStats, world: usize) void {
+        if (world >= MAX_WORLDS) return;
+        self.seqlock.beginWrite();
+        _ = self.transfers_sent[world].fetchAdd(1, .monotonic);
+        self.seqlock.endWrite();
+    }
+
+    /// Increment transfer received counter with seqlock protection.
+    pub fn incrementTransfersReceived(self: *CoordinatorStats, world: usize, count: u64) void {
+        if (world >= MAX_WORLDS) return;
+        self.seqlock.beginWrite();
+        _ = self.transfers_received[world].fetchAdd(count, .monotonic);
+        self.seqlock.endWrite();
+    }
+
+    /// Increment queue full counter with seqlock protection.
+    pub fn incrementQueueFull(self: *CoordinatorStats) void {
+        self.seqlock.beginWrite();
+        _ = self.queue_full_count.fetchAdd(1, .monotonic);
+        self.seqlock.endWrite();
+    }
+
+    /// Create a non-atomic snapshot of current statistics (legacy API).
+    /// WARNING: This can return inconsistent data if read during a write.
+    /// Use getAtomicSnapshot() for consistent reads.
     /// Uses monotonic ordering since stats are for observation only.
     pub fn snapshot(self: *const CoordinatorStats) CoordinatorStatsSnapshot {
         var snap = CoordinatorStatsSnapshot{};
@@ -120,6 +262,45 @@ pub const CoordinatorStats = struct {
         snap.queue_full_count = self.queue_full_count.load(.monotonic);
         snap.total_tick_time_ns = self.total_tick_time_ns.load(.monotonic);
         return snap;
+    }
+
+    /// Read a consistent snapshot of statistics using seqlock.
+    /// Returns null if unable to get consistent read after max_retries.
+    ///
+    /// This is safe to call concurrently with write operations.
+    /// Under normal conditions (short write hold times), this should
+    /// succeed immediately with 0-2 retries.
+    pub fn getAtomicSnapshot(self: *const CoordinatorStats) ?CoordinatorStatsSnapshot {
+        var retries: u32 = 0;
+
+        while (retries < Seqlock.MAX_RETRIES) : (retries += 1) {
+            const start_version = self.seqlock.readVersion();
+
+            // Skip if write in progress (odd version)
+            if (Seqlock.isWriteInProgress(start_version)) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+
+            // Read all fields
+            var snap = CoordinatorStatsSnapshot{};
+            snap.ticks = self.ticks.load(.monotonic);
+            for (0..MAX_WORLDS) |i| {
+                snap.transfers_sent[i] = self.transfers_sent[i].load(.monotonic);
+                snap.transfers_received[i] = self.transfers_received[i].load(.monotonic);
+            }
+            snap.queue_full_count = self.queue_full_count.load(.monotonic);
+            snap.total_tick_time_ns = self.total_tick_time_ns.load(.monotonic);
+
+            // Validate snapshot is consistent (version unchanged)
+            if (self.seqlock.validateSnapshot(start_version)) {
+                return snap;
+            }
+
+            std.atomic.spinLoopHint();
+        }
+
+        return null; // Failed to get consistent snapshot
     }
 };
 
@@ -223,10 +404,10 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
 
             const queue = &self.queues[source_world][target_world];
             if (queue.push(transfer)) {
-                _ = self.stats.transfers_sent[source_world].fetchAdd(1, .monotonic);
+                self.stats.incrementTransfersSent(source_world);
                 return true;
             } else {
-                _ = self.stats.queue_full_count.fetchAdd(1, .monotonic);
+                self.stats.incrementQueueFull();
                 return false;
             }
         }
@@ -242,7 +423,7 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
 
                 const queue = &self.queues[src][target_world];
                 if (queue.pop()) |transfer| {
-                    _ = self.stats.transfers_received[target_world].fetchAdd(1, .monotonic);
+                    self.stats.incrementTransfersReceived(target_world, 1);
                     return transfer;
                 }
             }
@@ -264,7 +445,7 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
                 const queue = &self.queues[src][target_world];
                 const remaining = out.len - count;
                 const batch_count = queue.popBatch(out[count..][0..remaining]);
-                _ = self.stats.transfers_received[target_world].fetchAdd(batch_count, .monotonic);
+                self.stats.incrementTransfersReceived(target_world, batch_count);
                 count += batch_count;
             }
 
@@ -315,7 +496,13 @@ pub fn WorldCoordinator(comptime cfg: WorldConfig, comptime world_count: u8) typ
 
         /// Tick counter increment (for external tracking).
         pub fn recordTick(self: *Self) void {
-            _ = self.stats.ticks.fetchAdd(1, .monotonic);
+            self.stats.incrementTicks();
+        }
+
+        /// Get atomic statistics snapshot (consistent multi-field read).
+        /// Returns null if unable to get consistent read (very rare).
+        pub fn getAtomicStats(self: *const Self) ?CoordinatorStatsSnapshot {
+            return self.stats.getAtomicSnapshot();
         }
 
         /// Create a transfer packet initialized for source→target.
@@ -717,4 +904,196 @@ test "WorldCoordinator: bidirectional transfers" {
 
     const recv2 = coord.popTransferFor(2).?;
     try std.testing.expectEqual(@as(u32, 300), recv2.unpackComponent(Data).?.id);
+}
+
+// ============================================================================
+// Seqlock Tests (Task: Atomic Statistics Snapshot H1)
+// ============================================================================
+
+test "Seqlock: basic version counting" {
+    // Test that begin/end write properly updates version.
+    var lock = Seqlock{};
+
+    // Initial version is 0 (even = stable)
+    try std.testing.expectEqual(@as(u32, 0), lock.readVersion());
+    try std.testing.expect(!Seqlock.isWriteInProgress(lock.readVersion()));
+
+    // Begin write: version becomes 1 (odd = write in progress)
+    lock.beginWrite();
+    try std.testing.expectEqual(@as(u32, 1), lock.readVersion());
+    try std.testing.expect(Seqlock.isWriteInProgress(lock.readVersion()));
+
+    // End write: version becomes 2 (even = stable)
+    lock.endWrite();
+    try std.testing.expectEqual(@as(u32, 2), lock.readVersion());
+    try std.testing.expect(!Seqlock.isWriteInProgress(lock.readVersion()));
+
+    // Multiple write cycles increment correctly
+    lock.beginWrite();
+    lock.endWrite();
+    try std.testing.expectEqual(@as(u32, 4), lock.readVersion());
+
+    lock.beginWrite();
+    lock.endWrite();
+    try std.testing.expectEqual(@as(u32, 6), lock.readVersion());
+}
+
+test "Seqlock: validateSnapshot success case" {
+    // Test that validateSnapshot succeeds when version unchanged.
+    var lock = Seqlock{};
+
+    const start_version = lock.readVersion();
+    try std.testing.expect(lock.validateSnapshot(start_version));
+
+    // Still valid if no writes occurred
+    try std.testing.expect(lock.validateSnapshot(start_version));
+}
+
+test "Seqlock: validateSnapshot fails on odd version" {
+    // Test that validateSnapshot fails if started during write.
+    var lock = Seqlock{};
+
+    lock.beginWrite();
+    const odd_version = lock.readVersion();
+    // Odd version should fail validation
+    try std.testing.expect(!lock.validateSnapshot(odd_version));
+    lock.endWrite();
+}
+
+test "Seqlock: validateSnapshot fails on version change" {
+    // Test that validateSnapshot fails if version changed.
+    var lock = Seqlock{};
+
+    const start_version = lock.readVersion();
+    try std.testing.expectEqual(@as(u32, 0), start_version);
+
+    // Simulate a write cycle
+    lock.beginWrite();
+    lock.endWrite();
+
+    // Version is now 2, so validating version 0 should fail
+    try std.testing.expect(!lock.validateSnapshot(start_version));
+}
+
+test "CoordinatorStats: atomic snapshot succeeds single-threaded" {
+    // In single-threaded case, atomic snapshot should always succeed.
+    var stats = CoordinatorStats.init();
+
+    // Initial state: all zeros
+    const snapshot = stats.getAtomicSnapshot().?;
+    try std.testing.expectEqual(@as(u64, 0), snapshot.ticks);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.queue_full_count);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.total_tick_time_ns);
+    for (0..8) |i| {
+        try std.testing.expectEqual(@as(u64, 0), snapshot.transfers_sent[i]);
+        try std.testing.expectEqual(@as(u64, 0), snapshot.transfers_received[i]);
+    }
+
+    // Update some stats
+    stats.incrementTicks();
+    stats.incrementTicks();
+    stats.incrementTransfersSent(0);
+    stats.incrementTransfersReceived(1, 5);
+    stats.incrementQueueFull();
+    stats.addTickTime(1000);
+
+    // Atomic snapshot should reflect all updates
+    const updated = stats.getAtomicSnapshot().?;
+    try std.testing.expectEqual(@as(u64, 2), updated.ticks);
+    try std.testing.expectEqual(@as(u64, 1), updated.transfers_sent[0]);
+    try std.testing.expectEqual(@as(u64, 5), updated.transfers_received[1]);
+    try std.testing.expectEqual(@as(u64, 1), updated.queue_full_count);
+    try std.testing.expectEqual(@as(u64, 1000), updated.total_tick_time_ns);
+}
+
+test "CoordinatorStats: reset uses seqlock" {
+    // Test that reset properly uses seqlock protection.
+    var stats = CoordinatorStats.init();
+
+    // Add some values
+    stats.incrementTicks();
+    stats.incrementTransfersSent(0);
+    stats.incrementQueueFull();
+
+    // Reset should clear all values atomically
+    stats.reset();
+
+    // Atomic snapshot should see all zeros
+    const snapshot = stats.getAtomicSnapshot().?;
+    try std.testing.expectEqual(@as(u64, 0), snapshot.ticks);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.transfers_sent[0]);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.queue_full_count);
+}
+
+test "CoordinatorStats: legacy snapshot still works" {
+    // Test that non-atomic snapshot API still works for compatibility.
+    var stats = CoordinatorStats.init();
+
+    stats.incrementTicks();
+    stats.incrementTransfersSent(2);
+
+    // Legacy snapshot should return values (though not atomically)
+    const snap = stats.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), snap.ticks);
+    try std.testing.expectEqual(@as(u64, 1), snap.transfers_sent[2]);
+}
+
+test "WorldCoordinator: getAtomicStats returns consistent snapshot" {
+    // Test the coordinator-level atomic stats getter.
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{} },
+        .coordination = .{
+            .transfer_queue = .{ .capacity = 64 },
+        },
+    };
+
+    const Coordinator = WorldCoordinator(cfg, 2);
+    var coord = Coordinator.init(std.testing.allocator);
+    defer coord.deinit();
+
+    // Initial atomic stats should be all zeros
+    const initial = coord.getAtomicStats().?;
+    try std.testing.expectEqual(@as(u64, 0), initial.ticks);
+    try std.testing.expectEqual(@as(u64, 0), initial.transfers_sent[0]);
+
+    // Update stats through coordinator operations
+    coord.recordTick();
+    const transfer = Coordinator.createTransfer(0, 1);
+    _ = coord.queueTransfer(0, 1, transfer);
+    _ = coord.popTransferFor(1);
+
+    // Atomic stats should reflect all changes
+    const updated = coord.getAtomicStats().?;
+    try std.testing.expectEqual(@as(u64, 1), updated.ticks);
+    try std.testing.expectEqual(@as(u64, 1), updated.transfers_sent[0]);
+    try std.testing.expectEqual(@as(u64, 1), updated.transfers_received[1]);
+}
+
+test "WorldCoordinator: atomic vs legacy stats comparison" {
+    // Both getStats (legacy) and getAtomicStats should return same values in single-threaded case.
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{} },
+        .coordination = .{
+            .transfer_queue = .{ .capacity = 64 },
+        },
+    };
+
+    const Coordinator = WorldCoordinator(cfg, 2);
+    var coord = Coordinator.init(std.testing.allocator);
+    defer coord.deinit();
+
+    // Perform some operations
+    for (0..5) |_| {
+        coord.recordTick();
+        const transfer = Coordinator.createTransfer(0, 1);
+        _ = coord.queueTransfer(0, 1, transfer);
+    }
+
+    // Both methods should return identical values
+    const legacy = coord.getStats();
+    const atomic = coord.getAtomicStats().?;
+
+    try std.testing.expectEqual(legacy.ticks, atomic.ticks);
+    try std.testing.expectEqual(legacy.transfers_sent[0], atomic.transfers_sent[0]);
+    try std.testing.expectEqual(legacy.queue_full_count, atomic.queue_full_count);
 }

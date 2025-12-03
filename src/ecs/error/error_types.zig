@@ -172,6 +172,9 @@ pub fn AggregateErrorsType(comptime max_errors: u16) type {
 
         /// Number of errors collected.
         count: u32 = 0,
+        /// Number of errors dropped due to capacity overflow.
+        /// Tiger Style: Track overflow to prevent silent error loss.
+        overflow_count: u32 = 0,
         /// Array of error entries (up to max_errors).
         errors: [max_errors]ErrorEntry = undefined,
 
@@ -185,7 +188,10 @@ pub fn AggregateErrorsType(comptime max_errors: u16) type {
             return .{};
         }
 
-        pub fn add(self: *Self, err: FrameError, system_index: u16, timestamp_ns: u64) void {
+        /// Add an error to the aggregate collection.
+        /// Returns true if error was stored, false if dropped due to capacity.
+        /// Tiger Style: Never silently drop errors - overflow is tracked and queryable.
+        pub fn add(self: *Self, err: FrameError, system_index: u16, timestamp_ns: u64) bool {
             if (self.count < max_errors) {
                 self.errors[self.count] = .{
                     .error_value = err,
@@ -193,7 +199,10 @@ pub fn AggregateErrorsType(comptime max_errors: u16) type {
                     .timestamp_ns = timestamp_ns,
                 };
                 self.count += 1;
+                return true;
             }
+            self.overflow_count += 1;
+            return false;
         }
 
         pub fn first(self: Self) ?FrameError {
@@ -210,6 +219,22 @@ pub fn AggregateErrorsType(comptime max_errors: u16) type {
         /// Check if error buffer is full.
         pub fn isFull(self: *const Self) bool {
             return self.count >= max_errors;
+        }
+
+        /// Check if any errors were dropped due to capacity overflow.
+        /// Tiger Style: Explicit overflow detection prevents silent error loss.
+        pub fn hasOverflow(self: *const Self) bool {
+            return self.overflow_count > 0;
+        }
+
+        /// Get the number of errors dropped due to capacity overflow.
+        pub fn getOverflowCount(self: *const Self) u32 {
+            return self.overflow_count;
+        }
+
+        /// Get total errors encountered (stored + dropped).
+        pub fn totalErrorCount(self: *const Self) u32 {
+            return self.count + self.overflow_count;
         }
     };
 }
@@ -286,18 +311,60 @@ test "ErrorCategory encoding" {
 test "AggregateErrors" {
     var agg = AggregateErrors.init();
     try std.testing.expectEqual(@as(u32, 0), agg.count);
+    try std.testing.expectEqual(@as(u32, 0), agg.overflow_count);
     try std.testing.expectEqual(@as(?FrameError, null), agg.first());
+    try std.testing.expect(!agg.hasOverflow());
 
-    agg.add(FrameError.SystemError, 0, 1000);
-    agg.add(FrameError.SystemTimeout, 1, 2000);
+    // Add returns true when error stored successfully
+    try std.testing.expect(agg.add(FrameError.SystemError, 0, 1000));
+    try std.testing.expect(agg.add(FrameError.SystemTimeout, 1, 2000));
 
     try std.testing.expectEqual(@as(u32, 2), agg.count);
     try std.testing.expectEqual(FrameError.SystemError, agg.first().?);
+    try std.testing.expect(!agg.hasOverflow());
+    try std.testing.expectEqual(@as(u32, 2), agg.totalErrorCount());
 
     const entries = agg.slice();
     try std.testing.expectEqual(@as(usize, 2), entries.len);
     try std.testing.expectEqual(@as(u16, 0), entries[0].system_index);
     try std.testing.expectEqual(@as(u16, 1), entries[1].system_index);
+}
+
+test "AggregateErrors overflow tracking" {
+    // Use small capacity for overflow testing
+    const SmallAggregateErrors = AggregateErrorsType(2);
+
+    var agg = SmallAggregateErrors.init();
+
+    // Fill to capacity
+    try std.testing.expect(agg.add(FrameError.SystemError, 0, 1000));
+    try std.testing.expect(agg.add(FrameError.SystemTimeout, 1, 2000));
+
+    try std.testing.expectEqual(@as(u32, 2), agg.count);
+    try std.testing.expect(agg.isFull());
+    try std.testing.expect(!agg.hasOverflow());
+    try std.testing.expectEqual(@as(u32, 0), agg.getOverflowCount());
+    try std.testing.expectEqual(@as(u32, 2), agg.totalErrorCount());
+
+    // Attempt to add when full - should return false and track overflow
+    try std.testing.expect(!agg.add(FrameError.SystemPanic, 2, 3000));
+    try std.testing.expectEqual(@as(u32, 2), agg.count); // Count unchanged
+    try std.testing.expect(agg.hasOverflow());
+    try std.testing.expectEqual(@as(u32, 1), agg.getOverflowCount());
+    try std.testing.expectEqual(@as(u32, 3), agg.totalErrorCount());
+
+    // Add more errors when full
+    try std.testing.expect(!agg.add(FrameError.QueryError, 3, 4000));
+    try std.testing.expect(!agg.add(FrameError.FrameCancelled, 4, 5000));
+    try std.testing.expectEqual(@as(u32, 2), agg.count); // Still only 2 stored
+    try std.testing.expectEqual(@as(u32, 3), agg.getOverflowCount()); // 3 dropped
+    try std.testing.expectEqual(@as(u32, 5), agg.totalErrorCount()); // 2 stored + 3 dropped
+
+    // Verify stored errors are preserved (first 2)
+    const entries = agg.slice();
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(FrameError.SystemError, entries[0].error_value);
+    try std.testing.expectEqual(FrameError.SystemTimeout, entries[1].error_value);
 }
 
 test "FrameResult" {

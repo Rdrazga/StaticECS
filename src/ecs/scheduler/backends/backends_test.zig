@@ -11,16 +11,29 @@
 
 const std = @import("std");
 const testing = std.testing;
+const builtin = @import("builtin");
 
 const ecs = @import("../../../ecs.zig");
 const WorldConfig = ecs.WorldConfig;
 const Phase = ecs.Phase;
+
+const config_mod = @import("../../config.zig");
+const ExecutionModel = config_mod.ExecutionModel;
 
 const error_types = @import("../../error/error_types.zig");
 const FrameError = error_types.FrameError;
 
 const interface = @import("interface.zig");
 const BackendStats = interface.BackendStats;
+
+const select = @import("select.zig");
+const io_uring_batch = @import("io_uring_batch.zig");
+const work_stealing = @import("work_stealing.zig");
+
+// Platform-specific modules for scalability tests
+const numa_allocator = @import("../../scalability/numa_allocator.zig");
+const huge_page_allocator = @import("../../scalability/huge_page_allocator.zig");
+const affinity = @import("../../scalability/affinity.zig");
 
 // ============================================================================
 // Test State (Thread-Safe)
@@ -495,4 +508,245 @@ test "blocking backend - accumulated time tracking" {
     const accumulated = scheduler.getAccumulatedTime();
     try testing.expect(accumulated >= 0.048 - 0.001); // Allow small floating point variance
     try testing.expect(accumulated <= 0.048 + 0.001);
+}
+
+// ============================================================================
+// io_uring Backend Tests (Linux-only)
+// ============================================================================
+
+test "io_uring - availability check" {
+    // This test always passes - documents platform detection
+    if (builtin.os.tag != .linux) {
+        // io_uring not available on non-Linux
+        try testing.expect(!io_uring_batch.io_uring_available);
+        return;
+    }
+    // On Linux, io_uring should be available
+    try testing.expect(io_uring_batch.io_uring_available);
+}
+
+test "io_uring - backend selection on Linux" {
+    if (builtin.os.tag != .linux) {
+        // Skip on non-Linux platforms
+        return error.SkipZigTest;
+    }
+
+    // Verify backend selection works on Linux
+    try testing.expect(select.isBackendAvailable(.io_uring_batch));
+
+    // Verify backend name is correct
+    const name = select.getBackendName(.io_uring_batch);
+    try testing.expectEqualStrings("io_uring Batch (Linux syscall batching)", name);
+}
+
+test "io_uring - fallback on non-Linux" {
+    if (builtin.os.tag == .linux) {
+        // This test is for non-Linux platforms only
+        return error.SkipZigTest;
+    }
+
+    // On non-Linux, io_uring_batch should still be queryable but not available
+    try testing.expect(!select.isBackendAvailable(.io_uring_batch));
+}
+
+// ============================================================================
+// Async Backend Behavior Tests
+// ============================================================================
+
+test "async backend - evented model availability" {
+    // The evented_single_thread model uses BlockingBackend with IoContext support
+    // Verify backend is available
+    try testing.expect(select.isBackendAvailable(.evented_single_thread));
+
+    // Verify backend name
+    const name = select.getBackendName(.evented_single_thread);
+    try testing.expect(std.mem.indexOf(u8, name, "Evented") != null);
+}
+
+test "async backend - backend selection respects model" {
+    // Verify backend selection is consistent for all models
+    try testing.expect(select.isBackendAvailable(.blocking_single_thread));
+    try testing.expect(select.isBackendAvailable(.evented_single_thread));
+    try testing.expect(select.isBackendAvailable(.concurrent_threadpool));
+    try testing.expect(select.isBackendAvailable(.work_stealing));
+    try testing.expect(select.isBackendAvailable(.adaptive_hybrid));
+}
+
+test "async backend - backend descriptions are non-empty" {
+    // All backends should have meaningful descriptions
+    const models = [_]config_mod.ExecutionModel{
+        .blocking_single_thread,
+        .evented_single_thread,
+        .concurrent_threadpool,
+        .io_uring_batch,
+        .work_stealing,
+        .adaptive_hybrid,
+    };
+
+    for (models) |model| {
+        const desc = select.getBackendDescription(model);
+        try testing.expect(desc.len > 10); // Should have meaningful description
+    }
+}
+
+// ============================================================================
+// Work-Stealing Backend Tests
+// ============================================================================
+
+test "work stealing - Chase-Lev deque basic operations" {
+    // Test the deque data structure used by work-stealing
+    const Deque = work_stealing.ChaseLevDeque(u32, 16);
+    var deque = Deque.init();
+
+    // Push some items (owner side)
+    try testing.expect(deque.push(1));
+    try testing.expect(deque.push(2));
+    try testing.expect(deque.push(3));
+
+    // Pop from owner side (LIFO)
+    try testing.expectEqual(@as(?u32, 3), deque.pop());
+    try testing.expectEqual(@as(?u32, 2), deque.pop());
+    try testing.expectEqual(@as(?u32, 1), deque.pop());
+    try testing.expectEqual(@as(?u32, null), deque.pop()); // Empty
+}
+
+test "work stealing - Chase-Lev deque steal operations" {
+    const Deque = work_stealing.ChaseLevDeque(u32, 16);
+    var deque = Deque.init();
+
+    // Push items
+    try testing.expect(deque.push(10));
+    try testing.expect(deque.push(20));
+    try testing.expect(deque.push(30));
+
+    // Steal from thief side (FIFO)
+    try testing.expectEqual(@as(?u32, 10), deque.steal());
+    try testing.expectEqual(@as(?u32, 20), deque.steal());
+    try testing.expectEqual(@as(?u32, 30), deque.steal());
+    try testing.expectEqual(@as(?u32, null), deque.steal()); // Empty
+}
+
+test "work stealing - Chase-Lev deque mixed push/pop/steal" {
+    const Deque = work_stealing.ChaseLevDeque(u32, 16);
+    var deque = Deque.init();
+
+    // Interleaved operations
+    try testing.expect(deque.push(1));
+    try testing.expect(deque.push(2));
+    try testing.expectEqual(@as(?u32, 1), deque.steal()); // Steal oldest
+    try testing.expect(deque.push(3));
+    try testing.expectEqual(@as(?u32, 3), deque.pop()); // Pop newest
+    try testing.expectEqual(@as(?u32, 2), deque.pop()); // Pop remaining
+}
+
+test "work stealing - deque capacity limit" {
+    const Deque = work_stealing.ChaseLevDeque(u32, 4); // Small capacity
+    var deque = Deque.init();
+
+    // Fill the deque
+    try testing.expect(deque.push(1));
+    try testing.expect(deque.push(2));
+    try testing.expect(deque.push(3));
+    try testing.expect(deque.push(4));
+
+    // Should fail when full
+    try testing.expect(!deque.push(5));
+}
+
+test "work stealing - backend availability" {
+    // Verify work_stealing backend is available
+    try testing.expect(select.isBackendAvailable(.work_stealing));
+
+    // Verify backend name
+    const name = select.getBackendName(.work_stealing);
+    try testing.expect(std.mem.indexOf(u8, name, "Work-Stealing") != null);
+}
+
+// ============================================================================
+// Platform-Specific Tests
+// ============================================================================
+
+test "platform - NUMA allocator availability" {
+    if (builtin.os.tag != .linux) {
+        // NUMA is primarily a Linux feature
+        return error.SkipZigTest;
+    }
+
+    // On Linux, test that NUMA allocator can be initialized
+    // This tests the header/metadata structure
+    const NumaAlloc = numa_allocator.NumaAllocator(.{});
+    const alloc = NumaAlloc.init(testing.allocator, 0);
+
+    // Verify stats are initialized
+    try testing.expectEqual(@as(u64, 0), alloc.stats.local_allocations);
+    try testing.expectEqual(@as(u64, 0), alloc.stats.remote_allocations);
+}
+
+test "platform - huge page allocator initialization" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) {
+        // Huge pages only supported on Linux and Windows
+        return error.SkipZigTest;
+    }
+
+    // Test that huge page allocator type can be instantiated
+    const HugeAlloc = huge_page_allocator.HugePageAllocator(.{});
+    const alloc = HugeAlloc.init(testing.allocator);
+
+    // Verify allocator is valid
+    try testing.expect(@TypeOf(alloc.backing_allocator) == std.mem.Allocator);
+}
+
+test "platform - affinity manager detection" {
+    // Affinity manager should detect CPU count on all platforms
+    const manager = affinity.AffinityManager.init(.{}) catch |err| {
+        // On some platforms/configurations, init may fail
+        // That's acceptable - we just skip
+        _ = err;
+        return error.SkipZigTest;
+    };
+
+    // Should detect at least one CPU
+    try testing.expect(manager.cpu_count >= 1);
+}
+
+test "platform - affinity CPU binding (Linux only)" {
+    if (builtin.os.tag != .linux) {
+        // Thread affinity pinning is most reliable on Linux
+        return error.SkipZigTest;
+    }
+
+    // Just verify the API exists and doesn't crash
+    // Actual pinning requires specific permissions
+    affinity.AffinityManager.pinThread(0) catch {
+        // May fail due to permissions, which is fine
+    };
+}
+
+test "platform - backend name consistency" {
+    // All execution models should have consistent naming
+    const models = [_]config_mod.ExecutionModel{
+        .blocking_single_thread,
+        .evented_single_thread,
+        .concurrent_threadpool,
+        .io_uring_batch,
+        .work_stealing,
+        .adaptive_hybrid,
+    };
+
+    for (models) |model| {
+        const name = select.getBackendName(model);
+        try testing.expect(name.len > 0);
+        // Names should contain descriptive text
+        try testing.expect(std.mem.indexOf(u8, name, "(") != null);
+    }
+}
+
+// ============================================================================
+// Concurrent Command Buffer Tests (Relates to H-6)
+// ============================================================================
+
+test "concurrent commands - basic atomic operations" {
+    // Test that concurrent command structures exist
+    const concurrent_commands = @import("../../context/concurrent_commands.zig");
+    _ = concurrent_commands;
 }

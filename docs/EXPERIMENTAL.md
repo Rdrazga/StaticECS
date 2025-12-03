@@ -4,6 +4,27 @@ These features are not production-ready. They may change significantly or be rem
 
 Use experimental features at your own risk. APIs may change without notice.
 
+## Recently Promoted to Production Ready
+
+The following features were previously experimental but are now considered production ready:
+
+| Feature | Track | Status |
+|---------|-------|--------|
+| **Adaptive Hybrid Backend** | Track B.1 | ✅ Production Ready |
+| **io_uring Batch Backend** | Track B.1 | ✅ Production Ready (Linux) |
+| **Work-Stealing Scheduler** | Track A | ✅ Production Ready |
+| **AddComponent/RemoveComponent Commands** | Track A | ✅ Production Ready |
+| **Comprehensive Validation** | Track A | ✅ Production Ready |
+| **Benchmark Suite** | Track D | ✅ Production Ready |
+
+### What Changed
+
+- **Track A Fixes**: Command buffer archetype transitions, entity validation, config validation
+- **Track B.1**: io_uring backend improvements, adaptive backend metrics and switching logic
+- **Track C**: TigerStyle compliance throughout codebase
+- **Track D**: Full benchmark suite with stats, baselines, memory/cache analysis
+- **Track E**: Comprehensive test coverage for all major subsystems
+
 ---
 
 ## GPU Compute Executor
@@ -207,14 +228,27 @@ Currently useful for:
 
 ---
 
+---
+
+## Remaining Experimental Features Summary
+
+| Feature | Status | Blocker |
+|---------|--------|---------|
+| GPU Compute Executor | ⛔ Placeholder | No GPU backend |
+| External Thread Pool | ⚠️ Incomplete | No task execution |
+| Batch Worker Pool | ⚠️ Limited | No SIMD intrinsics |
+| Cluster Coordination | ⚠️ Framework | No network transport |
+
 ## Contributing to Experimental Features
 
 If you're interested in helping implement these features:
 
-1. Check [docs/plans/07-placeholder-features.md](plans/07-placeholder-features.md) for detailed implementation plans
-2. Open an issue to discuss your approach before starting
-3. Keep experimental APIs behind feature flags when possible
-4. Add comprehensive tests before promoting to stable
+1. Check [docs/plans/experimental-features/](plans/experimental-features/) for detailed TRIZ analyses
+2. Review [docs/plans/00-MASTER-ROADMAP.md](plans/00-MASTER-ROADMAP.md) for prioritization
+3. Open an issue to discuss your approach before starting
+4. Keep experimental APIs behind feature flags when possible
+5. Add comprehensive tests before promoting to stable
+6. Follow TigerStyle guidelines (see codebase style)
 
 ## Reporting Issues
 
@@ -223,3 +257,4 @@ When reporting issues with experimental features:
 1. Clearly state you're using an experimental feature
 2. Include the exact error messages
 3. Note that behavior may be intentionally limited
+4. Check if the limitation is documented above

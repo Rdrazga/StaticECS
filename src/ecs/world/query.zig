@@ -2,12 +2,80 @@
 //!
 //! This module provides compile-time query definitions and runtime iterators
 //! for efficiently accessing entities matching specific component patterns.
+//!
+//! ## Complexity Notes (QR-3)
+//!
+//! The `matchesArchetype` function uses nested inline loops to compare query
+//! component requirements against archetype component sets. This results in
+//! O(n²) complexity where n = max(query_components, archetype_components).
+//!
+//! For typical ECS configurations (n < 20 components per archetype), this
+//! comptime cost is acceptable and produces optimal runtime code. However,
+//! archetypes with very large component counts (20+) may see increased
+//! compile times. This is a deliberate tradeoff favoring runtime performance
+//! over compilation speed.
+//!
+//! Tiger Style: Comptime O(n²) acceptable for typical archetype sizes (n < 20).
 
 const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
 const entity = @import("entity.zig");
 const EntityId = entity.EntityId;
 const EntityHandle = entity.EntityHandle;
 const archetype_table = @import("archetype_table.zig");
+
+// ============================================================================
+// Type Diagnostic Helpers (QR-2: Better diagnostics for missing types)
+// ============================================================================
+
+/// Build a comma-separated string of type names for error messages.
+/// Returns "(none)" if the list is empty.
+/// Tiger Style: Pure comptime function for diagnostic messages.
+fn typeListStr(comptime types: []const type) []const u8 {
+    if (types.len == 0) return "(none)";
+
+    comptime {
+        var result: []const u8 = "";
+        for (types, 0..) |T, i| {
+            if (i > 0) result = result ++ ", ";
+            result = result ++ @typeName(T);
+        }
+        return result;
+    }
+}
+
+/// Diagnostic information for query type errors.
+/// Provides context about which types are available in each category.
+pub const QueryDiagnostics = struct {
+    read_types: []const u8,
+    write_types: []const u8,
+    optional_types: []const u8,
+    exclude_types: []const u8,
+    all_required: []const u8,
+};
+
+/// Build diagnostics struct for a query specification.
+/// Used to generate helpful compile-time error messages.
+fn buildQueryDiagnostics(
+    comptime read_types: []const type,
+    comptime write_types: []const type,
+    comptime exclude_types: []const type,
+    comptime optional_types: []const type,
+    comptime all_components: []const type,
+) QueryDiagnostics {
+    return .{
+        .read_types = typeListStr(read_types),
+        .write_types = typeListStr(write_types),
+        .optional_types = typeListStr(optional_types),
+        .exclude_types = typeListStr(exclude_types),
+        .all_required = typeListStr(all_components),
+    };
+}
+
+// ============================================================================
+// Query Specification
+// ============================================================================
 
 /// Query specification defining which components to match.
 /// - read_types: Required read-only components
@@ -70,6 +138,14 @@ pub fn QuerySpec(
         /// Check if an archetype's component set matches this query.
         /// Requires all read/write components, rejects excluded components.
         /// Optional components do not affect matching.
+        ///
+        /// ## Complexity (QR-3)
+        ///
+        /// This function has O(n*m) comptime complexity where n = required components
+        /// and m = archetype components. For typical configurations (n, m < 20),
+        /// this produces fast comptime evaluation and optimal runtime code (static
+        /// branching eliminated). The tradeoff is acceptable compile time for
+        /// guaranteed zero-cost runtime matching.
         pub fn matchesArchetype(comptime arch_components: []const type) bool {
             // Check all required components are present
             inline for (all_components) |required| {
@@ -110,7 +186,10 @@ pub fn QueryResult(comptime Spec: type) type {
     return struct {
         const Self = @This();
 
-        entity_id: EntityId,
+        /// Entity identifier for this result.
+        /// Defaults to EntityId.INVALID to prevent confusion with valid entity 0.
+        /// Tiger Style: Explicit invalid state prevents subtle bugs from uninitialized QueryResults.
+        entity_id: EntityId = EntityId.INVALID,
 
         /// Read-only component pointers (required) - stored as tuple
         read: ReadPointers,
@@ -121,12 +200,40 @@ pub fn QueryResult(comptime Spec: type) type {
         /// Optional component pointers (may be null if not present in archetype) - stored as tuple
         optional: OptionalPointers,
 
-        /// Find index of type T in types array at comptime
-        fn findTypeIndex(comptime types: []const type, comptime T: type) comptime_int {
+        /// Check if this QueryResult contains a valid entity.
+        /// Returns false if entity_id is INVALID (default state).
+        /// Tiger Style: Explicit validity check for fail-fast error detection.
+        pub fn isValid(self: *const Self) bool {
+            return self.entity_id.isValid();
+        }
+
+        /// QR-2: Enhanced diagnostics struct for this query specification.
+        /// Provides detailed information about available component types.
+        pub const diagnostics: QueryDiagnostics = buildQueryDiagnostics(
+            Spec.read_components,
+            Spec.write_components,
+            Spec.exclude_components,
+            Spec.optional_components,
+            &Spec.all_components,
+        );
+
+        /// Find index of type T in a types array at comptime.
+        /// Provides detailed error diagnostics if type is not found.
+        /// Tiger Style: Exhaustive error messages with available alternatives.
+        fn findTypeIndex(comptime types: []const type, comptime T: type, comptime category: []const u8) comptime_int {
             for (types, 0..) |t, i| {
                 if (t == T) return i;
             }
-            @compileError("Type " ++ @typeName(T) ++ " not found in query components");
+            // QR-2: Enhanced compile-time error with full context
+            @compileError(
+                "Query component type '" ++ @typeName(T) ++ "' not found in " ++ category ++ " components.\n" ++
+                    "  Available " ++ category ++ " types: " ++ typeListStr(types) ++ "\n" ++
+                    "  All query components: read=[" ++ diagnostics.read_types ++ "], " ++
+                    "write=[" ++ diagnostics.write_types ++ "], " ++
+                    "optional=[" ++ diagnostics.optional_types ++ "]\n" ++
+                    "  Hint: Ensure the type is in the correct category (read vs write vs optional).\n" ++
+                    "  Hint: Check for typos in the type name or missing imports.",
+            );
         }
 
         /// Tuple of const pointers to read components
@@ -166,20 +273,23 @@ pub fn QueryResult(comptime Spec: type) type {
             });
 
         /// Get a read-only component pointer by type.
+        /// Compile error with diagnostics if T is not in read_components.
         pub fn getRead(self: *const Self, comptime T: type) *const T {
-            const idx = comptime findTypeIndex(Spec.read_components, T);
+            const idx = comptime findTypeIndex(Spec.read_components, T, "read");
             return self.read[idx];
         }
 
         /// Get a mutable component pointer by type.
+        /// Compile error with diagnostics if T is not in write_components.
         pub fn getWrite(self: *Self, comptime T: type) *T {
-            const idx = comptime findTypeIndex(Spec.write_components, T);
+            const idx = comptime findTypeIndex(Spec.write_components, T, "write");
             return self.write[idx];
         }
 
         /// Get an optional component pointer by type. Returns null if component not present.
+        /// Compile error with diagnostics if T is not in optional_components.
         pub fn getOptional(self: *const Self, comptime T: type) ?*const T {
-            const idx = comptime findTypeIndex(Spec.optional_components, T);
+            const idx = comptime findTypeIndex(Spec.optional_components, T, "optional");
             return self.optional[idx];
         }
 
@@ -231,14 +341,29 @@ pub fn ArchetypeQueryIterator(comptime Spec: type, comptime Table: type) type {
         }
 
         pub fn next(self: *Self) ?Result {
+            // Pre-condition: Capture initial row for invariant check
+            const initial_row = self.current_row;
+
+            // Pre-condition: Query state valid - table must have valid length
+            // Why: Ensures iterator operates on properly initialized table
+            assert(self.table.len() <= self.table.capacity());
+
             if (self.current_row >= self.table.len()) {
                 return null;
             }
+
+            // Pre-condition: Iterator not exhausted (row within bounds)
+            // Why: Prevents out-of-bounds access on table storage
+            assert(self.current_row < self.table.len());
 
             var result: Result = undefined;
 
             // Get entity ID - invariant: valid rows always have entity IDs
             result.entity_id = self.table.getEntityId(self.current_row) orelse unreachable;
+
+            // Post-condition: Entity returned is alive/valid
+            // Why: Prevents returning stale or invalid entity references
+            assert(result.entity_id.isValid());
 
             // Get read component pointers using tuple indexing
             // Invariant: query only iterates archetypes containing required components
@@ -254,6 +379,11 @@ pub fn ArchetypeQueryIterator(comptime Spec: type, comptime Table: type) type {
                 result.write[i] = ptr orelse unreachable;
             }
 
+            // Post-condition: Returned components match query filter
+            // Why: The orelse unreachable above enforces non-null; pointers are
+            // guaranteed valid at this point. Required components are verified
+            // at iterator construction via archetype matching.
+
             // Get optional component pointers (null if not in this archetype)
             inline for (Spec.optional_components, 0..) |T, i| {
                 if (Spec.archetypeHasOptional(archetype_components, T)) {
@@ -264,6 +394,11 @@ pub fn ArchetypeQueryIterator(comptime Spec: type, comptime Table: type) type {
             }
 
             self.current_row += 1;
+
+            // Invariant: Iteration index properly advanced by exactly 1
+            // Why: Ensures forward progress and prevents infinite loops
+            assert(self.current_row == initial_row + 1);
+
             return result;
         }
 
@@ -320,36 +455,69 @@ pub fn MultiArchetypeQueryIterator(
             break :blk availability;
         };
 
+        /// Fetch result for a specific archetype/row combination.
+        /// Tiger Style: Extracted helper to keep next() under 70 lines.
+        /// Returns null if row is out of bounds for the table.
+        fn fetchResultForArchetype(self: *Self, comptime arch_idx: usize) ?Result {
+            const table_ptr = self.tables[arch_idx];
+            const table_len = table_ptr.len();
+
+            // Pre-condition: Table state valid
+            assert(table_len <= table_ptr.capacity());
+
+            if (self.current_row >= table_len) return null;
+
+            // Pre-condition: Row within bounds
+            assert(self.current_row < table_len);
+
+            var result: Result = undefined;
+            result.entity_id = table_ptr.getEntityId(self.current_row).?;
+
+            // Post-condition: Entity returned is alive/valid
+            assert(result.entity_id.isValid());
+
+            // Get required component pointers
+            inline for (Spec.read_components, 0..) |T, ri| {
+                result.read[ri] = table_ptr.getComponentConst(T, self.current_row).?;
+            }
+            inline for (Spec.write_components, 0..) |T, wi| {
+                result.write[wi] = table_ptr.getComponent(T, self.current_row).?;
+            }
+
+            // Post-condition: Returned components match query filter
+            // Why: The .? above enforces non-null; pointers are guaranteed valid.
+            // Required components are verified at iterator construction via matching.
+
+            // Get optional component pointers
+            inline for (Spec.optional_components, 0..) |T, j| {
+                result.optional[j] = if (OptionalAvailability[arch_idx][j])
+                    table_ptr.getComponentConst(T, self.current_row)
+                else
+                    null;
+            }
+
+            return result;
+        }
+
         pub fn next(self: *Self) ?Result {
+            // Pre-condition: Query state valid - archetype index in valid range
+            // Why: Ensures we don't access out-of-bounds table pointers
+            assert(self.current_archetype <= matching_indices.len);
+
             while (self.current_archetype < matching_indices.len) {
+                const initial_row = self.current_row;
+                const initial_archetype = self.current_archetype;
+
                 // Inline switch over archetype index for type-safe table access
                 inline for (0..matching_indices.len) |i| {
                     if (self.current_archetype == i) {
-                        const table_ptr = self.tables[i];
-                        const table_len = table_ptr.len();
-
-                        if (self.current_row < table_len) {
-                            var result: Result = undefined;
-                            result.entity_id = table_ptr.getEntityId(self.current_row).?;
-
-                            // Get required component pointers using tuple indexing
-                            inline for (Spec.read_components, 0..) |T, ri| {
-                                result.read[ri] = table_ptr.getComponentConst(T, self.current_row).?;
-                            }
-                            inline for (Spec.write_components, 0..) |T, wi| {
-                                result.write[wi] = table_ptr.getComponent(T, self.current_row).?;
-                            }
-
-                            // Get optional component pointers using tuple indexing
-                            inline for (Spec.optional_components, 0..) |T, j| {
-                                if (OptionalAvailability[i][j]) {
-                                    result.optional[j] = table_ptr.getComponentConst(T, self.current_row);
-                                } else {
-                                    result.optional[j] = null;
-                                }
-                            }
-
+                        if (self.fetchResultForArchetype(i)) |result| {
                             self.current_row += 1;
+
+                            // Invariant: Iteration index properly advanced
+                            assert(self.current_row == initial_row + 1);
+                            assert(self.current_archetype == initial_archetype);
+
                             return result;
                         }
                     }
@@ -358,6 +526,10 @@ pub fn MultiArchetypeQueryIterator(
                 // Move to next archetype
                 self.current_archetype += 1;
                 self.current_row = 0;
+
+                // Invariant: Archetype transition resets row to 0
+                assert(self.current_row == 0);
+                assert(self.current_archetype == initial_archetype + 1);
             }
 
             return null;
@@ -551,4 +723,147 @@ test "ArchetypeQueryIterator with optional - absent" {
     // Optional Velocity should be null (not in this archetype)
     try std.testing.expect(result.getOptional(Velocity) == null);
     try std.testing.expect(!result.hasOptional(Velocity));
+}
+
+test "QueryResult default entity_id is invalid" {
+    // QR-1: Test that default-initialized QueryResult has invalid entity
+    // Tiger Style: Explicit invalid state prevents confusion with valid entity 0/0
+    const Position = struct { x: f32, y: f32 };
+
+    const Q = Query(.{
+        .read = &.{Position},
+    });
+
+    // Default initialization should produce invalid entity
+    // Only entity_id has a default; read/write/optional must be provided
+    const Result = QueryResult(Q);
+    var default_result: Result = .{
+        .read = .{undefined},
+        .write = .{},
+        .optional = .{},
+    };
+
+    // Default entity_id should be INVALID (not 0/0 which could be valid)
+    try std.testing.expect(!default_result.isValid());
+    try std.testing.expect(!default_result.entity_id.isValid());
+    try std.testing.expectEqual(EntityId.INVALID, default_result.entity_id);
+
+    // Verify INVALID is different from entity 0
+    const entity_zero = EntityId.init(0, 0);
+    try std.testing.expect(entity_zero.isValid());
+    try std.testing.expect(default_result.entity_id.index != entity_zero.index or
+        default_result.entity_id.generation != entity_zero.generation);
+}
+
+test "QueryResult from iteration is valid" {
+    // Verify that QueryResults from actual iteration have valid entity IDs
+    const Position = struct { x: f32, y: f32 };
+
+    const Table = archetype_table.ArchetypeTable(&.{Position}, .dynamic, 0);
+    var table = Table.init(std.testing.allocator, "test");
+    defer table.deinit();
+
+    // Add entity at index 0
+    _ = try table.addEntity(EntityId.init(0, 0), .{
+        Position{ .x = 1.0, .y = 2.0 },
+    });
+
+    const Q = Query(.{
+        .read = &.{Position},
+    });
+
+    const Iterator = ArchetypeQueryIterator(Q, Table);
+    var iter = Iterator.init(&table);
+
+    const result = iter.next().?;
+
+    // Entity from iteration should be valid (entity 0/0 IS valid)
+    try std.testing.expect(result.isValid());
+    try std.testing.expect(result.entity_id.isValid());
+    try std.testing.expectEqual(@as(u20, 0), result.entity_id.index);
+    try std.testing.expectEqual(@as(u12, 0), result.entity_id.generation);
+}
+
+test "QR-2: QueryResult diagnostics are accessible" {
+    // QR-2: Test that diagnostics struct provides helpful type information
+    // These diagnostics are used in compile-time error messages for missing types
+    const Position = struct { x: f32, y: f32 };
+    const Velocity = struct { dx: f32, dy: f32 };
+    const Health = struct { hp: i32 };
+    const Static = struct {};
+
+    const Q = Query(.{
+        .read = &.{Position},
+        .write = &.{Velocity},
+        .optional = &.{Health},
+        .exclude = &.{Static},
+    });
+
+    const Result = QueryResult(Q);
+
+    // Verify diagnostics struct is populated with type information
+    // These strings are used in compile-time error messages
+    try std.testing.expect(Result.diagnostics.read_types.len > 0);
+    try std.testing.expect(Result.diagnostics.write_types.len > 0);
+    try std.testing.expect(Result.diagnostics.optional_types.len > 0);
+    try std.testing.expect(Result.diagnostics.exclude_types.len > 0);
+
+    // Verify the type names contain expected substrings
+    try std.testing.expect(std.mem.indexOf(u8, Result.diagnostics.read_types, "Position") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Result.diagnostics.write_types, "Velocity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Result.diagnostics.optional_types, "Health") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Result.diagnostics.exclude_types, "Static") != null);
+}
+
+test "QR-2: typeListStr empty list returns (none)" {
+    // Test the helper function for building type list strings
+    // Note: typeListStr is comptime-only, so we test via comptime assertions
+
+    // Comptime verification: empty list should return "(none)"
+    comptime {
+        const empty_list = typeListStr(&.{});
+        if (!std.mem.eql(u8, empty_list, "(none)")) {
+            @compileError("Expected '(none)' for empty type list");
+        }
+    }
+
+    // Test passes if comptime check succeeds
+    try std.testing.expect(true);
+}
+
+test "QR-2: typeListStr single type has content" {
+    const Position = struct { x: f32, y: f32 };
+
+    // Single type should produce non-empty, non-(none) string
+    comptime {
+        const single_list = typeListStr(&.{Position});
+        if (single_list.len == 0) {
+            @compileError("Expected non-empty string for single type");
+        }
+        if (std.mem.eql(u8, single_list, "(none)")) {
+            @compileError("Expected non-(none) string for single type");
+        }
+    }
+
+    try std.testing.expect(true);
+}
+
+test "QR-2: typeListStr multiple types has content" {
+    const Position = struct { x: f32, y: f32 };
+    const Velocity = struct { dx: f32, dy: f32 };
+
+    // Multiple types should produce non-empty string
+    comptime {
+        const multi_list = typeListStr(&.{ Position, Velocity });
+        if (multi_list.len == 0) {
+            @compileError("Expected non-empty string for multiple types");
+        }
+        // With two types, the string should be longer than a single type
+        const single_list = typeListStr(&.{Position});
+        if (multi_list.len <= single_list.len) {
+            @compileError("Expected multi_list to be longer than single_list");
+        }
+    }
+
+    try std.testing.expect(true);
 }

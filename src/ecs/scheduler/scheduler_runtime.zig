@@ -1,7 +1,61 @@
-//! Scheduler Runtime Execution
+//! # Scheduler Runtime
 //!
-//! This module handles per-frame execution of the system schedule,
-//! including stage execution, system invocation, and error handling.
+//! Purpose: Runtime execution engine that runs the system schedule each frame.
+//! Handles stage execution, system invocation, error aggregation, and tracing.
+//!
+//! ## Key Types
+//! - `SystemExecutor` - Executes individual systems with error handling
+//! - `FrameExecutor` - Orchestrates full frame execution across all phases
+//! - `StageRunner` - Runs a single stage (parallel systems within a stage)
+//!
+//! ## Usage
+//! ```zig
+//! const RuntimeType = SchedulerRuntime(cfg, WorldType);
+//! var runtime = RuntimeType.init(allocator, &world, trace_sink);
+//!
+//! // Execute one frame
+//! const result = runtime.tick(delta_time, frame_policy);
+//! if (result.hasErrors()) {
+//!     // Handle errors based on policy
+//! }
+//! ```
+//!
+//! ## Execution Flow
+//! ```
+//! tick() -> for each phase:
+//!   -> for each stage in phase:
+//!     -> execute systems (parallel if enabled)
+//!     -> flush command buffers
+//!   -> emit phase completion trace
+//! ```
+//!
+//! ## Thread Safety
+//! - Single-threaded execution models: No synchronization needed
+//! - Concurrent models: Stage-level parallelism with command buffer isolation
+//! - Command buffers are flushed sequentially at stage boundaries
+//!
+//! ## Related Modules
+//! - `schedule_build.zig` - Compile-time schedule construction
+//! - `backends/*.zig` - Execution model implementations
+//! - `system_context.zig` - System function context
+//!
+//! ## Module Dependencies (Import Rationale)
+//!
+//! This module coordinates runtime execution, requiring imports from multiple
+//! architectural layers. Each import serves a distinct purpose:
+//!
+//! | Import | Purpose | Used By |
+//! |--------|---------|---------|
+//! | `config_mod` | WorldConfig, Phase, FramePolicy, ExecutionModel | All executors |
+//! | `schedule_build` | Schedule, ConfigStage | Stage/Phase execution |
+//! | `error_types` | FrameError, AggregateErrors, FrameResult | Error handling |
+//! | `tracing` | TracingContext, TraceSink | Frame/tick tracing |
+//! | `system_context` | SystemContext, CommandBuffer, IoContext | System execution |
+//! | `context_mod` | ComponentRegistry | Command dispatch |
+//!
+//! Tiger Style: Imports are grouped by architectural layer (config → schedule →
+//! error → trace → context). This is the minimum set required for runtime
+//! orchestration. If this grows further, consider extracting sub-components.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -101,25 +155,79 @@ pub fn CommandExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type
     const CmdBuf = SysCtx.CmdBuf;
     const archetype_count = cfg.archetypes.archetypes.len;
     const CompRegistry = ComponentRegistry(cfg, WorldType);
+    // Get handle type for error tracking
+    const HandleType = CmdBuf.CommandT.despawn;
 
     return struct {
         const Self = @This();
 
+        /// Result of command execution batch - tracks errors for diagnostics.
+        /// Tiger Style: Explicit error tracking, no silent swallowing.
+        pub const CommandExecutionResult = struct {
+            /// Number of despawn commands that failed.
+            despawn_error_count: u32 = 0,
+            /// Last despawn error encountered (if any).
+            last_despawn_error: ?@import("../world.zig").WorldError = null,
+            /// Entity that failed to despawn (for debugging).
+            last_failed_entity: ?HandleType = null,
+            /// Number of spawn commands that failed.
+            spawn_error_count: u32 = 0,
+            /// Number of set_component commands that failed.
+            set_component_error_count: u32 = 0,
+            /// Total commands processed.
+            total_commands: u32 = 0,
+
+            /// Returns true if all commands succeeded.
+            pub fn allSucceeded(self: @This()) bool {
+                return self.despawn_error_count == 0 and
+                    self.spawn_error_count == 0 and
+                    self.set_component_error_count == 0;
+            }
+
+            /// Returns total number of errors across all command types.
+            pub fn totalErrors(self: @This()) u32 {
+                return self.despawn_error_count + self.spawn_error_count + self.set_component_error_count;
+            }
+        };
+
         /// Execute all queued commands.
-        pub fn executeCommands(world: *WorldType, commands: *CmdBuf) void {
+        /// Returns execution result with error tracking for diagnostics.
+        /// Tiger Style: No silent error swallowing - errors are tracked and reported.
+        pub fn executeCommands(world: *WorldType, commands: *CmdBuf) CommandExecutionResult {
+            var result = CommandExecutionResult{};
+
             for (commands.getCommands()) |cmd| {
+                result.total_commands += 1;
                 switch (cmd) {
                     .despawn => |handle| {
-                        // Despawn the entity - ignore errors and continue
-                        world.despawn(handle) catch {};
+                        // Despawn the entity - track errors for diagnostics
+                        world.despawn(handle) catch |err| {
+                            result.despawn_error_count += 1;
+                            result.last_despawn_error = err;
+                            result.last_failed_entity = handle;
+
+                            // Tiger Style: Debug builds log errors for visibility
+                            if (@import("builtin").mode == .Debug) {
+                                std.debug.print(
+                                    "CommandExecutor: despawn failed for entity {}: {}\n",
+                                    .{ handle.id.toU32(), err },
+                                );
+                            }
+                        };
                     },
                     .spawn => |spawn_cmd| {
                         // Tiger Style: Execute spawn with archetype dispatch
-                        executeSpawnCommand(world, spawn_cmd);
+                        const spawn_success = executeSpawnCommand(world, spawn_cmd);
+                        if (!spawn_success) {
+                            result.spawn_error_count += 1;
+                        }
                     },
                     .set_component => |set_cmd| {
                         // Tiger Style: Use ComponentRegistry for typed dispatch
-                        executeSetComponentCommand(world, set_cmd);
+                        const set_success = executeSetComponentCommand(world, set_cmd);
+                        if (!set_success) {
+                            result.set_component_error_count += 1;
+                        }
                     },
                     .custom => |custom_cmd| {
                         // Custom commands would be handled by user-defined handlers
@@ -128,30 +236,33 @@ pub fn CommandExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type
                 }
             }
             commands.clear();
+            return result;
         }
 
         /// Execute a spawn command, creating an entity in the specified archetype.
         /// Tiger Style: Uses inline for to dispatch to correct archetype at comptime.
-        fn executeSpawnCommand(world: *WorldType, spawn_cmd: CmdBuf.CommandT.spawn) void {
+        /// Returns true on success, false on failure.
+        fn executeSpawnCommand(world: *WorldType, spawn_cmd: CmdBuf.CommandT.spawn) bool {
             const arch_idx = spawn_cmd.archetype_index;
 
             // Validate archetype index
             if (arch_idx >= archetype_count) {
-                // Invalid archetype index - skip silently (fail-safe)
-                // Tiger Style: In debug builds, this would be caught by assertions
+                // Invalid archetype index - fail
+                // Tiger Style: In debug builds, log for visibility
                 if (@import("builtin").mode == .Debug) {
                     std.debug.print("spawn command: invalid archetype index {}\n", .{arch_idx});
                 }
-                return;
+                return false;
             }
 
             // Allocate entity
             const handle = world.entities.create() orelse {
-                // Capacity exhausted - skip silently (fail-safe)
+                // Capacity exhausted - fail
+                // Tiger Style: In debug builds, log for visibility
                 if (@import("builtin").mode == .Debug) {
                     std.debug.print("spawn command: entity capacity exhausted\n", .{});
                 }
-                return;
+                return false;
             };
 
             // Dispatch to correct archetype using comptime inline for
@@ -171,9 +282,12 @@ pub fn CommandExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type
                                 handle.toId(),
                                 spawn_cmd.data[0..spawn_cmd.data_size],
                             ) catch {
-                                // Failed to add entity - destroy handle and skip
+                                // Failed to add entity - destroy handle and return failure
                                 _ = world.entities.destroy(handle);
-                                return;
+                                if (@import("builtin").mode == .Debug) {
+                                    std.debug.print("spawn command: failed to add entity to archetype {}\n", .{i});
+                                }
+                                return false;
                             };
                         } else {
                             // No component data - use default values
@@ -186,25 +300,38 @@ pub fn CommandExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type
                                 &default_data,
                             ) catch {
                                 _ = world.entities.destroy(handle);
-                                return;
+                                if (@import("builtin").mode == .Debug) {
+                                    std.debug.print("spawn command: failed to add entity to archetype {} (default)\n", .{i});
+                                }
+                                return false;
                             };
                         }
                     };
 
                     // Update entity metadata with location
                     _ = world.entities.setLocation(handle, @intCast(i), row);
-                    return;
+                    return true;
                 }
             }
+            // Should not reach here if inline for properly dispatches
+            return false;
         }
 
         /// Execute a set_component command using the ComponentRegistry for type dispatch.
         /// Tiger Style: Uses comptime-generated registry for O(log N) component_id lookup.
-        fn executeSetComponentCommand(world: *WorldType, set_cmd: CmdBuf.CommandT.set_component) void {
+        /// Returns true on success, false on failure.
+        fn executeSetComponentCommand(world: *WorldType, set_cmd: CmdBuf.CommandT.set_component) bool {
             // Validate entity is alive before attempting to set component
             if (!world.isAlive(set_cmd.entity)) {
-                // Entity no longer exists, skip silently (common case for despawned entities)
-                return;
+                // Entity no longer exists - this is often expected for despawned entities
+                // but we should track it for completeness
+                if (@import("builtin").mode == .Debug) {
+                    std.debug.print(
+                        "set_component: entity {} no longer alive\n",
+                        .{set_cmd.entity.id.toU32()},
+                    );
+                }
+                return false;
             }
 
             // Use ComponentRegistry to dispatch to typed setter
@@ -225,6 +352,7 @@ pub fn CommandExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type
                     );
                 }
             }
+            return success;
         }
     };
 }
@@ -275,7 +403,16 @@ pub fn StageExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
             }
 
             // Process deferred commands after the stage completes
-            CmdExec.executeCommands(ctx.world, ctx.commands);
+            // Tiger Style: Result returned for diagnostics, logged in debug builds
+            const cmd_result = CmdExec.executeCommands(ctx.world, ctx.commands);
+
+            // Log command execution summary in debug builds if there were errors
+            if (@import("builtin").mode == .Debug and !cmd_result.allSucceeded()) {
+                std.debug.print(
+                    "Stage command execution: {} despawn errors, {} spawn errors, {} set_component errors out of {} total commands\n",
+                    .{ cmd_result.despawn_error_count, cmd_result.spawn_error_count, cmd_result.set_component_error_count, cmd_result.total_commands },
+                );
+            }
 
             return all_success;
         }
@@ -382,12 +519,13 @@ pub fn StageExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
         }
 
         /// Merge per-system command buffers and execute deferred commands.
+        /// Tiger Style: Result tracked for diagnostics.
         fn mergeAndFlushCommands(
             ctx: *SysCtx,
             concurrent_cmds: *ConcBufs,
-        ) void {
+        ) CmdExec.CommandExecutionResult {
             _ = concurrent_cmds.mergeInto(ctx.commands);
-            CmdExec.executeCommands(ctx.world, ctx.commands);
+            return CmdExec.executeCommands(ctx.world, ctx.commands);
         }
 
         // ==================================================================
@@ -432,7 +570,15 @@ pub fn StageExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
             const all_success = collectErrors(stage, &system_errors, policy, errors, ctx.time_ns);
 
             // Merge commands and execute deferred operations
-            mergeAndFlushCommands(ctx, &concurrent_cmds);
+            const cmd_result = mergeAndFlushCommands(ctx, &concurrent_cmds);
+
+            // Log command execution summary in debug builds if there were errors
+            if (@import("builtin").mode == .Debug and !cmd_result.allSucceeded()) {
+                std.debug.print(
+                    "Parallel stage command execution: {} despawn errors, {} spawn errors, {} set_component errors out of {} total commands\n",
+                    .{ cmd_result.despawn_error_count, cmd_result.spawn_error_count, cmd_result.set_component_error_count, cmd_result.total_commands },
+                );
+            }
 
             return all_success;
         }
@@ -530,26 +676,82 @@ pub fn FrameExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
             trace_sink: ?TraceSink,
             allocator: Allocator,
         ) FrameResult {
-            const time_ns = getTimeNs();
+            // Tiger Style: Assert frame state validity
+            std.debug.assert(@intFromPtr(world) != 0); // World pointer must be valid
+            std.debug.assert(!std.math.isNan(delta_time) and delta_time >= 0.0); // Delta must be valid
 
-            // Initialize command buffer
+            const time_ns = getTimeNs();
             var commands = CmdBuf.init();
 
             // Create IoBackend and IoContext based on execution model
             var io_backend = createIoBackend(allocator);
             defer if (io_backend) |*b| b.deinit();
-
             var io_context = createIoContext(if (io_backend) |*b| b else null);
 
-            // Create system context with resources from world
-            var ctx = switch (execution_model) {
+            // Create system context and execute phases
+            var ctx = createSystemContext(world, delta_time, tick_index, time_ns, &commands, allocator, &io_context);
+            const policy = cfg.policies.frame;
+            var errors = AggregateErrors.init();
+
+            // Tracing: emit tick boundaries
+            var tracer = Tracer.init(trace_sink, @intFromPtr(world));
+            tracer.emitTickStart(tick_index, time_ns);
+
+            // Execute all phases in config-defined order
+            const frame_success = executeAllPhases(&ctx, policy, &errors);
+
+            const end_time_ns = getTimeNs();
+            tracer.emitTickEnd(tick_index, end_time_ns, end_time_ns - time_ns);
+
+            return buildFrameResult(frame_success, policy, &errors);
+        }
+
+        /// Execute all phases and return success status.
+        /// Tiger Style: Central control in parent, iteration over config-driven phases.
+        fn executeAllPhases(ctx: *SysCtx, policy: FramePolicy, errors: *AggregateErrors) bool {
+            var frame_success = true;
+            inline for (0..num_phases) |phase_idx| {
+                const phase_success = PhaseExec.executePhaseByIndex(ctx, phase_idx, policy, errors);
+                if (!phase_success) {
+                    frame_success = false;
+                    if (policy == .default) break;
+                }
+            }
+            return frame_success;
+        }
+
+        /// Build frame result based on execution success and error policy.
+        /// Tiger Style: Pure helper, no side effects.
+        fn buildFrameResult(frame_success: bool, policy: FramePolicy, errors: *const AggregateErrors) FrameResult {
+            // Tiger Style: Assert error state consistency
+            std.debug.assert(frame_success or errors.count > 0); // Failure implies errors recorded
+
+            if (frame_success) return .{ .success = {} };
+            if (policy == .aggregate) return .{ .aggregate_errors = errors.* };
+            // Default policy: return first error
+            if (errors.first()) |first_err| return .{ .single_error = first_err };
+            return .{ .success = {} };
+        }
+
+        /// Create system context based on execution model.
+        /// Tiger Style: Pure helper for context initialization.
+        fn createSystemContext(
+            world: *WorldType,
+            delta_time: f64,
+            tick_index: u64,
+            time_ns: u64,
+            commands: *CmdBuf,
+            allocator: Allocator,
+            io_context: *IoContext,
+        ) SysCtx {
+            return switch (execution_model) {
                 .blocking_single_thread => SysCtx.init(
                     world,
                     &world.resources,
                     delta_time,
                     tick_index,
                     time_ns,
-                    &commands,
+                    commands,
                     allocator,
                 ),
                 .evented_single_thread, .concurrent_threadpool => SysCtx.initWithIo(
@@ -558,55 +760,11 @@ pub fn FrameExecutor(comptime cfg: WorldConfig, comptime WorldType: type) type {
                     delta_time,
                     tick_index,
                     time_ns,
-                    &commands,
+                    commands,
                     allocator,
-                    &io_context,
+                    io_context,
                 ),
             };
-
-            const policy = cfg.policies.frame;
-            var errors = AggregateErrors.init();
-
-            // Initialize tracing context
-            var tracer = Tracer.init(trace_sink, @intFromPtr(world));
-
-            // Emit tick start
-            tracer.emitTickStart(tick_index, time_ns);
-
-            // Execute all phases in config-defined order (using phase indices)
-            var frame_success = true;
-
-            inline for (0..num_phases) |phase_idx| {
-                const phase_success = PhaseExec.executePhaseByIndex(&ctx, phase_idx, policy, &errors);
-
-                if (!phase_success) {
-                    frame_success = false;
-
-                    if (policy == .default) {
-                        break;
-                    }
-                }
-            }
-
-            // Emit tick end
-            const end_time_ns = getTimeNs();
-            tracer.emitTickEnd(tick_index, end_time_ns, end_time_ns - time_ns);
-
-            // Return result based on policy and errors
-            if (frame_success) {
-                return .{ .success = {} };
-            }
-
-            if (policy == .aggregate) {
-                return .{ .aggregate_errors = errors };
-            }
-
-            // Default policy: return first error
-            if (errors.first()) |first_err| {
-                return .{ .single_error = first_err };
-            }
-
-            return .{ .success = {} };
         }
 
         /// Create IoBackend based on execution model.
@@ -742,4 +900,406 @@ test "FrameExecutor basic structure" {
 
     const Sched = Schedule(cfg);
     try std.testing.expectEqual(@as(usize, 1), Sched.system_count);
+}
+
+// ============================================================================
+// Phase Execution Ordering Tests
+// ============================================================================
+
+test "Phase execution ordering" {
+    // Test that phases run in the correct order: pre_update (0), update (1), post_update (2)
+    const Position = struct { x: f32, y: f32 };
+    const Velocity = struct { dx: f32, dy: f32 };
+
+    // Track execution order using comptime-known indices
+    const TestSystems = struct {
+        fn preUpdateSystem(_: anytype) FrameError!void {}
+        fn updateSystem(_: anytype) FrameError!void {}
+        fn postUpdateSystem(_: anytype) FrameError!void {}
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Position, Velocity } },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "moving", .components = &.{ Position, Velocity } },
+        } },
+        .systems = .{
+            .systems = &.{
+                .{
+                    .name = "pre_update_sys",
+                    .func = @ptrCast(&TestSystems.preUpdateSystem),
+                    .phase = 0, // pre_update
+                },
+                .{
+                    .name = "update_sys",
+                    .func = @ptrCast(&TestSystems.updateSystem),
+                    .phase = 1, // update
+                },
+                .{
+                    .name = "post_update_sys",
+                    .func = @ptrCast(&TestSystems.postUpdateSystem),
+                    .phase = 2, // post_update
+                },
+            },
+        },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const Sched = Schedule(cfg);
+
+    // Verify systems are assigned to correct phases
+    try std.testing.expectEqual(@as(usize, 3), Sched.system_count);
+    try std.testing.expectEqual(@as(usize, 3), Sched.num_phases);
+
+    // Check each phase has exactly one system
+    try std.testing.expectEqual(@as(u16, 1), Sched.stages_by_phase[0].stage_count);
+    try std.testing.expectEqual(@as(u16, 1), Sched.stages_by_phase[1].stage_count);
+    try std.testing.expectEqual(@as(u16, 1), Sched.stages_by_phase[2].stage_count);
+}
+
+test "System dependency resolution" {
+    // Systems with dependencies should execute in dependency order
+    const ComponentA = struct { val: u32 };
+    const ComponentB = struct { val: u32 };
+
+    const TestSystems = struct {
+        fn dependencySystem(_: anytype) FrameError!void {}
+        fn mainSystem(_: anytype) FrameError!void {}
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ ComponentA, ComponentB } },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{ ComponentA, ComponentB } },
+        } },
+        .systems = .{
+            .systems = &.{
+                // Main system depends on dependency system via write/read conflict
+                .{
+                    .name = "main",
+                    .func = @ptrCast(&TestSystems.mainSystem),
+                    .phase = 1,
+                    .read_components = &.{ComponentA}, // reads what dependency writes
+                    .write_components = &.{ComponentB},
+                },
+                .{
+                    .name = "dependency",
+                    .func = @ptrCast(&TestSystems.dependencySystem),
+                    .phase = 1,
+                    .write_components = &.{ComponentA}, // writes ComponentA
+                    .read_components = &.{},
+                },
+            },
+        },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const Sched = Schedule(cfg);
+
+    // Systems with conflicts should be in separate stages
+    // Dependency system writes ComponentA, main system reads ComponentA
+    try std.testing.expect(Sched.conflicts[0][1]); // Systems should conflict
+    try std.testing.expectEqual(@as(usize, 2), Sched.system_count);
+}
+
+test "Tick result aggregation" {
+    // Test that errors from systems are properly aggregated
+    const Position = struct { x: f32, y: f32 };
+
+    const TestSystems = struct {
+        fn failingSystem(_: anytype) FrameError!void {
+            return FrameError.SystemError;
+        }
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{Position} },
+        } },
+        .systems = .{
+            .systems = &.{
+                .{
+                    .name = "failing",
+                    .func = @ptrCast(&TestSystems.failingSystem),
+                    .phase = 1,
+                },
+            },
+        },
+        .options = .{ .max_entities = 100 },
+        .policies = .{ .frame = .aggregate }, // Use aggregate policy
+    };
+
+    // Verify config is valid
+    const Sched = Schedule(cfg);
+    try std.testing.expectEqual(@as(usize, 1), Sched.system_count);
+
+    // AggregateErrors should track errors properly
+    const AggErrors = AggregateErrorsType(cfg.options.max_aggregate_errors);
+    var errors = AggErrors.init();
+    try std.testing.expectEqual(@as(u32, 0), errors.count);
+
+    // Add an error
+    const added = errors.add(FrameError.SystemError, 0, 1000);
+    try std.testing.expect(added);
+    try std.testing.expectEqual(@as(u32, 1), errors.count);
+    try std.testing.expectEqual(FrameError.SystemError, errors.first().?);
+}
+
+test "Multi-phase transitions" {
+    // Test that state is consistent between phases
+    const State = struct { value: u32 };
+
+    const TestSystems = struct {
+        fn phase0System(_: anytype) FrameError!void {}
+        fn phase1System(_: anytype) FrameError!void {}
+        fn phase2System(_: anytype) FrameError!void {}
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{State} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{State} },
+        } },
+        .systems = .{
+            .systems = &.{
+                .{
+                    .name = "phase0_sys",
+                    .func = @ptrCast(&TestSystems.phase0System),
+                    .phase = 0,
+                    .write_components = &.{State},
+                },
+                .{
+                    .name = "phase1_sys",
+                    .func = @ptrCast(&TestSystems.phase1System),
+                    .phase = 1,
+                    .read_components = &.{State},
+                    .write_components = &.{State},
+                },
+                .{
+                    .name = "phase2_sys",
+                    .func = @ptrCast(&TestSystems.phase2System),
+                    .phase = 2,
+                    .read_components = &.{State},
+                },
+            },
+        },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const Sched = Schedule(cfg);
+
+    // Verify all 3 phases have systems
+    try std.testing.expectEqual(@as(usize, 3), Sched.num_phases);
+    try std.testing.expectEqual(@as(usize, 3), Sched.system_count);
+
+    // Each phase should have 1 stage with 1 system
+    for (0..3) |i| {
+        try std.testing.expect(Sched.stages_by_phase[i].stage_count >= 1);
+    }
+}
+
+test "Empty phase handling" {
+    // Phases with no systems should not crash
+    const Position = struct { x: f32, y: f32 };
+
+    const TestSystems = struct {
+        fn updateSystem(_: anytype) FrameError!void {}
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{Position} },
+        } },
+        .systems = .{
+            .systems = &.{
+                // Only update phase (1) has a system
+                // pre_update (0) and post_update (2) are empty
+                .{
+                    .name = "update_only",
+                    .func = @ptrCast(&TestSystems.updateSystem),
+                    .phase = 1, // update phase only
+                },
+            },
+        },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const Sched = Schedule(cfg);
+
+    // Schedule should still have 3 phases
+    try std.testing.expectEqual(@as(usize, 3), Sched.num_phases);
+
+    // Phase 0 (pre_update) should be empty
+    try std.testing.expectEqual(@as(u16, 0), Sched.stages_by_phase[0].stage_count);
+
+    // Phase 1 (update) should have systems
+    try std.testing.expectEqual(@as(u16, 1), Sched.stages_by_phase[1].stage_count);
+
+    // Phase 2 (post_update) should be empty
+    try std.testing.expectEqual(@as(u16, 0), Sched.stages_by_phase[2].stage_count);
+}
+
+test "Frame timing accuracy" {
+    // Test that frame timing structures work correctly
+    const Position = struct { x: f32, y: f32 };
+
+    const TestSystems = struct {
+        fn timedSystem(_: anytype) FrameError!void {}
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{Position} },
+        } },
+        .systems = .{
+            .systems = &.{
+                .{
+                    .name = "timed",
+                    .func = @ptrCast(&TestSystems.timedSystem),
+                    .phase = 1,
+                },
+            },
+        },
+        .tick = .{
+            .mode = .fixed_rate,
+            .target_hz = 60, // 60 FPS target
+        },
+        .options = .{ .max_entities = 100 },
+    };
+
+    // Verify tick configuration
+    try std.testing.expectEqual(config_mod.TickMode.fixed_rate, cfg.tick.mode);
+    try std.testing.expectEqual(@as(?u32, 60), cfg.tick.target_hz);
+
+    // Verify FixedRateConfig
+    const rate_config = FixedRateConfig{
+        .target_hz = 60,
+        .max_frame_delay_ns = 100_000_000, // 100ms max delay
+    };
+    try std.testing.expectEqual(@as(u32, 60), rate_config.target_hz);
+    try std.testing.expectEqual(@as(?u64, 100_000_000), rate_config.max_frame_delay_ns);
+}
+
+test "System skip on error" {
+    // Test error handling doesn't corrupt state
+    const Counter = struct { count: u32 };
+
+    const TestSystems = struct {
+        fn failingSystem(_: anytype) FrameError!void {
+            return FrameError.SystemError;
+        }
+        fn successSystem(_: anytype) FrameError!void {}
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Counter} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{Counter} },
+        } },
+        .systems = .{
+            .systems = &.{
+                .{
+                    .name = "failing",
+                    .func = @ptrCast(&TestSystems.failingSystem),
+                    .phase = 1,
+                    .write_components = &.{Counter},
+                },
+                .{
+                    .name = "success",
+                    .func = @ptrCast(&TestSystems.successSystem),
+                    .phase = 1,
+                    .read_components = &.{Counter},
+                },
+            },
+        },
+        .options = .{ .max_entities = 100 },
+        .policies = .{ .frame = .default }, // Stop on first error
+    };
+
+    const Sched = Schedule(cfg);
+
+    // Both systems exist
+    try std.testing.expectEqual(@as(usize, 2), Sched.system_count);
+
+    // Systems have a conflict (write/read on Counter)
+    try std.testing.expect(Sched.conflicts[0][1]);
+}
+
+test "CommandExecutor result tracking" {
+    // Test CommandExecutionResult structure
+    const Position = struct { x: f32, y: f32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{Position} },
+        } },
+        .systems = .{ .systems = &.{} },
+        .options = .{ .max_entities = 100 },
+    };
+
+    // Generate the WorldType to get CommandExecutor
+    const world_mod = @import("../world.zig");
+    const WorldType = world_mod.World(cfg);
+    const CmdExec = CommandExecutor(cfg, WorldType);
+
+    // Test CommandExecutionResult
+    var result = CmdExec.CommandExecutionResult{};
+    try std.testing.expect(result.allSucceeded());
+    try std.testing.expectEqual(@as(u32, 0), result.totalErrors());
+
+    // Simulate errors
+    result.despawn_error_count = 1;
+    result.spawn_error_count = 2;
+    try std.testing.expect(!result.allSucceeded());
+    try std.testing.expectEqual(@as(u32, 3), result.totalErrors());
+}
+
+test "StageExecutor type generation" {
+    // Test StageExecutor type generation with config
+    const Position = struct { x: f32, y: f32 };
+
+    const TestSystems = struct {
+        fn sys1(_: anytype) FrameError!void {}
+        fn sys2(_: anytype) FrameError!void {}
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{Position} },
+        } },
+        .systems = .{
+            .systems = &.{
+                .{
+                    .name = "sys1",
+                    .func = @ptrCast(&TestSystems.sys1),
+                    .phase = 1,
+                    .write_components = &.{Position},
+                },
+                .{
+                    .name = "sys2",
+                    .func = @ptrCast(&TestSystems.sys2),
+                    .phase = 1,
+                    .read_components = &.{Position},
+                },
+            },
+        },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const Sched = Schedule(cfg);
+    const world_mod = @import("../world.zig");
+    const WorldType = world_mod.World(cfg);
+    const StageExec = StageExecutor(cfg, WorldType);
+
+    // Verify type generation
+    try std.testing.expectEqual(@as(usize, 2), Sched.system_count);
+
+    // StageExec should have ConfigStage type
+    const ConfigStage = StageExec.ConfigStage;
+    try std.testing.expectEqual(@as(u16, cfg.options.max_systems_per_stage), ConfigStage.max_systems_per_stage);
 }

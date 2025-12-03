@@ -15,7 +15,7 @@ zig-out/
 Thumbs.db
 
 # Plan documents (internal design docs)
-docs/plans/
+
 docs/code-review*
 
 # Debug files

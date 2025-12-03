@@ -39,6 +39,10 @@ pub const TickMode = core_types.TickMode;
 pub const LayoutMode = core_types.LayoutMode;
 pub const CapacityMode = core_types.CapacityMode;
 
+/// TypedContext for type-safe opaque pointer handling.
+/// See core_types.TypedContext for full documentation.
+pub const TypedContext = core_types.TypedContext;
+
 // ============================================================================
 // Policy Types (Error Handling)
 // ============================================================================
@@ -49,6 +53,8 @@ pub const InvariantPolicy = policy_types.InvariantPolicy;
 pub const InitPolicy = policy_types.InitPolicy;
 pub const FramePolicy = policy_types.FramePolicy;
 pub const RuntimePolicy = policy_types.RuntimePolicy;
+pub const GenerationWrapAction = policy_types.GenerationWrapAction;
+pub const GenerationPolicy = policy_types.GenerationPolicy;
 
 // ============================================================================
 // Tracing Types
@@ -69,6 +75,10 @@ pub const definition_types = @import("definition_types.zig");
 pub const ArchetypeDef = definition_types.ArchetypeDef;
 pub const SystemDef = definition_types.SystemDef;
 pub const asSystemFn = definition_types.asSystemFn;
+
+/// TypedFnPtr for type-safe function pointer handling.
+/// See definition_types.TypedFnPtr for full documentation.
+pub const TypedFnPtr = definition_types.TypedFnPtr;
 
 // ============================================================================
 // Spec Types (Components, Systems, Schedule)
@@ -107,6 +117,11 @@ pub const ExternalPipelineConfig = pipeline_config.ExternalPipelineConfig;
 pub const DefaultFastPathPredicate = pipeline_config.DefaultFastPathPredicate;
 pub const HybridPipelineConfig = pipeline_config.HybridPipelineConfig;
 pub const PipelineConfig = pipeline_config.PipelineConfig;
+
+// Input data mapping types (P-M3 fix)
+pub const DefaultInputDataMapper = pipeline_config.DefaultInputDataMapper;
+pub const RawInputData = pipeline_config.RawInputData;
+pub const RawInputDataMapper = pipeline_config.RawInputDataMapper;
 
 // ============================================================================
 // Scalability Configuration

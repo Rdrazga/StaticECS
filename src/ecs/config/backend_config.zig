@@ -91,3 +91,160 @@ pub const AdaptiveConfig = struct {
     /// Which backend to start with. If null, auto-detect based on platform.
     initial_backend: ?ExecutionModel = null,
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const std = @import("std");
+
+test "BackendConfig defaults - none variant" {
+    // Verify that none variant works correctly
+    const cfg = BackendConfig{ .none = {} };
+
+    // Should be the none variant
+    switch (cfg) {
+        .none => {
+            // Success - this is expected
+        },
+        else => {
+            return error.UnexpectedVariant;
+        },
+    }
+}
+
+test "BackendConfig defaults - io_uring_batch" {
+    // Verify io_uring_batch defaults are sensible
+    const cfg = BackendConfig{ .io_uring_batch = .{} };
+
+    switch (cfg) {
+        .io_uring_batch => |io_cfg| {
+            // Verify power-of-two queue sizes
+            try std.testing.expectEqual(@as(u16, 256), io_cfg.sq_entries);
+            try std.testing.expectEqual(@as(u16, 512), io_cfg.cq_entries);
+            try std.testing.expectEqual(@as(u16, 64), io_cfg.batch_size);
+
+            // Verify cq_entries is 2x sq_entries
+            try std.testing.expectEqual(io_cfg.sq_entries * 2, io_cfg.cq_entries);
+
+            // Verify kernel polling is disabled by default
+            try std.testing.expect(!io_cfg.kernel_poll);
+            try std.testing.expectEqual(@as(?u8, null), io_cfg.sq_thread_cpu);
+            try std.testing.expectEqual(@as(u32, 1000), io_cfg.sq_thread_idle_ms);
+        },
+        else => {
+            return error.UnexpectedVariant;
+        },
+    }
+}
+
+test "BackendConfig defaults - work_stealing" {
+    // Verify work_stealing defaults are sensible
+    const cfg = BackendConfig{ .work_stealing = .{} };
+
+    switch (cfg) {
+        .work_stealing => |ws_cfg| {
+            // Verify auto-detect worker count by default
+            try std.testing.expectEqual(@as(u16, 0), ws_cfg.worker_count);
+
+            // Verify power-of-two local queue size
+            try std.testing.expectEqual(@as(u16, 256), ws_cfg.local_queue_size);
+
+            // Verify reasonable steal batch size
+            try std.testing.expectEqual(@as(u8, 32), ws_cfg.steal_batch);
+
+            // Verify LIFO slot enabled by default for cache performance
+            try std.testing.expect(ws_cfg.lifo_slot);
+
+            // Verify spin count is reasonable
+            try std.testing.expectEqual(@as(u16, 100), ws_cfg.spin_count);
+        },
+        else => {
+            return error.UnexpectedVariant;
+        },
+    }
+}
+
+test "BackendConfig defaults - adaptive" {
+    // Verify adaptive backend defaults are sensible
+    const cfg = BackendConfig{ .adaptive = .{} };
+
+    switch (cfg) {
+        .adaptive => |adp_cfg| {
+            // Verify threshold for batch mode switching
+            try std.testing.expectEqual(@as(u32, 64), adp_cfg.batch_threshold);
+
+            // Verify imbalance threshold is reasonable (0.3 = 30%)
+            try std.testing.expect(adp_cfg.imbalance_threshold > 0.0);
+            try std.testing.expect(adp_cfg.imbalance_threshold < 1.0);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.3), adp_cfg.imbalance_threshold, 0.001);
+
+            // Verify measurement window is reasonable
+            try std.testing.expectEqual(@as(u32, 100), adp_cfg.window_size);
+
+            // Verify cooldown prevents oscillation
+            try std.testing.expectEqual(@as(u32, 10), adp_cfg.switch_cooldown);
+            try std.testing.expect(adp_cfg.switch_cooldown < adp_cfg.window_size);
+
+            // Verify no initial backend by default (auto-detect)
+            try std.testing.expectEqual(@as(?ExecutionModel, null), adp_cfg.initial_backend);
+        },
+        else => {
+            return error.UnexpectedVariant;
+        },
+    }
+}
+
+test "IoUringBatchConfig validation" {
+    // Test custom configuration values
+    const custom_cfg = IoUringBatchConfig{
+        .sq_entries = 512,
+        .cq_entries = 1024,
+        .batch_size = 128,
+        .kernel_poll = true,
+        .sq_thread_cpu = 3,
+        .sq_thread_idle_ms = 500,
+    };
+
+    try std.testing.expectEqual(@as(u16, 512), custom_cfg.sq_entries);
+    try std.testing.expectEqual(@as(u16, 1024), custom_cfg.cq_entries);
+    try std.testing.expectEqual(@as(u16, 128), custom_cfg.batch_size);
+    try std.testing.expect(custom_cfg.kernel_poll);
+    try std.testing.expectEqual(@as(?u8, 3), custom_cfg.sq_thread_cpu);
+    try std.testing.expectEqual(@as(u32, 500), custom_cfg.sq_thread_idle_ms);
+}
+
+test "WorkStealingConfig validation" {
+    // Test custom worker count
+    const custom_cfg = WorkStealingConfig{
+        .worker_count = 8,
+        .local_queue_size = 512,
+        .steal_batch = 64,
+        .lifo_slot = false,
+        .spin_count = 200,
+    };
+
+    try std.testing.expectEqual(@as(u16, 8), custom_cfg.worker_count);
+    try std.testing.expectEqual(@as(u16, 512), custom_cfg.local_queue_size);
+    try std.testing.expectEqual(@as(u8, 64), custom_cfg.steal_batch);
+    try std.testing.expect(!custom_cfg.lifo_slot);
+    try std.testing.expectEqual(@as(u16, 200), custom_cfg.spin_count);
+}
+
+test "AdaptiveConfig with initial backend" {
+    // Test setting initial backend
+    const blocking_cfg = AdaptiveConfig{
+        .initial_backend = .blocking_single_thread,
+    };
+    try std.testing.expectEqual(ExecutionModel.blocking_single_thread, blocking_cfg.initial_backend.?);
+
+    const evented_cfg = AdaptiveConfig{
+        .initial_backend = .evented_single_thread,
+    };
+    try std.testing.expectEqual(ExecutionModel.evented_single_thread, evented_cfg.initial_backend.?);
+
+    const concurrent_cfg = AdaptiveConfig{
+        .initial_backend = .concurrent_threadpool,
+    };
+    try std.testing.expectEqual(ExecutionModel.concurrent_threadpool, concurrent_cfg.initial_backend.?);
+}

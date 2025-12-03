@@ -253,3 +253,255 @@ pub const ScalabilityConfig = struct {
         return self.cluster.enabled;
     }
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const std = @import("std");
+
+test "ScalabilityConfig defaults - all disabled" {
+    // By default, all scalability features should be disabled
+    const cfg = ScalabilityConfig{};
+
+    try std.testing.expect(!cfg.anyEnabled());
+    try std.testing.expect(!cfg.wantsNuma());
+    try std.testing.expect(!cfg.wantsHugePages());
+    try std.testing.expect(!cfg.wantsAffinity());
+    try std.testing.expect(!cfg.wantsCluster());
+}
+
+test "ScalabilityConfig anyEnabled detection" {
+    // Test that anyEnabled correctly detects when features are enabled
+    const numa_cfg = ScalabilityConfig{
+        .numa = .{ .enabled = true },
+    };
+    try std.testing.expect(numa_cfg.anyEnabled());
+    try std.testing.expect(numa_cfg.wantsNuma());
+
+    const huge_cfg = ScalabilityConfig{
+        .huge_pages = .{ .enabled = true },
+    };
+    try std.testing.expect(huge_cfg.anyEnabled());
+    try std.testing.expect(huge_cfg.wantsHugePages());
+
+    const affinity_cfg = ScalabilityConfig{
+        .affinity = .{ .enabled = true },
+    };
+    try std.testing.expect(affinity_cfg.anyEnabled());
+    try std.testing.expect(affinity_cfg.wantsAffinity());
+
+    const cluster_cfg = ScalabilityConfig{
+        .cluster = .{ .enabled = true },
+    };
+    try std.testing.expect(cluster_cfg.anyEnabled());
+    try std.testing.expect(cluster_cfg.wantsCluster());
+}
+
+test "NumaConfig strategies" {
+    // Test different NUMA allocation strategies
+    const local_preferred = NumaConfig{
+        .enabled = true,
+        .strategy = .local_preferred,
+    };
+    try std.testing.expect(local_preferred.enabled);
+    try std.testing.expectEqual(NumaConfig.Strategy.local_preferred, local_preferred.strategy);
+
+    const local_strict = NumaConfig{
+        .enabled = true,
+        .strategy = .local_strict,
+    };
+    try std.testing.expectEqual(NumaConfig.Strategy.local_strict, local_strict.strategy);
+
+    const interleave = NumaConfig{
+        .enabled = true,
+        .strategy = .interleave,
+    };
+    try std.testing.expectEqual(NumaConfig.Strategy.interleave, interleave.strategy);
+
+    const explicit = NumaConfig{
+        .enabled = true,
+        .strategy = .explicit,
+        .node_bindings = &[_]NumaConfig.NodeBinding{
+            .{ .worker_id = 0, .node_id = 0 },
+            .{ .worker_id = 1, .node_id = 1 },
+        },
+    };
+    try std.testing.expectEqual(NumaConfig.Strategy.explicit, explicit.strategy);
+    try std.testing.expect(explicit.node_bindings != null);
+    try std.testing.expectEqual(@as(usize, 2), explicit.node_bindings.?.len);
+}
+
+test "NumaConfig interleave settings" {
+    // Test interleave configuration
+    const cfg = NumaConfig{
+        .enabled = true,
+        .strategy = .interleave,
+        .interleave = .{
+            .page_size = 2 * 1024 * 1024, // 2MB pages
+            .nodes = &[_]u8{ 0, 1, 2, 3 },
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), cfg.interleave.page_size);
+    try std.testing.expect(cfg.interleave.nodes != null);
+    try std.testing.expectEqual(@as(usize, 4), cfg.interleave.nodes.?.len);
+}
+
+test "HugePageConfig defaults" {
+    // Verify huge page defaults
+    const cfg = HugePageConfig{};
+
+    try std.testing.expect(!cfg.enabled);
+    try std.testing.expectEqual(HugePageConfig.PageSize.@"2MB", cfg.size);
+    try std.testing.expect(cfg.fallback); // Should fallback by default
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), cfg.threshold);
+}
+
+test "HugePageConfig page sizes" {
+    // Test different page size configurations
+    const cfg_2mb = HugePageConfig{
+        .enabled = true,
+        .size = .@"2MB",
+    };
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), @intFromEnum(cfg_2mb.size));
+
+    const cfg_1gb = HugePageConfig{
+        .enabled = true,
+        .size = .@"1GB",
+    };
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), @intFromEnum(cfg_1gb.size));
+}
+
+test "HugePageConfig threshold validation" {
+    // Test custom threshold
+    const cfg = HugePageConfig{
+        .enabled = true,
+        .threshold = 64 * 1024 * 1024, // 64MB threshold
+        .fallback = false,
+    };
+
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), cfg.threshold);
+    try std.testing.expect(!cfg.fallback);
+}
+
+test "AffinityConfig strategies" {
+    // Test different affinity strategies
+    const sequential = AffinityConfig{
+        .enabled = true,
+        .strategy = .sequential,
+    };
+    try std.testing.expectEqual(AffinityConfig.Strategy.sequential, sequential.strategy);
+
+    const physical_only = AffinityConfig{
+        .enabled = true,
+        .strategy = .physical_only,
+    };
+    try std.testing.expectEqual(AffinityConfig.Strategy.physical_only, physical_only.strategy);
+
+    const numa_spread = AffinityConfig{
+        .enabled = true,
+        .strategy = .numa_spread,
+    };
+    try std.testing.expectEqual(AffinityConfig.Strategy.numa_spread, numa_spread.strategy);
+
+    const explicit = AffinityConfig{
+        .enabled = true,
+        .strategy = .explicit,
+        .cpu_bindings = &[_]AffinityConfig.CpuBinding{
+            .{ .thread_id = 0, .cpu_id = 2 },
+            .{ .thread_id = 1, .cpu_id = 4 },
+        },
+    };
+    try std.testing.expectEqual(AffinityConfig.Strategy.explicit, explicit.strategy);
+    try std.testing.expect(explicit.cpu_bindings != null);
+    try std.testing.expectEqual(@as(usize, 2), explicit.cpu_bindings.?.len);
+}
+
+test "AffinityConfig prefer_physical default" {
+    // Default should prefer physical cores
+    const cfg = AffinityConfig{};
+    try std.testing.expect(cfg.prefer_physical);
+}
+
+test "ClusterConfig defaults" {
+    // Verify cluster defaults
+    const cfg = ClusterConfig{};
+
+    try std.testing.expect(!cfg.enabled);
+    try std.testing.expectEqual(@as(u16, 0), cfg.node_id);
+    try std.testing.expectEqual(@as(u16, 1), cfg.total_instances);
+    try std.testing.expectEqual(ClusterConfig.Discovery.static, cfg.discovery);
+    try std.testing.expectEqual(ClusterConfig.Transport.tcp, cfg.transport);
+    try std.testing.expectEqual(ClusterConfig.Topology.mesh, cfg.topology);
+    try std.testing.expectEqual(ClusterConfig.OwnershipStrategy.hash_based, cfg.ownership);
+    try std.testing.expectEqual(@as(u32, 1000), cfg.heartbeat_interval_ms);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.peer_timeout_ms);
+}
+
+test "ClusterConfig discovery mechanisms" {
+    // Test different discovery mechanisms
+    const static_cfg = ClusterConfig{
+        .enabled = true,
+        .discovery = .static,
+        .peers = &[_]ClusterConfig.PeerAddress{
+            .{ .host = "192.168.1.1", .port = 9000, .node_id = 1 },
+            .{ .host = "192.168.1.2", .port = 9000, .node_id = 2 },
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 2), static_cfg.peers.len);
+
+    const dns_cfg = ClusterConfig{
+        .enabled = true,
+        .discovery = .dns,
+    };
+    try std.testing.expectEqual(ClusterConfig.Discovery.dns, dns_cfg.discovery);
+
+    const multicast_cfg = ClusterConfig{
+        .enabled = true,
+        .discovery = .multicast,
+    };
+    try std.testing.expectEqual(ClusterConfig.Discovery.multicast, multicast_cfg.discovery);
+
+    const k8s_cfg = ClusterConfig{
+        .enabled = true,
+        .discovery = .kubernetes,
+    };
+    try std.testing.expectEqual(ClusterConfig.Discovery.kubernetes, k8s_cfg.discovery);
+}
+
+test "ClusterConfig transports" {
+    // Test different transport options
+    const tcp_cfg = ClusterConfig{ .transport = .tcp };
+    try std.testing.expectEqual(ClusterConfig.Transport.tcp, tcp_cfg.transport);
+
+    const udp_cfg = ClusterConfig{ .transport = .udp };
+    try std.testing.expectEqual(ClusterConfig.Transport.udp, udp_cfg.transport);
+
+    const rdma_cfg = ClusterConfig{ .transport = .rdma };
+    try std.testing.expectEqual(ClusterConfig.Transport.rdma, rdma_cfg.transport);
+}
+
+test "ClusterConfig topologies" {
+    // Test different cluster topologies
+    const mesh_cfg = ClusterConfig{ .topology = .mesh };
+    try std.testing.expectEqual(ClusterConfig.Topology.mesh, mesh_cfg.topology);
+
+    const star_cfg = ClusterConfig{ .topology = .star };
+    try std.testing.expectEqual(ClusterConfig.Topology.star, star_cfg.topology);
+
+    const ring_cfg = ClusterConfig{ .topology = .ring };
+    try std.testing.expectEqual(ClusterConfig.Topology.ring, ring_cfg.topology);
+}
+
+test "ClusterConfig ownership strategies" {
+    // Test different ownership strategies
+    const hash_cfg = ClusterConfig{ .ownership = .hash_based };
+    try std.testing.expectEqual(ClusterConfig.OwnershipStrategy.hash_based, hash_cfg.ownership);
+
+    const range_cfg = ClusterConfig{ .ownership = .range_based };
+    try std.testing.expectEqual(ClusterConfig.OwnershipStrategy.range_based, range_cfg.ownership);
+
+    const consistent_cfg = ClusterConfig{ .ownership = .consistent_hash };
+    try std.testing.expectEqual(ClusterConfig.OwnershipStrategy.consistent_hash, consistent_cfg.ownership);
+}

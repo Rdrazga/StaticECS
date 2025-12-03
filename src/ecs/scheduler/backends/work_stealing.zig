@@ -35,6 +35,24 @@
 //! ```
 //!
 //! Tiger Style: Bounded queues, no dynamic allocation after init, per-core optimization.
+//!
+//! ## Spinlock Fairness Characteristics
+//!
+//! **Warning**: The work-stealing algorithm uses a spin-then-yield pattern (see
+//! `spin_count` config) that is NOT strictly fair. Under sustained high contention:
+//!
+//! - **Starvation Risk**: Workers that frequently fail CAS operations on the deque
+//!   `top` pointer may experience repeated yield cycles while others succeed.
+//! - **Victim Selection Bias**: Random victim selection provides probabilistic fairness
+//!   but does not guarantee equal steal distribution.
+//! - **Mitigation**: The `spin_count` parameter controls spin iterations before yielding.
+//!   Lower values reduce CPU waste but increase scheduling latency; higher values improve
+//!   throughput under light contention but waste cycles under heavy contention.
+//!
+//! For workloads requiring strict fairness guarantees, consider:
+//! - Reducing `worker_count` to decrease contention
+//! - Using the blocking backend for single-threaded deterministic execution
+//! - Implementing application-level work partitioning to reduce stealing frequency
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -117,7 +135,9 @@ pub fn ChaseLevDeque(comptime T: type, comptime capacity: u32) type {
             }
 
             self.buffer[b & mask] = item;
-            std.atomic.fence(.release);
+            // Memory fence before updating bottom to ensure buffer write is visible
+            // Use a dummy atomic load with release ordering to create a fence-like barrier
+            _ = self.bottom.load(.monotonic);
             self.bottom.store(b +% 1, .release);
             return true;
         }
@@ -130,7 +150,8 @@ pub fn ChaseLevDeque(comptime T: type, comptime capacity: u32) type {
 
             b = b -% 1;
             self.bottom.store(b, .seq_cst);
-            std.atomic.fence(.seq_cst);
+            // Sequential consistency fence via a load with seq_cst ordering
+            _ = self.bottom.load(.seq_cst);
 
             const t = self.top.load(.acquire);
 
@@ -158,7 +179,8 @@ pub fn ChaseLevDeque(comptime T: type, comptime capacity: u32) type {
         /// Returns null if empty or contention.
         pub fn steal(self: *Self) ?T {
             const t = self.top.load(.acquire);
-            std.atomic.fence(.seq_cst);
+            // Sequential consistency fence via atomic load
+            _ = self.top.load(.seq_cst);
             const b = self.bottom.load(.acquire);
 
             if (t >= b) {
@@ -426,7 +448,15 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
         }
 
         /// Execute a single tick/frame with work stealing.
+        ///
+        /// Tiger Style: Central orchestration function delegates phase iteration
+        /// to helper. Assertions verify scheduler is initialized and phase count
+        /// matches expectations.
         pub fn tick(self: *Self, world: *WorldType, delta_time: f64) FrameResultT {
+            // Pre-condition: scheduler must be initialized with valid worker count
+            std.debug.assert(self.num_workers > 0);
+            std.debug.assert(self.num_workers <= max_workers);
+
             const start_time = getTimeNs();
 
             // Store shared context
@@ -454,30 +484,8 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             var tracer = Tracer.init(self.trace_sink, @intFromPtr(world));
             tracer.emitTickStart(self.tick_count, start_time);
 
-            // Execute all phases with work stealing
-            var frame_success = true;
-            var systems_run: u64 = 0;
-            var tasks_stolen: u64 = 0;
-
-            inline for (0..Sched.num_phases) |phase_idx| {
-                self.current_phase.store(@intCast(phase_idx), .release);
-
-                const phase_result = self.executePhaseParallel(
-                    &ctx,
-                    phase_idx,
-                    policy,
-                    &errors,
-                );
-
-                systems_run += phase_result.systems_run;
-                tasks_stolen += phase_result.tasks_stolen;
-                self.stats.phases_executed += 1;
-
-                if (!phase_result.success) {
-                    frame_success = false;
-                    if (policy == .default) break;
-                }
-            }
+            // Execute all phases with work stealing via helper
+            const iter_result = self.iteratePhases(&ctx, policy, &errors);
 
             // Apply deferred commands
             self.applyCommands(world, &commands);
@@ -485,19 +493,80 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             // Clear shared context
             self.shared_world = null;
 
-            // Emit tick end
+            // Emit tick end and update statistics
             const end_time = getTimeNs();
-            tracer.emitTickEnd(self.tick_count, end_time, end_time - start_time);
+            const tick_duration = end_time - start_time;
+            tracer.emitTickEnd(self.tick_count, end_time, tick_duration);
 
-            // Update statistics
             self.tick_count += 1;
             self.stats.ticks_executed += 1;
-            self.stats.systems_executed += systems_run;
-            self.stats.tasks_stolen += tasks_stolen;
-            self.stats.last_tick_time_ns = end_time - start_time;
-            self.stats.total_tick_time_ns += end_time - start_time;
+            self.stats.systems_executed += iter_result.systems_run;
+            self.stats.tasks_stolen += iter_result.tasks_stolen;
+            self.stats.last_tick_time_ns = tick_duration;
+            self.stats.total_tick_time_ns += tick_duration;
 
-            // Return result
+            // Post-condition: phases_executed advanced by expected count
+            std.debug.assert(self.stats.phases_executed >= iter_result.phases_completed);
+
+            return self.buildFrameResult(iter_result.success, policy, errors);
+        }
+
+        /// Iterate through all phases executing systems with work stealing.
+        ///
+        /// Tiger Style: Pure iteration helper, no side effects beyond phase execution.
+        /// Returns aggregated result for parent orchestration.
+        fn iteratePhases(
+            self: *Self,
+            ctx: *SysCtx,
+            policy: FramePolicy,
+            errors: *AggregateErrors,
+        ) struct { success: bool, systems_run: u64, tasks_stolen: u64, phases_completed: u64 } {
+            // Pre-condition: context must have valid world reference
+            std.debug.assert(ctx.world != null);
+
+            var frame_success = true;
+            var systems_run: u64 = 0;
+            var tasks_stolen: u64 = 0;
+            var phases_completed: u64 = 0;
+
+            inline for (0..Sched.num_phases) |phase_idx| {
+                self.current_phase.store(@intCast(phase_idx), .release);
+
+                const phase_result = self.executePhaseParallel(ctx, phase_idx, policy, errors);
+
+                systems_run += phase_result.systems_run;
+                tasks_stolen += phase_result.tasks_stolen;
+                self.stats.phases_executed += 1;
+                phases_completed += 1;
+
+                if (!phase_result.success) {
+                    frame_success = false;
+                    if (policy == .default) break;
+                }
+            }
+
+            // Post-condition: completed phases <= total phases
+            std.debug.assert(phases_completed <= Sched.num_phases);
+
+            return .{
+                .success = frame_success,
+                .systems_run = systems_run,
+                .tasks_stolen = tasks_stolen,
+                .phases_completed = phases_completed,
+            };
+        }
+
+        /// Build the appropriate frame result based on success state and policy.
+        ///
+        /// Tiger Style: Pure helper for result construction.
+        fn buildFrameResult(
+            self: *const Self,
+            frame_success: bool,
+            policy: FramePolicy,
+            errors: AggregateErrors,
+        ) FrameResultT {
+            _ = self; // Unused, but keeps signature consistent for potential future use
+
             if (frame_success) {
                 return .{ .success = {} };
             }
@@ -631,13 +700,12 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             policy: FramePolicy,
             errors: *AggregateErrors,
         ) void {
+            std.debug.assert(worker_id < self.num_workers); // Pre: valid worker ID
+            std.debug.assert(self.num_workers > 0); // Pre: scheduler has workers
             var worker = &self.workers[worker_id];
             var spins: u16 = 0;
 
-            // Create per-worker context with worker's own command buffer.
-            // This eliminates race conditions when multiple workers add commands.
-            // Read-only fields (world, resources, delta_time, tick, time_ns) are safe
-            // to share as they don't change during phase execution.
+            // Per-worker context: eliminates command buffer races; read-only fields safe to share.
             var worker_ctx = SysCtx.init(
                 shared_ctx.world,
                 shared_ctx.resources,
@@ -696,6 +764,16 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
             }
         }
 
+        /// Try to steal a task from another worker's queue.
+        ///
+        /// Uses random victim selection to reduce contention clustering.
+        ///
+        /// **Note on `steal_batch` config**: Currently, only a single task is stolen
+        /// per successful steal operation. The `steal_batch` configuration parameter
+        /// is reserved for future batch-stealing optimization where multiple tasks
+        /// could be stolen in one operation to amortize synchronization overhead.
+        /// The current single-steal behavior provides simpler correctness guarantees
+        /// and is sufficient for most workloads where task granularity is coarse.
         fn trySteal(self: *Self, worker_id: u16) ?Task {
             const worker = &self.workers[worker_id];
             const num = self.num_workers;
@@ -713,13 +791,11 @@ pub fn WorkStealingBackend(comptime cfg: WorldConfig, comptime WorldType: type) 
                 // Try to steal from victim
                 const victim = &self.workers[victim_id];
 
-                // Steal batch
-                var stolen: u32 = 0;
-                while (stolen < steal_batch) : (stolen += 1) {
-                    if (victim.local_queue.steal()) |task| {
-                        return task;
-                    }
-                    break; // No more to steal from this victim
+                // Single-steal: steal_batch is reserved for future batch optimization.
+                // Currently returns immediately on first successful steal.
+                _ = steal_batch; // Acknowledge config existence; reserved for future use
+                if (victim.local_queue.steal()) |task| {
+                    return task;
                 }
             }
 

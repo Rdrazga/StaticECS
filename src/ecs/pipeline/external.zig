@@ -1,15 +1,50 @@
-//! External Pipeline Interface
+//! # External Pipeline
 //!
-//! Provides batch import/export APIs for external entity flow management.
-//! Entities can be imported in batches, processed externally, and exported
-//! back to the ECS world.
+//! Purpose: Batch import/export APIs for external entity flow management.
+//! Enables high-throughput entity processing by bypassing per-entity overhead.
 //!
-//! ## Features
+//! ## Key Types
+//! - `ExternalPipeline` - Main pipeline type with import/export operations
+//! - `ImportBuffer` - Fixed-size buffer for batched entity creation
+//! - `ExportBuffer` - Buffer for queried entity data export
+//! - `ImportContext` - Context for processing imported entities
+//! - `ExportContext` - Context for processing exported entities
 //!
-//! - **Batch Import**: Add entities with components in bulk
-//! - **Batch Export**: Query and export entities with their data
-//! - **Zero-Copy Access**: Direct array access for high-throughput processing
-//! - **Thread-Safe Handoff**: Safe data transfer between threads
+//! ## Usage
+//! ```zig
+//! const Pipeline = ExternalPipeline(cfg);
+//! var pipeline = Pipeline.init(&world);
+//!
+//! // Import entities in batch
+//! var import_ctx = pipeline.beginImport();
+//! for (external_data) |data| {
+//!     import_ctx.addEntity("archetype", .{ .component = data });
+//! }
+//! const handles = try pipeline.commitImport(&import_ctx);
+//!
+//! // Export entities for external processing
+//! var export_ctx = pipeline.beginExport(.{ .include = &.{Position} });
+//! while (export_ctx.next()) |entity_data| {
+//!     processExternally(entity_data);
+//! }
+//! ```
+//!
+//! ## Data Flow
+//! ```
+//! External Data ──► ImportBuffer ──► World (spawn)
+//!                                        │
+//! External Sink ◄── ExportBuffer ◄───────┘ (query)
+//! ```
+//!
+//! ## Thread Safety
+//! - Import/export operations are NOT thread-safe by default
+//! - Use `operation_state` detection to catch concurrent access bugs
+//! - For multi-threaded access, use separate pipelines per thread
+//!
+//! ## Related Modules
+//! - `hybrid.zig` - Hybrid pipeline with fast-path optimization
+//! - `orchestrator.zig` - High-level pipeline orchestration
+//! - `../world.zig` - Entity storage target
 //!
 //! Tiger Style: All sizes comptime-computed from config. No dynamic allocation
 //! after initialization.
@@ -226,8 +261,29 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
         // ====================================================================
 
         /// Pipeline statistics for monitoring.
+        ///
+        /// ## Limitation (P-L1): Entity Count Accuracy
+        ///
+        /// The `entities_imported` counter only reflects entities that were
+        /// **fully successfully created** with all their components. It does NOT
+        /// include:
+        /// - Entities that failed to spawn (counted in `spawn_failures`)
+        /// - Entities that were rolled back due to component failures (counted
+        ///   in `component_failures`)
+        ///
+        /// Therefore, after an import operation:
+        /// - `entities_imported` = actual entities added to world
+        /// - `spawn_failures` + `component_failures` = entities that were attempted
+        ///   but NOT added
+        /// - Total attempted = `entities_imported + spawn_failures + component_failures`
+        ///
+        /// To verify world entity count matches expectations, compare:
+        /// `world.entityCount()` against your expected pre-import count + `entities_imported`
+        ///
+        /// Tiger Style: Explicit failure tracking prevents silent data loss.
         pub const Stats = struct {
-            /// Total entities imported via batch API.
+            /// Total entities imported via batch API (successfully created only).
+            /// See struct-level docs for accuracy limitations.
             entities_imported: u64 = 0,
             /// Total entities exported via batch API.
             entities_exported: u64 = 0,
@@ -236,8 +292,10 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
             /// Total export operations performed.
             export_operations: u64 = 0,
             /// Entities that failed during spawn (createEntity failed).
+            /// These entities were never created in the world.
             spawn_failures: u64 = 0,
             /// Entities despawned due to component set failures (transactional rollback).
+            /// These entities were created but immediately destroyed due to incomplete data.
             component_failures: u64 = 0,
         };
 
@@ -356,6 +414,88 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
             self.import_buffer.len += 1;
         }
 
+        // ====================================================================
+        // Import Helpers (TigerStyle: Pure leaf functions for entity operations)
+        // ====================================================================
+
+        /// Result of attempting to create an entity with components.
+        /// Distinguishes spawn failures from component failures for accurate tracking.
+        const EntityCreateResult = union(enum) {
+            /// Entity created successfully with all components
+            success: WorldType.WorldEntityHandle,
+            /// Entity spawn failed (createEntity error)
+            spawn_failure,
+            /// Entity created but component set failed - needs rollback
+            component_failure: WorldType.WorldEntityHandle,
+        };
+
+        /// Create an entity and set all components from an import entry.
+        /// Returns result indicating success, spawn failure, or component failure.
+        ///
+        /// Tiger Style: Pure leaf function - no control flow decisions about rollback.
+        /// Parent function decides how to handle failures.
+        fn createEntityWithComponents(self: *Self, entry: *const ImportBuffer.ImportEntry) EntityCreateResult {
+            // Tiger Style: Pre-condition - entry has at least one component
+            // (empty entries are valid but unusual, so we allow mask == 0)
+            std.debug.assert(entry.component_mask <= std.math.maxInt(ComponentMask));
+
+            // Create entity in world
+            const entity = self.world.createEntity() catch {
+                return .spawn_failure;
+            };
+
+            // Tiger Style: Post-condition - entity handle is valid after createEntity
+            std.debug.assert(self.world.entityExists(entity));
+
+            // Set all components from entry
+            var all_components_set = true;
+            inline for (0..num_components) |comp_idx| {
+                const T = component_types[comp_idx];
+                const mask = @as(ComponentMask, 1) << @intCast(comp_idx);
+                if (entry.component_mask & mask != 0) {
+                    if (entry.components.get(comp_idx)) |value| {
+                        self.world.setComponent(entity, value) catch {
+                            all_components_set = false;
+                        };
+                        _ = T; // Suppress unused variable warning
+                    }
+                }
+            }
+
+            if (!all_components_set) {
+                return .{ .component_failure = entity };
+            }
+
+            return .{ .success = entity };
+        }
+
+        /// Rollback (destroy) an entity that failed component setup.
+        /// Handles destruction errors gracefully - entity may remain in inconsistent state.
+        ///
+        /// Tiger Style: Pure leaf function - performs cleanup, returns success status.
+        /// Destruction failure is serious but we continue to prevent cascade failures.
+        fn rollbackEntity(self: *Self, entity: WorldType.WorldEntityHandle) bool {
+            // Tiger Style: Pre-condition - entity should exist for rollback
+            std.debug.assert(self.world.entityExists(entity));
+
+            const destroyed = self.world.destroyEntity(entity);
+
+            // Tiger Style: Post-condition - entity should not exist after successful destroy
+            // Note: If destroy fails, entity may still exist in inconsistent state
+            if (destroyed) |_| {
+                std.debug.assert(!self.world.entityExists(entity));
+                return true;
+            } else |_| {
+                // Destruction failed - entity exists but is incomplete
+                // This is a serious error state but we track it via return value
+                return false;
+            }
+        }
+
+        // ====================================================================
+        // Import Commit (TigerStyle: Central control flow)
+        // ====================================================================
+
         /// Commit import batch to world, creating entities.
         /// Returns a CommitResult containing created entities and failure statistics.
         ///
@@ -365,9 +505,6 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
         pub fn commitImport(self: *Self) CommitResult {
             // Tiger Style: Comptime assertion - buffers must not alias
             comptime {
-                // Verify import_result_buffer and export_buffer.entities are separate fields
-                // This is inherently true due to struct field semantics, but we assert it
-                // to document the invariant
                 const import_offset = @offsetOf(Self, "import_result_buffer");
                 const export_offset = @offsetOf(Self, "export_buffer");
                 if (import_offset == export_offset) {
@@ -375,7 +512,7 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
                 }
             }
 
-            // Tiger Style: Runtime assertion - detect concurrent operations
+            // Tiger Style: Runtime pre-condition - no concurrent operations
             std.debug.assert(self.operation_state == .none);
             self.operation_state = .importing;
             defer self.operation_state = .none;
@@ -390,56 +527,30 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
                 };
             }
 
-            // Tiger Style: Use dedicated import_result_buffer instead of aliasing export_buffer
             var created: *[batch_size]WorldType.WorldEntityHandle = &self.import_result_buffer;
             var created_count: u32 = 0;
             var spawn_failures: u32 = 0;
             var component_failures: u32 = 0;
 
+            // Process each import entry - central control flow
             for (0..count) |i| {
                 const entry = &self.import_buffer.entries[i];
+                const result = self.createEntityWithComponents(entry);
 
-                // Create entity in world
-                const entity = self.world.createEntity() catch {
-                    // Track spawn failure and continue to next entry
-                    spawn_failures += 1;
-                    continue;
-                };
-
-                // Track if any component fails to set for this entity
-                var entity_complete = true;
-
-                // Set all components from entry
-                inline for (0..num_components) |comp_idx| {
-                    const T = component_types[comp_idx];
-                    const mask = @as(ComponentMask, 1) << @intCast(comp_idx);
-                    if (entry.component_mask & mask != 0) {
-                        if (entry.components.get(comp_idx)) |value| {
-                            self.world.setComponent(entity, value) catch {
-                                // Component set failed - mark entity as incomplete
-                                entity_complete = false;
-                            };
-                            // Suppress unused variable warning
-                            _ = T;
-                        }
-                    }
+                switch (result) {
+                    .success => |entity| {
+                        created[created_count] = entity;
+                        created_count += 1;
+                    },
+                    .spawn_failure => {
+                        spawn_failures += 1;
+                    },
+                    .component_failure => |entity| {
+                        // Tiger Style: Atomic rollback on partial failure
+                        _ = self.rollbackEntity(entity);
+                        component_failures += 1;
+                    },
                 }
-
-                // Tiger Style: Transactional rollback on partial failure
-                // If any component failed to set, despawn the entity to prevent
-                // incomplete/corrupt entities from existing in the world
-                if (!entity_complete) {
-                    self.world.destroyEntity(entity) catch {
-                        // Despawn failed - entity exists but is incomplete
-                        // This is a serious error state, but we still track it
-                    };
-                    component_failures += 1;
-                    continue;
-                }
-
-                // Entity fully created with all components
-                created[created_count] = entity;
-                created_count += 1;
             }
 
             // Update stats
@@ -447,10 +558,9 @@ pub fn ExternalPipeline(comptime cfg: WorldConfig) type {
             self.stats.import_batches += 1;
             self.stats.spawn_failures += spawn_failures;
             self.stats.component_failures += component_failures;
-
             self.import_buffer.reset();
 
-            // Tiger Style: Post-condition assertion - result buffer distinct from export buffer
+            // Tiger Style: Post-condition - result buffer distinct from export buffer
             std.debug.assert(@intFromPtr(created) != @intFromPtr(&self.export_buffer.entities));
 
             return .{

@@ -120,13 +120,101 @@ pub fn PhaseStagesType(comptime max_stages: u16, comptime max_systems: u16) type
     };
 }
 
-/// Legacy type aliases for backward compatibility with default sizes.
+/// @deprecated Use `Schedule(cfg).ConfigStage` for config-aware stage types.
+///
+/// These legacy type aliases use hardcoded default sizes which may not match
+/// your WorldConfig. For new code, access stage types through the Schedule:
+///
+/// ```zig
+/// const Sched = Schedule(cfg);
+/// const MyStage = Sched.ConfigStage;           // Config-sized stage type
+/// const MyPhaseStages = Sched.ConfigPhaseStages; // Config-sized phase stages
+/// ```
+///
+/// Migration path:
+/// - Replace `schedule_build.Stage` with `Schedule(cfg).ConfigStage`
+/// - Replace `schedule_build.PhaseStages` with config-aware type from Schedule
+///
+/// These aliases will be removed in a future version.
 pub const Stage = StageType(DEFAULT_MAX_SYSTEMS_PER_STAGE);
+/// @deprecated Use `Schedule(cfg).ConfigPhaseStages` instead. See Stage for details.
 pub const PhaseStages = PhaseStagesType(DEFAULT_MAX_STAGES_PER_PHASE, DEFAULT_MAX_SYSTEMS_PER_STAGE);
+
+/// Find the earliest stage without conflicts for a system.
+/// Uses greedy graph coloring - assigns system to first stage where no conflict exists.
+/// Why: Separates stage selection logic for testability and clarity.
+/// Tiger Style: Pure helper, no side effects. Returns stage index.
+fn findBestStageForSystem(
+    comptime sys_idx: u16,
+    comptime phase_system_indices: []const u16,
+    comptime prior_count: usize,
+    comptime stage_assignments: []const u16,
+    comptime num_stages: u16,
+    comptime conflicts: anytype,
+) u16 {
+    // Assertion: system index must be within bounds of conflict matrix
+    comptime std.debug.assert(sys_idx < conflicts.len);
+    // Assertion: prior_count cannot exceed phase_system_indices length
+    comptime std.debug.assert(prior_count <= phase_system_indices.len);
+
+    // Search through existing stages plus one potential new stage
+    stage_search: for (0..num_stages + 1) |stage| {
+        // Check if any previously-assigned system in this stage conflicts
+        for (0..prior_count) |prev_pi| {
+            const prev_idx = phase_system_indices[prev_pi];
+            if (stage_assignments[prev_idx] == stage) {
+                if (conflicts[sys_idx][prev_idx]) {
+                    continue :stage_search; // Conflict found, try next stage
+                }
+            }
+        }
+        return @intCast(stage); // No conflicts in this stage
+    }
+
+    // Fallback: create new stage (shouldn't reach here with proper loop bounds)
+    return num_stages;
+}
+
+/// Build stage structures from assignments array.
+/// Why: Separates structure building from assignment logic for clarity.
+/// Tiger Style: Pure transformation, predictable output from input.
+fn buildStageStructures(
+    comptime StageT: type,
+    comptime phase_index: u8,
+    comptime phase_system_indices: []const u16,
+    comptime phase_system_count: u16,
+    comptime stage_assignments: []const u16,
+    comptime num_stages: u16,
+    comptime max_stages: u16,
+) [max_stages]StageT {
+    // Assertion: num_stages must fit within configured max
+    comptime std.debug.assert(num_stages <= max_stages);
+    // Assertion: phase_system_count must match indices slice length
+    comptime std.debug.assert(phase_system_count == phase_system_indices.len);
+
+    var stages: [max_stages]StageT = .{StageT{}} ** max_stages;
+
+    for (0..num_stages) |stage| {
+        stages[stage].phase_index = phase_index;
+        stages[stage].stage_index = @intCast(stage);
+        stages[stage].system_count = 0;
+
+        // Collect system indices assigned to this stage
+        for (0..phase_system_count) |pi| {
+            const sys_idx = phase_system_indices[pi];
+            if (stage_assignments[sys_idx] == stage) {
+                stages[stage].system_indices[stages[stage].system_count] = sys_idx;
+                stages[stage].system_count += 1;
+            }
+        }
+    }
+
+    return stages;
+}
 
 /// Build stages for a single phase using greedy graph coloring.
 /// Systems are assigned to the earliest stage where they have no conflicts.
-/// Tiger Style: Uses config-based bounds for stage sizing.
+/// Tiger Style: Uses config-based bounds for stage sizing. Central control.
 pub fn buildStagesForPhaseByIndex(
     comptime systems: []const SystemDef,
     comptime phase_index: u8,
@@ -135,10 +223,14 @@ pub fn buildStagesForPhaseByIndex(
     comptime max_systems: u16,
 ) PhaseStagesType(max_stages, max_systems) {
     const PhaseStagesT = PhaseStagesType(max_stages, max_systems);
-    const StageT = PhaseStagesT.Stage;
     var result = PhaseStagesT{};
 
-    // Find systems in this phase by index
+    // Pre-condition: phase_index must be valid (bounded by reasonable value)
+    comptime std.debug.assert(phase_index < 255);
+    // Pre-condition: systems array must not exceed stage capacity bounds
+    comptime std.debug.assert(systems.len <= max_systems * max_stages);
+
+    // Collect systems belonging to this phase
     var phase_system_indices: [systems.len]u16 = undefined;
     var phase_system_count: u16 = 0;
 
@@ -149,67 +241,41 @@ pub fn buildStagesForPhaseByIndex(
         }
     }
 
-    if (phase_system_count == 0) {
-        return result;
-    }
+    if (phase_system_count == 0) return result; // No systems = empty result
 
-    // Greedy stage assignment
+    // Greedy stage assignment: assign each system to earliest non-conflicting stage
     var stage_assignments: [systems.len]u16 = .{0} ** systems.len;
     var num_stages: u16 = 0;
 
     for (0..phase_system_count) |pi| {
         const sys_idx = phase_system_indices[pi];
-
-        // Find earliest stage without conflicts
-        var best_stage: u16 = 0;
-        var found = false;
-
-        stage_search: for (0..num_stages + 1) |stage| {
-            // Check if any system already in this stage conflicts
-            for (0..pi) |prev_pi| {
-                const prev_idx = phase_system_indices[prev_pi];
-                if (stage_assignments[prev_idx] == stage) {
-                    if (conflicts[sys_idx][prev_idx]) {
-                        continue :stage_search;
-                    }
-                }
-            }
-            best_stage = @intCast(stage);
-            found = true;
-            break;
-        }
-
-        if (!found) {
-            best_stage = num_stages;
-        }
-
-        stage_assignments[sys_idx] = best_stage;
-        if (best_stage >= num_stages) {
-            num_stages = best_stage + 1;
-        }
+        const best = findBestStageForSystem(
+            sys_idx,
+            phase_system_indices[0..pi],
+            pi,
+            &stage_assignments,
+            num_stages,
+            conflicts,
+        );
+        stage_assignments[sys_idx] = best;
+        if (best >= num_stages) num_stages = best + 1;
     }
 
-    // Build stage structures
-    for (0..num_stages) |stage| {
-        var stage_data = StageT{
-            .phase_index = phase_index,
-            .stage_index = @intCast(stage),
-            .system_count = 0,
-        };
-
-        // Collect system indices for this stage
-        for (0..phase_system_count) |pi| {
-            const sys_idx = phase_system_indices[pi];
-            if (stage_assignments[sys_idx] == stage) {
-                stage_data.system_indices[stage_data.system_count] = sys_idx;
-                stage_data.system_count += 1;
-            }
-        }
-
-        result.stages[stage] = stage_data;
-    }
-
+    // Build stage structures from assignments
+    result.stages = buildStageStructures(
+        PhaseStagesT.Stage,
+        phase_index,
+        phase_system_indices[0..phase_system_count],
+        phase_system_count,
+        &stage_assignments,
+        num_stages,
+        max_stages,
+    );
     result.stage_count = num_stages;
+
+    // Post-condition: if systems exist, we must have at least one stage
+    comptime std.debug.assert(phase_system_count == 0 or result.stage_count > 0);
+
     return result;
 }
 
@@ -434,13 +500,12 @@ test "buildConflictMatrix" {
     try std.testing.expect(!matrix[1][1]);
 }
 
-const TestSystems = struct {
-    fn dummySystem() void {}
-};
-
-test "Schedule type generation" {
+// Test config struct for Schedule type generation (module level for comptime evaluation)
+const ScheduleTestConfig = struct {
     const Position = struct { x: f32, y: f32 };
     const Velocity = struct { dx: f32, dy: f32 };
+
+    fn dummySystem(_: *anyopaque) void {}
 
     const cfg = WorldConfig{
         .components = .{ .types = &.{ Position, Velocity } },
@@ -451,14 +516,14 @@ test "Schedule type generation" {
             .systems = &.{
                 .{
                     .name = "physics",
-                    .func = @ptrCast(&TestSystems.dummySystem),
+                    .func = config_mod.asSystemFn(dummySystem),
                     .phase = 1, // update phase index
                     .write_components = &.{Position},
                     .read_components = &.{Velocity},
                 },
                 .{
                     .name = "render",
-                    .func = @ptrCast(&TestSystems.dummySystem),
+                    .func = config_mod.asSystemFn(dummySystem),
                     .phase = 3, // render phase index
                     .read_components = &.{Position},
                 },
@@ -466,8 +531,10 @@ test "Schedule type generation" {
         },
         .options = .{ .max_entities = 100 },
     };
+};
 
-    const Sched = Schedule(cfg);
+test "Schedule type generation" {
+    const Sched = Schedule(ScheduleTestConfig.cfg);
 
     try std.testing.expectEqual(@as(usize, 2), Sched.system_count);
     // Systems DO have a data conflict (physics writes Position, render reads Position)

@@ -58,6 +58,8 @@ pub const ExternalPipelineConfig = struct {
 // Hybrid Pipeline Configuration
 // ============================================================================
 
+const std = @import("std");
+
 /// Default fast-path predicate that rejects all entities.
 /// Users should provide their own predicate for actual fast-path logic.
 pub const DefaultFastPathPredicate = struct {
@@ -66,6 +68,98 @@ pub const DefaultFastPathPredicate = struct {
     pub fn canFastPath(entity_data: anytype) bool {
         _ = entity_data;
         return false;
+    }
+};
+
+// ============================================================================
+// Input Data Mapper Types
+// ============================================================================
+
+/// Default input data mapper for ECS fallback.
+/// Zero-initializes components (backward-compatible behavior).
+/// Users can provide custom mappers for specific component layouts.
+///
+/// Tiger Style: Comptime mapper type allows zero overhead when not mapping.
+pub const DefaultInputDataMapper = struct {
+    /// Map input data to component values.
+    /// Default implementation returns zero-initialized components.
+    pub fn mapInputToComponents(comptime ComponentTypes: []const type, input: anytype) Tuple(ComponentTypes) {
+        _ = input;
+        var result: Tuple(ComponentTypes) = undefined;
+        inline for (0..ComponentTypes.len) |i| {
+            result[i] = std.mem.zeroes(ComponentTypes[i]);
+        }
+        return result;
+    }
+
+    fn Tuple(comptime types: []const type) type {
+        return std.meta.Tuple(types);
+    }
+};
+
+/// Standard raw data component for storing unmapped input.
+/// Include this in your archetype to preserve raw input data.
+pub const RawInputData = struct {
+    /// Raw input bytes (first 256 bytes).
+    data: [256]u8 = undefined,
+    /// Length of valid data.
+    len: u32 = 0,
+    /// User-defined flags from input.
+    flags: u32 = 0,
+};
+
+/// Input data mapper that stores raw bytes in a RawInputData component.
+/// Use when archetype contains RawInputData component.
+///
+/// Example:
+/// ```zig
+/// const config = WorldConfig{
+///     .components = .{ .types = &.{ RawInputData, Position } },
+///     .archetypes = .{ .archetypes = &.{
+///         .{ .name = "raw_entity", .components = &.{ RawInputData, Position } },
+///     }},
+///     .pipeline = .{
+///         .mode = .hybrid,
+///         .hybrid = .{
+///             .input_data_mapper_type = RawInputDataMapper,
+///         },
+///     },
+/// };
+/// ```
+pub const RawInputDataMapper = struct {
+    /// Map input data to component values, storing raw bytes in RawInputData if present.
+    pub fn mapInputToComponents(comptime ComponentTypes: []const type, input: anytype) Tuple(ComponentTypes) {
+        var result: Tuple(ComponentTypes) = undefined;
+        inline for (0..ComponentTypes.len) |i| {
+            const CompType = ComponentTypes[i];
+            if (CompType == RawInputData) {
+                // Map input to RawInputData component
+                result[i] = mapToRawInputData(input);
+            } else {
+                // Zero-initialize other components
+                result[i] = std.mem.zeroes(CompType);
+            }
+        }
+        return result;
+    }
+
+    fn mapToRawInputData(input: anytype) RawInputData {
+        var raw: RawInputData = .{};
+        // Check if input has the expected fields
+        if (@hasField(@TypeOf(input), "data") and @hasField(@TypeOf(input), "len")) {
+            const input_len = @as(usize, input.len);
+            const copy_len = @min(input_len, raw.data.len);
+            @memcpy(raw.data[0..copy_len], input.data[0..copy_len]);
+            raw.len = @intCast(copy_len);
+            if (@hasField(@TypeOf(input), "flags")) {
+                raw.flags = input.flags;
+            }
+        }
+        return raw;
+    }
+
+    fn Tuple(comptime types: []const type) type {
+        return std.meta.Tuple(types);
     }
 };
 
@@ -85,6 +179,22 @@ pub const HybridPipelineConfig = struct {
     /// Fallback to ECS when fast-path queue is full.
     /// When false, returns error.FastPathFull instead.
     fallback_on_full: bool = true,
+
+    /// Input data mapper type for ECS fallback.
+    /// Must have `fn mapInputToComponents(comptime []const type, input) @Tuple(types)`.
+    /// Default zero-initializes components; use RawInputDataMapper to preserve input bytes.
+    input_data_mapper_type: type = DefaultInputDataMapper,
+
+    /// Buffer size for InputData in bytes.
+    /// Controls the maximum payload size for fast-path inputs.
+    /// Default 256 matches legacy behavior.
+    /// Tiger Style: Configurable at comptime for zero overhead sizing.
+    input_buffer_size: u32 = 256,
+
+    /// Buffer size for OutputData in bytes.
+    /// Controls the maximum response size for fast-path outputs.
+    /// Default 256 matches legacy behavior.
+    output_buffer_size: u32 = 256,
 };
 
 // ============================================================================

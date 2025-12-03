@@ -63,6 +63,10 @@ pub fn PipelineOrchestrator(comptime cfg: WorldConfig) type {
         /// Aggregated statistics.
         stats: AggregatedStats,
 
+        /// Last tick result for getter-based access.
+        /// Tiger Style: Always available - never null after first tick.
+        last_tick_result: TickResult,
+
         // ====================================================================
         // Statistics
         // ====================================================================
@@ -85,6 +89,37 @@ pub fn PipelineOrchestrator(comptime cfg: WorldConfig) type {
             hybrid_fast_path_hits: u64 = 0,
             /// Hybrid mode: fast-path misses.
             hybrid_fast_path_misses: u64 = 0,
+        };
+
+        /// Result of a single tick operation.
+        /// Aggregates commit results and processing statistics.
+        ///
+        /// Tiger Style: No silent error swallowing - all failures are visible.
+        pub const TickResult = struct {
+            /// Whether the tick completed without catching errors.
+            success: bool = true,
+
+            // External mode results (from CommitResult)
+            /// Number of entities successfully created (external mode).
+            entities_created: u32 = 0,
+            /// Number of entity spawn failures (external mode).
+            spawn_failures: u32 = 0,
+            /// Number of component set failures causing rollback (external mode).
+            component_failures: u32 = 0,
+
+            // Hybrid mode results
+            /// Number of fast-path items processed this tick (hybrid mode).
+            fast_path_processed: u32 = 0,
+
+            /// Returns true if all operations succeeded with no failures.
+            pub fn isComplete(self: TickResult) bool {
+                return self.success and self.spawn_failures == 0 and self.component_failures == 0;
+            }
+
+            /// Returns total failure count across all operations.
+            pub fn totalFailures(self: TickResult) u32 {
+                return self.spawn_failures + self.component_failures;
+            }
         };
 
         // ====================================================================
@@ -112,6 +147,7 @@ pub fn PipelineOrchestrator(comptime cfg: WorldConfig) type {
                     HybridPipelineType.init(world)
                 else {},
                 .stats = .{},
+                .last_tick_result = .{},
             };
         }
 
@@ -162,20 +198,34 @@ pub fn PipelineOrchestrator(comptime cfg: WorldConfig) type {
         /// Execute one tick of the pipeline.
         /// Behavior depends on pipeline mode:
         /// - internal: Just updates stats (ECS scheduler handles execution)
-        /// - external: Commits import batch, ready for scheduler
-        /// - hybrid: Processes fast-path queue, updates stats
-        pub fn tick(self: *Self) Error!void {
+        /// - external: Commits import batch, captures all CommitResult data
+        /// - hybrid: Processes fast-path queue, captures processed count
+        ///
+        /// Returns TickResult with all success/failure information.
+        /// Tiger Style: No silent error swallowing - failures always visible.
+        pub fn tick(self: *Self) Error!TickResult {
             self.stats.ticks_executed += 1;
+
+            var result: TickResult = .{};
 
             switch (mode) {
                 .internal => {
                     // Internal mode: ECS scheduler handles everything
-                    // Nothing special to do here
+                    // Nothing special to do here - result stays at defaults
                 },
                 .external => {
                     // External mode: Commit pending imports
-                    const created = self.external_pipeline.commitImport() catch return error.TickFailed;
-                    self.stats.external_imported += created.entities_created;
+                    // Tiger Style: commitImport cannot error (uses fail-fast internally)
+                    const commit_result = self.external_pipeline.commitImport();
+
+                    // Capture ALL CommitResult data - no silent loss
+                    result.entities_created = commit_result.entities_created;
+                    result.spawn_failures = commit_result.spawn_failures;
+                    result.component_failures = commit_result.component_failures;
+                    result.success = commit_result.isComplete();
+
+                    // Update aggregated stats
+                    self.stats.external_imported += commit_result.entities_created;
 
                     // Update external stats
                     const ext_stats = self.external_pipeline.getStats();
@@ -183,7 +233,9 @@ pub fn PipelineOrchestrator(comptime cfg: WorldConfig) type {
                 },
                 .hybrid => {
                     // Hybrid mode: Process fast-path queue
-                    _ = self.hybrid_pipeline.tickFastPath();
+                    // Capture processed count - no silent discard
+                    const processed = self.hybrid_pipeline.tickFastPath();
+                    result.fast_path_processed = processed;
 
                     // Update hybrid stats
                     const hyb_stats = self.hybrid_pipeline.getStats();
@@ -191,17 +243,45 @@ pub fn PipelineOrchestrator(comptime cfg: WorldConfig) type {
                     self.stats.hybrid_fast_path_misses = hyb_stats.fast_path_misses;
                 },
             }
+
+            // Store for getter-based access
+            self.last_tick_result = result;
+
+            return result;
         }
 
-        /// Execute one tick with delta time.
-        /// Forwards to scheduler for ECS system execution.
-        pub fn tickWithDelta(self: *Self, delta_time: f64) Error!void {
-            // First handle mode-specific pre-tick
-            try self.tick();
+        /// Execute one tick with delta time for ECS system execution.
+        ///
+        /// ## API Design Note
+        ///
+        /// The `delta_time` parameter is accepted for API consistency with game loops
+        /// and external schedulers that provide time deltas. Currently, the pipeline
+        /// orchestrator delegates to mode-specific tick() which handles its own timing.
+        ///
+        /// **When delta_time becomes used:**
+        /// - Scheduler integration will forward delta_time to FrameExecutor
+        /// - Systems can access it via SystemContext.delta_time
+        /// - Time-scaled updates (physics, animations) will use this value
+        ///
+        /// **Current behavior:** Parameter is validated but not forwarded until
+        /// scheduler integration is complete. Use tick() for equivalent behavior.
+        ///
+        /// Returns TickResult from the underlying tick operation.
+        pub fn tickWithDelta(self: *Self, delta_time: f64) Error!TickResult {
+            // Tiger Style: Validate inputs - this also serves as documentation that
+            // delta_time is intentionally accepted but not yet forwarded.
+            // The assertion prevents invalid inputs and silences the "unused parameter" warning.
+            std.debug.assert(!std.math.isNan(delta_time) and delta_time >= 0.0);
 
-            // Then execute ECS systems via scheduler
-            // Note: This requires scheduler integration
-            _ = delta_time;
+            // First handle mode-specific pre-tick
+            const result = try self.tick();
+
+            // TODO(scheduler-integration): Forward delta_time to FrameExecutor when
+            // scheduler integration is implemented. This parameter exists for API
+            // compatibility with game loops that provide frame timing.
+            // See: scheduler_runtime.zig executeFrame() for delta_time usage pattern.
+
+            return result;
         }
 
         // ====================================================================
@@ -233,6 +313,14 @@ pub fn PipelineOrchestrator(comptime cfg: WorldConfig) type {
         /// Get aggregated statistics.
         pub fn getStats(self: *const Self) AggregatedStats {
             return self.stats;
+        }
+
+        /// Get the result from the last tick operation.
+        /// Useful for callers who don't capture the tick() return value.
+        ///
+        /// Tiger Style: Always available after first tick.
+        pub fn getLastTickResult(self: *const Self) TickResult {
+            return self.last_tick_result;
         }
 
         /// Reset all statistics.
@@ -410,4 +498,115 @@ test "AggregatedStats defaults" {
     try std.testing.expectEqual(@as(u64, 0), stats.ticks_executed);
     try std.testing.expectEqual(@as(u64, 0), stats.external_imported);
     try std.testing.expectEqual(@as(u64, 0), stats.hybrid_fast_path_hits);
+}
+
+test "TickResult defaults and helpers" {
+    const TestComp = struct { value: i32 };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{TestComp} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{TestComp} },
+        } },
+        .pipeline = .{ .mode = .internal },
+    };
+
+    const Orchestrator = PipelineOrchestrator(test_config);
+
+    // Test default TickResult is successful and complete
+    const result = Orchestrator.TickResult{};
+    try std.testing.expect(result.success);
+    try std.testing.expect(result.isComplete());
+    try std.testing.expectEqual(@as(u32, 0), result.totalFailures());
+    try std.testing.expectEqual(@as(u32, 0), result.entities_created);
+    try std.testing.expectEqual(@as(u32, 0), result.spawn_failures);
+    try std.testing.expectEqual(@as(u32, 0), result.component_failures);
+    try std.testing.expectEqual(@as(u32, 0), result.fast_path_processed);
+}
+
+test "TickResult failure tracking" {
+    const TestComp = struct { value: i32 };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{TestComp} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{TestComp} },
+        } },
+        .pipeline = .{ .mode = .external },
+    };
+
+    const Orchestrator = PipelineOrchestrator(test_config);
+
+    // Test TickResult with failures reports correctly
+    var result = Orchestrator.TickResult{
+        .success = true,
+        .entities_created = 10,
+        .spawn_failures = 2,
+        .component_failures = 1,
+    };
+
+    // Should not be complete due to failures
+    try std.testing.expect(!result.isComplete());
+    try std.testing.expectEqual(@as(u32, 3), result.totalFailures());
+
+    // Even with success=true, isComplete checks for zero failures
+    try std.testing.expect(result.success);
+    try std.testing.expect(!result.isComplete());
+
+    // Reset to zero failures - now should be complete
+    result.spawn_failures = 0;
+    result.component_failures = 0;
+    try std.testing.expect(result.isComplete());
+    try std.testing.expectEqual(@as(u32, 0), result.totalFailures());
+}
+
+test "TickResult with success=false" {
+    const TestComp = struct { value: i32 };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{TestComp} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{TestComp} },
+        } },
+        .pipeline = .{ .mode = .internal },
+    };
+
+    const Orchestrator = PipelineOrchestrator(test_config);
+
+    // Test that success=false alone makes isComplete return false
+    const result = Orchestrator.TickResult{
+        .success = false,
+        .spawn_failures = 0,
+        .component_failures = 0,
+    };
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(!result.isComplete());
+    try std.testing.expectEqual(@as(u32, 0), result.totalFailures());
+}
+
+test "getLastTickResult available after init" {
+    const TestComp = struct { value: i32 };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{TestComp} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "test", .components = &.{TestComp} },
+        } },
+        .pipeline = .{ .mode = .internal },
+    };
+
+    const WorldType = @import("../world.zig").World(test_config);
+    const Orchestrator = PipelineOrchestrator(test_config);
+
+    // Create a world to initialize orchestrator
+    var world = WorldType.init(std.testing.allocator);
+    defer world.deinit();
+
+    var orchestrator = Orchestrator.init(&world);
+
+    // getLastTickResult should be available immediately with defaults
+    const last_result = orchestrator.getLastTickResult();
+    try std.testing.expect(last_result.success);
+    try std.testing.expect(last_result.isComplete());
 }

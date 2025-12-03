@@ -106,3 +106,172 @@ pub const WorldCoordinationConfig = struct {
     /// Entity routing configuration for outgoing transfers.
     routing: RoutingConfig = .{},
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const std = @import("std");
+
+test "WorldRole enum values" {
+    // Verify all world roles are defined
+    try std.testing.expectEqual(WorldRole.standalone, WorldRole.standalone);
+    try std.testing.expectEqual(WorldRole.accept, WorldRole.accept);
+    try std.testing.expectEqual(WorldRole.io, WorldRole.io);
+    try std.testing.expectEqual(WorldRole.compute, WorldRole.compute);
+    try std.testing.expectEqual(WorldRole.custom, WorldRole.custom);
+
+    // Verify roles are distinct
+    try std.testing.expect(WorldRole.standalone != WorldRole.accept);
+    try std.testing.expect(WorldRole.io != WorldRole.compute);
+}
+
+test "TransferQueueConfig defaults" {
+    // Verify default transfer queue configuration
+    const cfg = TransferQueueConfig{};
+
+    // Default capacity should be power of 2
+    try std.testing.expectEqual(@as(u32, 4096), cfg.capacity);
+
+    // Verify batch size is reasonable
+    try std.testing.expectEqual(@as(u32, 64), cfg.batch_size);
+    try std.testing.expect(cfg.batch_size < cfg.capacity);
+
+    // SPSC should be disabled by default (more flexible)
+    try std.testing.expect(!cfg.spsc);
+}
+
+test "TransferQueueConfig custom values" {
+    // Test custom configuration
+    const cfg = TransferQueueConfig{
+        .capacity = 8192,
+        .batch_size = 128,
+        .spsc = true,
+    };
+
+    try std.testing.expectEqual(@as(u32, 8192), cfg.capacity);
+    try std.testing.expectEqual(@as(u32, 128), cfg.batch_size);
+    try std.testing.expect(cfg.spsc);
+}
+
+test "RoutingConfig defaults" {
+    // Verify default routing configuration
+    const cfg = RoutingConfig{};
+
+    // No default target by default (no auto-routing)
+    try std.testing.expectEqual(@as(?u8, null), cfg.default_target);
+
+    // Empty component routes
+    try std.testing.expectEqual(@as(usize, 0), cfg.component_routes.len);
+}
+
+test "RoutingConfig with default target" {
+    // Test routing with default target
+    const cfg = RoutingConfig{
+        .default_target = 2, // Route to world 2 by default
+    };
+
+    try std.testing.expectEqual(@as(?u8, 2), cfg.default_target);
+}
+
+test "RoutingConfig component-based routing" {
+    // Test component-based routing rules
+    const cfg = RoutingConfig{
+        .default_target = 0,
+        .component_routes = &[_]ComponentRoute{
+            .{ .component_name = "NetworkComponent", .target_world = 1 },
+            .{ .component_name = "ComputeComponent", .target_world = 2 },
+            .{ .component_name = "StorageComponent", .target_world = 3 },
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.component_routes.len);
+    try std.testing.expectEqualStrings("NetworkComponent", cfg.component_routes[0].component_name);
+    try std.testing.expectEqual(@as(u8, 1), cfg.component_routes[0].target_world);
+    try std.testing.expectEqualStrings("ComputeComponent", cfg.component_routes[1].component_name);
+    try std.testing.expectEqual(@as(u8, 2), cfg.component_routes[1].target_world);
+}
+
+test "WorldCoordinationConfig defaults" {
+    // Verify default coordination configuration
+    const cfg = WorldCoordinationConfig{};
+
+    // Default role is standalone
+    try std.testing.expectEqual(WorldRole.standalone, cfg.role);
+
+    // Default world ID is 0
+    try std.testing.expectEqual(@as(u8, 0), cfg.world_id);
+
+    // Verify nested defaults
+    try std.testing.expectEqual(@as(u32, 4096), cfg.transfer_queue.capacity);
+    try std.testing.expectEqual(@as(?u8, null), cfg.routing.default_target);
+}
+
+test "WorldCoordinationConfig accept world" {
+    // Test accept world configuration
+    const cfg = WorldCoordinationConfig{
+        .role = .accept,
+        .world_id = 0,
+        .transfer_queue = .{
+            .capacity = 8192, // Higher capacity for accept world
+            .batch_size = 32, // Smaller batches for lower latency
+            .spsc = true, // SPSC for accept -> IO handoff
+        },
+        .routing = .{
+            .default_target = 1, // Route to IO world
+        },
+    };
+
+    try std.testing.expectEqual(WorldRole.accept, cfg.role);
+    try std.testing.expectEqual(@as(u8, 0), cfg.world_id);
+    try std.testing.expectEqual(@as(u32, 8192), cfg.transfer_queue.capacity);
+    try std.testing.expect(cfg.transfer_queue.spsc);
+    try std.testing.expectEqual(@as(?u8, 1), cfg.routing.default_target);
+}
+
+test "WorldCoordinationConfig IO world" {
+    // Test IO world configuration
+    const cfg = WorldCoordinationConfig{
+        .role = .io,
+        .world_id = 1,
+        .transfer_queue = .{
+            .batch_size = 128, // Larger batches for I/O efficiency
+        },
+        .routing = .{
+            .default_target = 2, // Route to compute world
+        },
+    };
+
+    try std.testing.expectEqual(WorldRole.io, cfg.role);
+    try std.testing.expectEqual(@as(u8, 1), cfg.world_id);
+    try std.testing.expectEqual(@as(u32, 128), cfg.transfer_queue.batch_size);
+}
+
+test "WorldCoordinationConfig compute world" {
+    // Test compute world configuration
+    const cfg = WorldCoordinationConfig{
+        .role = .compute,
+        .world_id = 2,
+        .routing = .{
+            .component_routes = &[_]ComponentRoute{
+                // Route based on component type
+                .{ .component_name = "Response", .target_world = 1 },
+            },
+        },
+    };
+
+    try std.testing.expectEqual(WorldRole.compute, cfg.role);
+    try std.testing.expectEqual(@as(u8, 2), cfg.world_id);
+    try std.testing.expectEqual(@as(usize, 1), cfg.routing.component_routes.len);
+}
+
+test "ComponentRoute struct" {
+    // Test individual component route
+    const route = ComponentRoute{
+        .component_name = "MyComponent",
+        .target_world = 5,
+    };
+
+    try std.testing.expectEqualStrings("MyComponent", route.component_name);
+    try std.testing.expectEqual(@as(u8, 5), route.target_world);
+}

@@ -66,9 +66,24 @@ pub fn Resources(comptime resource_types: []const type) type {
         }
 
         /// Remove a resource, returning true if it was initialized.
+        /// Per TigerStyle: zeros memory to prevent information leakage and
+        /// make use-after-free bugs more detectable.
         pub fn remove(self: *Self, comptime T: type) bool {
             const idx = comptime resourceIndex(T);
             const was_initialized = self.initialized[idx];
+
+            // Zero the memory regardless of initialization state for security
+            // This prevents information leakage and makes use-after-free detectable
+            const resource_ptr: *T = &self.storage[idx];
+            const byte_ptr: [*]u8 = @ptrCast(resource_ptr);
+            const bytes: []u8 = byte_ptr[0..@sizeOf(T)];
+            @memset(bytes, 0);
+
+            // Assert memory is zeroed (TigerStyle: exhaustive assertions)
+            for (bytes) |byte| {
+                std.debug.assert(byte == 0);
+            }
+
             self.initialized[idx] = false;
             return was_initialized;
         }
@@ -152,4 +167,55 @@ test "Resources empty spec" {
     const resources = EmptyResources.init();
     _ = resources;
     // Just verify it compiles and can be instantiated
+}
+
+test "Resources remove zeros memory" {
+    // Use a struct with distinct non-zero byte patterns
+    const SensitiveData = struct {
+        secret_key: u64,
+        password_hash: u128,
+        token: [16]u8,
+    };
+
+    const ResourceStore = Resources(&.{SensitiveData});
+    var resources = ResourceStore.init();
+
+    // Insert data with non-zero values (simulating sensitive data)
+    const sensitive = SensitiveData{
+        .secret_key = 0xDEADBEEF_CAFEBABE,
+        .password_hash = 0x12345678_9ABCDEF0_FEDCBA98_76543210,
+        .token = .{ 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00 },
+    };
+    _ = resources.insert(SensitiveData, sensitive);
+
+    // Verify data is stored correctly before removal
+    const stored = resources.get(SensitiveData).?;
+    try std.testing.expectEqual(@as(u64, 0xDEADBEEF_CAFEBABE), stored.secret_key);
+
+    // Get raw pointer to storage before removal (to verify zeroing)
+    // We access the underlying storage directly to check after removal
+    const storage_ptr: *SensitiveData = &resources.storage[0];
+    const byte_ptr: [*]const u8 = @ptrCast(storage_ptr);
+    const bytes: []const u8 = byte_ptr[0..@sizeOf(SensitiveData)];
+
+    // Verify at least some bytes are non-zero before removal
+    var non_zero_count: usize = 0;
+    for (bytes) |byte| {
+        if (byte != 0) non_zero_count += 1;
+    }
+    try std.testing.expect(non_zero_count > 0);
+
+    // Remove the resource
+    const was_removed = resources.remove(SensitiveData);
+    try std.testing.expect(was_removed);
+
+    // Verify ALL bytes are now zero (security: no information leakage)
+    for (bytes, 0..) |byte, i| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+        _ = i; // Index available for debugging if needed
+    }
+
+    // Verify resource is no longer accessible through normal API
+    try std.testing.expect(!resources.has(SensitiveData));
+    try std.testing.expect(resources.get(SensitiveData) == null);
 }

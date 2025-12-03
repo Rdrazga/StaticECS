@@ -368,9 +368,12 @@ test "Scheduler statistics reset" {
     try std.testing.expectEqual(@as(f64, 0.0), scheduler.getAccumulatedTime());
 }
 
-test "Scheduler comptime introspection" {
+// Test config for Scheduler comptime introspection (module level for comptime evaluation)
+const SchedulerTestConfig = struct {
     const Position = struct { x: f32, y: f32 };
     const Velocity = struct { vx: f32, vy: f32 };
+
+    fn dummyMovementSystem(_: *anyopaque) void {}
 
     const cfg = WorldConfig{
         .components = .{ .types = &.{ Position, Velocity } },
@@ -380,17 +383,17 @@ test "Scheduler comptime introspection" {
         .systems = .{ .systems = &.{
             .{
                 .name = "movement",
-                .func = struct {
-                    fn run(_: anytype) void {}
-                }.run,
+                .func = config_mod.asSystemFn(dummyMovementSystem),
                 .read_components = &.{Velocity},
                 .write_components = &.{Position},
             },
         } },
         .options = .{ .max_entities = 100 },
     };
+};
 
-    const TestScheduler = Scheduler(cfg);
+test "Scheduler comptime introspection" {
+    const TestScheduler = Scheduler(SchedulerTestConfig.cfg);
 
     try std.testing.expectEqual(1, TestScheduler.getSystemCount());
     try std.testing.expectEqual(ExecutionModel.blocking_single_thread, TestScheduler.getExecutionModel());

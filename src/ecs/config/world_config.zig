@@ -135,3 +135,195 @@ pub const WorldConfig = struct {
         return self.scalability.cluster.node_id;
     }
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const std = @import("std");
+
+test "WorldConfig defaults" {
+    // Verify default configuration
+    const cfg = WorldConfig{};
+
+    // Verify all specs have empty defaults
+    try std.testing.expectEqual(@as(usize, 0), cfg.componentCount());
+    try std.testing.expectEqual(@as(usize, 0), cfg.archetypeCount());
+    try std.testing.expectEqual(@as(usize, 0), cfg.systemCount());
+    try std.testing.expectEqual(@as(usize, 0), cfg.resourceCount());
+}
+
+test "WorldConfig phaseCount" {
+    // Verify phase count from config
+    const cfg = WorldConfig{};
+
+    // Should have default 5 phases (pre_update, update, post_update, render, network)
+    try std.testing.expectEqual(@as(usize, 5), cfg.phaseCount());
+}
+
+test "WorldConfig componentCount" {
+    const Position = struct { x: f32, y: f32 };
+    const Velocity = struct { dx: f32, dy: f32 };
+    const Health = struct { value: u32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Position, Velocity, Health } },
+    };
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.componentCount());
+}
+
+test "WorldConfig archetypeCount" {
+    const Position = struct { x: f32, y: f32 };
+    const Velocity = struct { dx: f32, dy: f32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Position, Velocity } },
+        .archetypes = .{
+            .archetypes = &.{
+                .{ .name = "static", .components = &.{Position} },
+                .{ .name = "moving", .components = &.{ Position, Velocity } },
+            },
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.archetypeCount());
+}
+
+test "WorldConfig systemCount" {
+    // Test systemCount with empty systems (systems spec tested more thoroughly in scheduler tests)
+    const cfg = WorldConfig{
+        .systems = .{
+            .systems = &.{},
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 0), cfg.systemCount());
+}
+
+test "WorldConfig isCoordinated" {
+    // Standalone world is not coordinated
+    const standalone_cfg = WorldConfig{};
+    try std.testing.expect(!standalone_cfg.isCoordinated());
+    try std.testing.expectEqual(WorldRole.standalone, standalone_cfg.worldRole());
+
+    // Accept world is coordinated
+    const accept_cfg = WorldConfig{
+        .coordination = .{ .role = .accept },
+    };
+    try std.testing.expect(accept_cfg.isCoordinated());
+    try std.testing.expectEqual(WorldRole.accept, accept_cfg.worldRole());
+
+    // IO world is coordinated
+    const io_cfg = WorldConfig{
+        .coordination = .{ .role = .io },
+    };
+    try std.testing.expect(io_cfg.isCoordinated());
+    try std.testing.expectEqual(WorldRole.io, io_cfg.worldRole());
+}
+
+test "WorldConfig pipelineMode" {
+    // Default pipeline mode is internal
+    const default_cfg = WorldConfig{};
+    try std.testing.expectEqual(PipelineMode.internal, default_cfg.pipelineMode());
+    try std.testing.expect(!default_cfg.isExternalPipeline());
+    try std.testing.expect(!default_cfg.isHybridPipeline());
+
+    // External pipeline mode
+    const external_cfg = WorldConfig{
+        .pipeline = .{ .mode = .external },
+    };
+    try std.testing.expectEqual(PipelineMode.external, external_cfg.pipelineMode());
+    try std.testing.expect(external_cfg.isExternalPipeline());
+    try std.testing.expect(!external_cfg.isHybridPipeline());
+
+    // Hybrid pipeline mode
+    const hybrid_cfg = WorldConfig{
+        .pipeline = .{ .mode = .hybrid },
+    };
+    try std.testing.expectEqual(PipelineMode.hybrid, hybrid_cfg.pipelineMode());
+    try std.testing.expect(!hybrid_cfg.isExternalPipeline());
+    try std.testing.expect(hybrid_cfg.isHybridPipeline());
+}
+
+test "WorldConfig hasScalabilityFeatures" {
+    // Default has no scalability features
+    const default_cfg = WorldConfig{};
+    try std.testing.expect(!default_cfg.hasScalabilityFeatures());
+    try std.testing.expect(!default_cfg.wantsNuma());
+    try std.testing.expect(!default_cfg.wantsHugePages());
+    try std.testing.expect(!default_cfg.wantsAffinity());
+    try std.testing.expect(!default_cfg.wantsCluster());
+
+    // With NUMA enabled
+    const numa_cfg = WorldConfig{
+        .scalability = .{ .numa = .{ .enabled = true } },
+    };
+    try std.testing.expect(numa_cfg.hasScalabilityFeatures());
+    try std.testing.expect(numa_cfg.wantsNuma());
+
+    // With huge pages enabled
+    const huge_cfg = WorldConfig{
+        .scalability = .{ .huge_pages = .{ .enabled = true } },
+    };
+    try std.testing.expect(huge_cfg.hasScalabilityFeatures());
+    try std.testing.expect(huge_cfg.wantsHugePages());
+
+    // With affinity enabled
+    const affinity_cfg = WorldConfig{
+        .scalability = .{ .affinity = .{ .enabled = true } },
+    };
+    try std.testing.expect(affinity_cfg.hasScalabilityFeatures());
+    try std.testing.expect(affinity_cfg.wantsAffinity());
+
+    // With cluster enabled
+    const cluster_cfg = WorldConfig{
+        .scalability = .{ .cluster = .{ .enabled = true, .node_id = 5 } },
+    };
+    try std.testing.expect(cluster_cfg.hasScalabilityFeatures());
+    try std.testing.expect(cluster_cfg.wantsCluster());
+    try std.testing.expectEqual(@as(u16, 5), cluster_cfg.clusterNodeId());
+}
+
+test "WorldConfig options" {
+    // Test custom options
+    const cfg = WorldConfig{
+        .options = .{
+            .max_entities = 50000,
+            .max_systems_per_stage = 64,
+            .max_stages_per_phase = 32,
+        },
+    };
+
+    try std.testing.expectEqual(@as(u32, 50000), cfg.options.max_entities);
+    try std.testing.expectEqual(@as(u16, 64), cfg.options.max_systems_per_stage);
+    try std.testing.expectEqual(@as(u16, 32), cfg.options.max_stages_per_phase);
+}
+
+test "WorldConfig complete example" {
+    // Test a complete game-like configuration (without systems - tested in scheduler)
+    const Position = struct { x: f32, y: f32, z: f32 };
+    const Velocity = struct { dx: f32, dy: f32, dz: f32 };
+    const Health = struct { current: u32, max: u32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Position, Velocity, Health } },
+        .archetypes = .{
+            .archetypes = &.{
+                .{ .name = "static", .components = &.{Position} },
+                .{ .name = "moving", .components = &.{ Position, Velocity } },
+                .{ .name = "player", .components = &.{ Position, Velocity, Health } },
+            },
+        },
+        .systems = .{ .systems = &.{} },
+        .options = .{ .max_entities = 10000 },
+        .tick = .{ .mode = .fixed_rate, .target_hz = 60 },
+    };
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.componentCount());
+    try std.testing.expectEqual(@as(usize, 3), cfg.archetypeCount());
+    try std.testing.expectEqual(@as(usize, 0), cfg.systemCount()); // No systems in this test
+    try std.testing.expectEqual(@as(u32, 10000), cfg.options.max_entities);
+    try std.testing.expect(!cfg.isCoordinated());
+    try std.testing.expect(!cfg.hasScalabilityFeatures());
+}

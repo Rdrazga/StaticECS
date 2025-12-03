@@ -700,3 +700,138 @@ test "valid config with adaptive_hybrid execution model" {
 //     };
 //     comptime validateWorldConfig(cfg);
 // }
+
+// ============================================================================
+// Pipeline Input Mapper Configuration Valid Tests (M-8)
+// ============================================================================
+
+test "valid config with hybrid pipeline and custom input mapper" {
+    // Custom mapper with required mapInputToComponents method
+    const CustomMapper = struct {
+        pub fn mapInputToComponents(comptime ComponentTypes: []const type, input: anytype) std.meta.Tuple(ComponentTypes) {
+            _ = input;
+            var result: std.meta.Tuple(ComponentTypes) = undefined;
+            inline for (0..ComponentTypes.len) |i| {
+                result[i] = std.mem.zeroes(ComponentTypes[i]);
+            }
+            return result;
+        }
+    };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "entity", .components = &.{Position} },
+        } },
+        .pipeline = .{
+            .mode = .hybrid,
+            .hybrid = .{
+                .input_data_mapper_type = CustomMapper,
+                .input_buffer_size = 128,
+                .output_buffer_size = 256,
+            },
+        },
+    };
+
+    comptime validateWorldConfig(cfg);
+}
+
+test "valid config with hybrid pipeline and default input mapper" {
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "entity", .components = &.{Position} },
+        } },
+        .pipeline = .{
+            .mode = .hybrid,
+            .hybrid = .{}, // Uses DefaultInputDataMapper which has mapInputToComponents
+        },
+    };
+
+    comptime validateWorldConfig(cfg);
+}
+
+test "valid config with hybrid pipeline and RawInputDataMapper" {
+    const RawInputDataMapper = config.RawInputDataMapper;
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "entity", .components = &.{Position} },
+        } },
+        .pipeline = .{
+            .mode = .hybrid,
+            .hybrid = .{
+                .input_data_mapper_type = RawInputDataMapper,
+            },
+        },
+    };
+
+    comptime validateWorldConfig(cfg);
+}
+
+// ============================================================================
+// Pipeline Input Mapper Manual Comptime Error Tests (M-8)
+// ============================================================================
+//
+// These tests verify that invalid input mapper configs produce compile errors.
+// Uncomment ONE AT A TIME to verify the expected error message.
+
+// --- Error 20: input_data_mapper_type missing mapInputToComponents ---
+// Expected: "WorldConfig: pipeline.hybrid.input_data_mapper_type must have mapInputToComponents method"
+//
+// test "comptime error: input_data_mapper_type missing method" {
+//     const InvalidMapper = struct {
+//         // Missing mapInputToComponents method
+//     };
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .pipeline = .{
+//             .mode = .hybrid,
+//             .hybrid = .{
+//                 .input_data_mapper_type = InvalidMapper, // Invalid: no mapInputToComponents
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }
+
+// --- Error 21: input_buffer_size is zero ---
+// Expected: "WorldConfig: pipeline.hybrid.input_buffer_size must be at least 1"
+//
+// test "comptime error: input_buffer_size zero" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .pipeline = .{
+//             .mode = .hybrid,
+//             .hybrid = .{
+//                 .input_buffer_size = 0, // Invalid: must be > 0
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }
+
+// --- Error 22: output_buffer_size is zero ---
+// Expected: "WorldConfig: pipeline.hybrid.output_buffer_size must be at least 1"
+//
+// test "comptime error: output_buffer_size zero" {
+//     const cfg = WorldConfig{
+//         .components = .{ .types = &.{Position} },
+//         .archetypes = .{ .archetypes = &.{
+//             .{ .name = "entity", .components = &.{Position} },
+//         } },
+//         .pipeline = .{
+//             .mode = .hybrid,
+//             .hybrid = .{
+//                 .output_buffer_size = 0, // Invalid: must be > 0
+//             },
+//         },
+//     };
+//     comptime validateWorldConfig(cfg);
+// }

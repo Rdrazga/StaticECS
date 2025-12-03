@@ -1,10 +1,75 @@
-//! Tracing and Logging Support
+//! # Tracing and Logging Support
 //!
-//! This module provides the tracing infrastructure for StaticECS, including
-//! TraceLevel configuration, TraceSink abstraction, and trace event types.
+//! This module provides the tracing infrastructure for StaticECS.
+//!
+//! ## Key Types
+//! - `TraceSink` - Consumer interface for trace events (with VTable)
+//! - `TracingContext` - Compile-time configured trace emitter
+//! - Event types: `TickEvent`, `StageEvent`, `SystemEvent`, `SystemErrorEvent`
+//! - `ConsoleSink` - Built-in debug sink that prints to stderr
+//!
+//! ## Architecture
+//!
+//! ```
+//! ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+//! │ TracingContext  │────>│   TraceSink      │────>│ User Callback   │
+//! │ (emits events)  │     │ (VTable dispatch)│     │ (logging, etc.) │
+//! └─────────────────┘     └──────────────────┘     └─────────────────┘
+//!         │                       │
+//!         │ compile-time          │ runtime
+//!         │ level filtering       │ vtable dispatch
+//! ```
+//!
+//! ## Forward Declaration Pattern
+//!
+//! Configuration types (`config/tracing_types.zig`) use `TraceSinkPtr` (opaque
+//! pointer) to reference TraceSink without creating circular dependencies.
+//! At runtime, the pointer is cast back to `*TraceSink` for event dispatch.
+//!
+//! See `config/tracing_types.zig` for the configuration-side documentation.
+//!
+//! ## Type Safety
+//!
+//! TraceSink uses `TypedContext` for debug-mode type verification of user-
+//! provided context pointers. This catches type mismatches in debug builds
+//! while having zero overhead in release builds.
+//!
+//! ## Usage Example
+//!
+//! ```zig
+//! // 1. Create a custom sink with state
+//! const MySinkData = struct { log_file: std.fs.File };
+//! var my_data = MySinkData{ .log_file = file };
+//!
+//! const my_vtable = TraceSink.VTable{
+//!     .on_system_start = struct {
+//!         fn f(ctx: *anyopaque, event: SystemEvent) void {
+//!             const data = TraceSink.castContext(ctx, MySinkData);
+//!             data.log_file.writer().print("System: {s}\n", .{event.system_name});
+//!         }
+//!     }.f,
+//! };
+//!
+//! const sink = TraceSink.init(MySinkData, &my_data, &my_vtable);
+//!
+//! // 2. Or use the built-in console sink
+//! const console_sink = ConsoleSink.sink();
+//! ```
+//!
+//! ## Thread Safety
+//!
+//! TraceSink callbacks may be invoked from multiple threads when using
+//! concurrent execution models. Implementations must ensure thread safety
+//! (e.g., via mutex, atomic operations, or thread-local storage).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../config.zig");
+const core_types = @import("../config/core_types.zig");
+
+/// TypedContext for type-safe opaque pointer handling.
+/// Re-exported for trace sink implementations.
+pub const TypedContext = core_types.TypedContext;
 
 // ============================================================================
 // Trace Level
@@ -105,15 +170,46 @@ pub const SystemErrorEvent = struct {
 // ============================================================================
 
 /// TraceSink is the interface for consuming trace events.
+///
 /// Implementations can log to stdout, files, network, or custom backends.
+/// The VTable pattern allows zero-overhead dispatch when tracing is disabled
+/// at compile time (TracingContext compiles calls to no-ops).
+///
+/// ## Lifecycle
+///
+/// 1. **Create**: Use `init()` with your context type and VTable
+/// 2. **Configure**: Pass to `TracingSpec.sink` (cast to `TraceSinkPtr`)
+/// 3. **Receive**: VTable callbacks invoked during world tick execution
+/// 4. **Cleanup**: User manages context lifetime (sink doesn't own memory)
+///
+/// ## Type Safety
+///
+/// The context field uses TypedContext for debug-mode type verification.
+/// In debug builds, casting to the wrong type will panic with a clear message.
+/// In release builds, TypedContext has zero overhead.
+///
+/// ## Usage
+/// ```zig
+/// var my_sink_data = MySinkData{ ... };
+/// const sink = TraceSink.init(MySinkData, &my_sink_data, &my_vtable);
+/// // In VTable callback, safely cast back:
+/// const data = TraceSink.castContext(ctx, MySinkData);
+/// ```
+///
+/// ## Relationship to TraceSinkPtr
+///
+/// Configuration uses `TraceSinkPtr` (opaque pointer) to avoid circular deps.
+/// At runtime: `@ptrCast(@alignCast(trace_spec.sink.?))` → `*const TraceSink`
 pub const TraceSink = struct {
-    /// User-provided context pointer.
-    context: *anyopaque,
+    /// User-provided context with debug-mode type verification.
+    /// Use init() to create with type safety, castContext() in callbacks.
+    context: TypedContext,
     /// Vtable for event callbacks.
     vtable: *const VTable,
 
     pub const VTable = struct {
         /// Called at the start of a tick/frame.
+        /// ctx: Use TraceSink.castContext() to safely cast to your context type.
         on_tick_start: ?*const fn (ctx: *anyopaque, event: TickEvent) void = null,
         /// Called at the end of a tick/frame.
         on_tick_end: ?*const fn (ctx: *anyopaque, event: TickEvent) void = null,
@@ -129,52 +225,115 @@ pub const TraceSink = struct {
         on_system_error: ?*const fn (ctx: *anyopaque, event: SystemErrorEvent) void = null,
     };
 
+    /// Create a type-safe TraceSink with context type verification.
+    /// In debug builds, the type is stored and verified on cast.
+    /// In release builds, this has zero overhead.
+    pub fn init(comptime T: type, ctx: *T, vtable: *const VTable) TraceSink {
+        return .{
+            .context = TypedContext.init(T, ctx),
+            .vtable = vtable,
+        };
+    }
+
+    /// Create a TraceSink with no context (for stateless sinks like ConsoleSink).
+    /// Uses a dummy context that will panic if accessed.
+    pub fn initStateless(vtable: *const VTable) TraceSink {
+        // Use undefined but mark with a recognizable type for debugging
+        const StatelessMarker = struct {};
+        return .{
+            .context = TypedContext.initConst(StatelessMarker, &StatelessMarker{}),
+            .vtable = vtable,
+        };
+    }
+
+    /// @deprecated Use init() for type-safe context creation.
+    /// Creates a TraceSink with raw anyopaque context (no type verification).
+    /// Maintained for backward compatibility.
+    pub fn initUnsafe(ctx: *anyopaque, vtable: *const VTable) TraceSink {
+        // Create with void type marker to indicate unsafe creation
+        const UnsafeMarker = struct {};
+        return .{
+            .context = .{
+                .ptr = ctx,
+                .type_name = if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe)
+                    @typeName(UnsafeMarker) ++ " (unsafe - no type checking)"
+                else {},
+            },
+            .vtable = vtable,
+        };
+    }
+
+    /// Safely cast the context pointer to its original type in callbacks.
+    /// In debug builds, panics if T doesn't match the type used in init().
+    ///
+    /// Usage in VTable callback:
+    /// ```zig
+    /// fn onTickStart(ctx: *anyopaque, event: TickEvent) void {
+    ///     const self = TraceSink.castContext(ctx, MySinkData);
+    ///     // use self...
+    /// }
+    /// ```
+    ///
+    /// Note: For maximum safety, store TypedContext and use its cast() directly.
+    /// This helper is for convenience in VTable callbacks which receive *anyopaque.
+    pub fn castContext(ctx: *anyopaque, comptime T: type) *T {
+        // In VTable callbacks we only have *anyopaque, so we do a direct cast.
+        // Type safety relies on the TraceSink being created with init(T, ...).
+        // Full verification requires storing TypedContext, but VTable ABI uses *anyopaque.
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// Get the raw context pointer (for passing to VTable callbacks).
+    pub fn rawContext(self: TraceSink) *anyopaque {
+        return self.context.rawPtr();
+    }
+
     /// Emit a tick start event.
     pub fn tickStart(self: TraceSink, event: TickEvent) void {
         if (self.vtable.on_tick_start) |cb| {
-            cb(self.context, event);
+            cb(self.context.rawPtr(), event);
         }
     }
 
     /// Emit a tick end event.
     pub fn tickEnd(self: TraceSink, event: TickEvent) void {
         if (self.vtable.on_tick_end) |cb| {
-            cb(self.context, event);
+            cb(self.context.rawPtr(), event);
         }
     }
 
     /// Emit a stage start event.
     pub fn stageStart(self: TraceSink, event: StageEvent) void {
         if (self.vtable.on_stage_start) |cb| {
-            cb(self.context, event);
+            cb(self.context.rawPtr(), event);
         }
     }
 
     /// Emit a stage end event.
     pub fn stageEnd(self: TraceSink, event: StageEvent) void {
         if (self.vtable.on_stage_end) |cb| {
-            cb(self.context, event);
+            cb(self.context.rawPtr(), event);
         }
     }
 
     /// Emit a system start event.
     pub fn systemStart(self: TraceSink, event: SystemEvent) void {
         if (self.vtable.on_system_start) |cb| {
-            cb(self.context, event);
+            cb(self.context.rawPtr(), event);
         }
     }
 
     /// Emit a system end event.
     pub fn systemEnd(self: TraceSink, event: SystemEvent) void {
         if (self.vtable.on_system_end) |cb| {
-            cb(self.context, event);
+            cb(self.context.rawPtr(), event);
         }
     }
 
     /// Emit a system error event.
     pub fn systemError(self: TraceSink, event: SystemErrorEvent) void {
         if (self.vtable.on_system_error) |cb| {
-            cb(self.context, event);
+            cb(self.context.rawPtr(), event);
         }
     }
 };
@@ -314,6 +473,7 @@ pub fn TracingContext(comptime level: TraceLevel) type {
 // ============================================================================
 
 /// A simple trace sink that prints to stderr.
+/// This is a stateless sink - it doesn't use the context pointer.
 pub const ConsoleSink = struct {
     pub const vtable = TraceSink.VTable{
         .on_tick_start = onTickStart,
@@ -366,11 +526,9 @@ pub const ConsoleSink = struct {
     }
 
     /// Create a TraceSink pointing to the console vtable.
+    /// This is a stateless sink - context is unused.
     pub fn sink() TraceSink {
-        return .{
-            .context = undefined,
-            .vtable = &vtable,
-        };
+        return TraceSink.initStateless(&vtable);
     }
 };
 

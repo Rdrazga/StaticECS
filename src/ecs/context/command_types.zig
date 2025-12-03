@@ -32,8 +32,12 @@ pub fn CommandType(comptime max_data_size: u32) type {
         spawn: SpawnCommandType(max_data_size),
         /// Despawn an entity.
         despawn: EntityHandle,
-        /// Set a component value on an entity.
+        /// Set a component value on an entity (entity must already have the component).
         set_component: SetComponentCommandType(max_data_size),
+        /// Add a component to an existing entity (may trigger archetype migration).
+        add_component: AddComponentCommandType(max_data_size),
+        /// Remove a component from an entity (may trigger archetype migration).
+        remove_component: RemoveComponentCommand,
         /// Custom user command (id + optional data pointer).
         custom: CustomCommand,
     };
@@ -58,6 +62,38 @@ pub fn SetComponentCommandType(comptime max_data_size: u32) type {
         size: usize = 0,
     };
 }
+
+/// Add component command with configurable data size.
+/// Tiger Style: Adds a component to an existing entity, possibly triggering archetype migration.
+///
+/// ## Migration Note
+/// Adding a component to an entity may require moving it to a different archetype.
+/// This is handled during flush by the world's archetype migration logic.
+pub fn AddComponentCommandType(comptime max_data_size: u32) type {
+    return struct {
+        /// The entity to add the component to.
+        entity: EntityHandle,
+        /// Compile-time generated component type ID.
+        component_type: u32,
+        /// Inline component data (copied from value).
+        data: [max_data_size]u8 = .{0} ** max_data_size,
+        /// Actual size of the component data.
+        size: usize = 0,
+    };
+}
+
+/// Remove component command (no data needed beyond entity and type).
+/// Tiger Style: Removes a component from an entity, possibly triggering archetype migration.
+///
+/// ## Migration Note
+/// Removing a component from an entity may require moving it to a different archetype.
+/// The component data is simply dropped during migration.
+pub const RemoveComponentCommand = struct {
+    /// The entity to remove the component from.
+    entity: EntityHandle,
+    /// Compile-time generated component type ID.
+    component_type: u32,
+};
 
 /// Custom command type (size-independent).
 pub const CustomCommand = struct {

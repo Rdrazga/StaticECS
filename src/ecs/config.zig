@@ -95,6 +95,11 @@ pub const DefaultFastPathPredicate = config_mod.DefaultFastPathPredicate;
 pub const HybridPipelineConfig = config_mod.HybridPipelineConfig;
 pub const PipelineConfig = config_mod.PipelineConfig;
 
+// Input data mapping types (P-M3 fix)
+pub const DefaultInputDataMapper = config_mod.DefaultInputDataMapper;
+pub const RawInputData = config_mod.RawInputData;
+pub const RawInputDataMapper = config_mod.RawInputDataMapper;
+
 // ============================================================================
 // Scalability Configuration
 // ============================================================================

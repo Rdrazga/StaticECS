@@ -1,18 +1,66 @@
-//! Dense Archetype Storage
+//! # Archetype Table
 //!
-//! This module implements Structure-of-Arrays (SoA) storage for entities
-//! with a fixed component set. Each archetype has a table that stores
-//! component data in dense, cache-friendly arrays.
+//! Purpose: Structure-of-Arrays (SoA) storage for entities sharing a component set.
+//! Provides cache-friendly, dense storage optimized for iteration performance.
 //!
-//! ## Capacity Modes (Tiger_Style Compliance)
+//! ## Key Types
+//! - `ArchetypeTable` - Generic table type parameterized by component types
+//! - `ArchetypeError` - Error types (CapacityExhausted, EntityNotFound, etc.)
 //!
-//! The archetype table supports two capacity modes:
-//! - **Fixed** (default): Preallocated arrays, returns error on overflow.
-//!   Tiger_Style compliant - no dynamic allocation after initialization.
-//! - **Dynamic**: ArrayList-based, grows as needed.
-//!   For backward compatibility when entity count is unbounded.
+//! ## Memory Layout
+//! ```
+//! Archetype "dynamic" (Position, Velocity):
+//!
+//! entity_ids:  [ E0 | E1 | E2 | E3 | ... ]   // Dense entity array
+//! positions:   [ P0 | P1 | P2 | P3 | ... ]   // Component array 1
+//! velocities:  [ V0 | V1 | V2 | V3 | ... ]   // Component array 2
+//!
+//! Row 0: E0 has P0, V0
+//! Row 1: E1 has P1, V1
+//! ...
+//! ```
+//!
+//! ## Usage
+//! ```zig
+//! const Table = ArchetypeTable(&.{Position, Velocity}, .fixed, 1000);
+//! var table = Table.init(allocator, "dynamic");
+//! defer table.deinit();
+//!
+//! // Add entity with components
+//! const row = try table.addEntity(entity_id, .{
+//!     Position{ .x = 0, .y = 0, .z = 0 },
+//!     Velocity{ .x = 1, .y = 0, .z = 0 },
+//! });
+//!
+//! // Access components by row
+//! const pos = table.getComponent(Position, row);
+//! pos.x += vel.x * dt;
+//! ```
+//!
+//! ## Capacity Modes (Tiger Style)
+//! | Mode | Behavior | Allocation | Tiger Style |
+//! |------|----------|------------|-------------|
+//! | `.fixed` | Pre-allocated, fail on overflow | Init only | ✅ Compliant |
+//! | `.dynamic` | ArrayList growth | Runtime | ⚠️ Not recommended |
+//!
+//! ## Performance Characteristics
+//! - O(1) component access by row index
+//! - O(n) entity lookup (linear scan)
+//! - Cache-friendly iteration (sequential memory access)
+//! - Swap-remove for O(1) entity deletion
+//!
+//! ## Thread Safety
+//! - NOT thread-safe for concurrent modification
+//! - Safe for concurrent read-only access
+//! - Use command buffers for deferred modifications in parallel systems
+//!
+//! ## Related Modules
+//! - `entity.zig` - Entity ID and handle types
+//! - `query.zig` - Query iteration over archetype tables
+//! - `../world.zig` - World manages multiple archetype tables
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -152,6 +200,40 @@ pub fn ArchetypeTable(
             };
         }
 
+        // ==================================================================
+        // AT-4: Invariant Assertions (Tiger_Style: Exhaustive validation)
+        // ==================================================================
+
+        /// Debug-only assertion that validates critical invariants:
+        /// 1. All component arrays have the same length as entity_ids
+        /// 2. count field matches actual storage length
+        ///
+        /// Tiger Style: Exhaustive assertions to catch bugs early.
+        /// Called after mutations in debug builds only.
+        fn assertInvariants(self: *const Self) void {
+            // Only run checks in Debug mode (skip in ReleaseSafe/ReleaseFast/ReleaseSmall)
+            if (builtin.mode != .Debug) return;
+
+            const entity_len = switch (capacity_mode) {
+                .fixed => self.count,
+                .dynamic => @as(u32, @intCast(self.entity_ids.items.len)),
+            };
+
+            // Verify count matches entity_ids length
+            assert(self.count == entity_len);
+
+            // Verify all component arrays match entity_ids length
+            if (component_count > 0) {
+                inline for (0..component_count) |i| {
+                    const comp_len: u32 = switch (capacity_mode) {
+                        .fixed => self.count, // Fixed mode uses count, arrays are pre-allocated
+                        .dynamic => @intCast(self.component_storage[i].items.len),
+                    };
+                    assert(comp_len == entity_len);
+                }
+            }
+        }
+
         /// Initialize an archetype table with pre-allocated capacity.
         /// For fixed mode, this is equivalent to init() (already pre-allocated).
         /// For dynamic mode, this reserves capacity upfront.
@@ -224,78 +306,92 @@ pub fn ArchetypeTable(
             };
         }
 
+        // ==================================================================
+        // AT-5: addEntity Helper Functions (Tiger_Style: ≤70 lines per fn)
+        // ==================================================================
+
+        /// Resolve component value from a components struct/tuple.
+        /// Returns either the matching field value, T.default, or zero-initialized.
+        /// Tiger Style: Pure compile-time helper for component value resolution.
+        fn resolveComponentValue(comptime T: type, comptime Components: type, components: Components) T {
+            // Why: Centralize component resolution logic to avoid duplication
+            // How: Compile-time field matching with fallback to defaults
+            return inline for (std.meta.fields(Components)) |field| {
+                if (field.type == T) break @field(components, field.name);
+            } else if (@hasDecl(T, "default")) T.default else std.mem.zeroes(T);
+        }
+
+        /// Store components for an entity in fixed capacity mode.
+        /// Tiger Style: Pure helper with bounded storage, no dynamic allocation.
+        /// Pre-condition: row < fixed_capacity (caller verified via error return)
+        fn storeEntityFixed(self: *Self, row: u32, entity_id: EntityId, comptime Components: type, components: Components) void {
+            // Assert pre-condition: row is within bounds (defensive, caller checked)
+            assert(row < fixed_capacity);
+
+            self.entity_ids[row] = entity_id;
+            inline for (0..component_count) |i| {
+                self.component_storage[i][row] = resolveComponentValue(component_types[i], Components, components);
+            }
+
+            // Assert post-condition: entity ID was stored correctly
+            assert(self.entity_ids[row] == entity_id);
+        }
+
+        /// Store components for an entity in dynamic capacity mode.
+        /// Tiger Style: Growable storage with optional max_capacity bound.
+        /// Pre-condition: max_capacity == 0 OR count < max_capacity (caller verified)
+        fn storeEntityDynamic(self: *Self, entity_id: EntityId, comptime Components: type, components: Components) !void {
+            // Assert pre-condition: capacity limit honored if configured
+            assert(max_capacity == 0 or self.count < max_capacity);
+
+            try self.entity_ids.append(self.allocator, entity_id);
+            errdefer _ = self.entity_ids.pop();
+
+            inline for (0..component_count) |i| {
+                try self.component_storage[i].append(
+                    self.allocator,
+                    resolveComponentValue(component_types[i], Components, components),
+                );
+            }
+
+            // Assert post-condition: entity appended to end of storage
+            assert(self.entity_ids.items[self.entity_ids.items.len - 1] == entity_id);
+        }
+
         /// Add an entity with its component values.
         /// Returns the row index where the entity was stored.
         /// In fixed mode, returns error.CapacityExhausted if full.
+        /// AT-3: Also validates against max_capacity in dynamic mode if configured.
         pub fn addEntity(self: *Self, entity_id: EntityId, components: anytype) !u32 {
             const Components = @TypeOf(components);
             const row = self.count;
 
+            // Assert pre-condition: count is consistent with storage state
+            assert(row == switch (capacity_mode) {
+                .fixed => self.count,
+                .dynamic => @as(u32, @intCast(self.entity_ids.items.len)),
+            });
+
             switch (capacity_mode) {
                 .fixed => {
                     // Tiger_Style: Check capacity before any mutation
-                    if (row >= fixed_capacity) {
-                        return ArchetypeError.CapacityExhausted;
-                    }
-
-                    // Store entity ID
-                    self.entity_ids[row] = entity_id;
-
-                    // Store each component value
-                    inline for (0..component_count) |i| {
-                        const T = component_types[i];
-
-                        // Find matching field in components tuple/struct
-                        const value = inline for (std.meta.fields(Components)) |field| {
-                            if (field.type == T) {
-                                break @field(components, field.name);
-                            }
-                        } else {
-                            // Component not provided - use default
-                            if (@hasDecl(T, "default")) {
-                                break T.default;
-                            } else {
-                                break std.mem.zeroes(T);
-                            }
-                        };
-
-                        self.component_storage[i][row] = value;
-                    }
-
-                    self.count += 1;
-                    return row;
+                    if (row >= fixed_capacity) return ArchetypeError.CapacityExhausted;
+                    self.storeEntityFixed(row, entity_id, Components, components);
                 },
                 .dynamic => {
-                    // Ensure capacity for all arrays
-                    try self.entity_ids.append(self.allocator, entity_id);
-                    errdefer _ = self.entity_ids.pop();
-
-                    // Add each component value
-                    inline for (0..component_count) |i| {
-                        const T = component_types[i];
-                        const array = &self.component_storage[i];
-
-                        // Find matching field in components tuple/struct
-                        const value = inline for (std.meta.fields(Components)) |field| {
-                            if (field.type == T) {
-                                break @field(components, field.name);
-                            }
-                        } else {
-                            // Component not provided - use default
-                            if (@hasDecl(T, "default")) {
-                                break T.default;
-                            } else {
-                                break std.mem.zeroes(T);
-                            }
-                        };
-
-                        try array.append(self.allocator, value);
-                    }
-
-                    self.count += 1;
-                    return row;
+                    // AT-3: Validate against max_capacity if configured (non-zero)
+                    if (max_capacity > 0 and row >= max_capacity) return ArchetypeError.CapacityExhausted;
+                    try self.storeEntityDynamic(entity_id, Components, components);
                 },
             }
+
+            self.count += 1;
+
+            // Assert post-condition: count incremented correctly
+            assert(self.count == row + 1);
+
+            self.assertInvariants(); // AT-4: Verify invariants after mutation
+            return row;
         }
 
         /// Remove an entity by row index. Uses swap-remove for O(1) performance.
@@ -304,6 +400,7 @@ pub fn ArchetypeTable(
             if (row >= self.count) return null;
 
             const last_row = self.count - 1;
+            var moved_entity: ?EntityId = null;
 
             switch (capacity_mode) {
                 .fixed => {
@@ -319,9 +416,8 @@ pub fn ArchetypeTable(
 
                     // Return the entity that was moved into this slot
                     if (row < self.count) {
-                        return self.entity_ids[row];
+                        moved_entity = self.entity_ids[row];
                     }
-                    return null;
                 },
                 .dynamic => {
                     // Swap-remove the entity ID
@@ -336,11 +432,13 @@ pub fn ArchetypeTable(
 
                     // Return the entity that was moved into this slot
                     if (row < self.count) {
-                        return self.entity_ids.items[row];
+                        moved_entity = self.entity_ids.items[row];
                     }
-                    return null;
                 },
             }
+
+            self.assertInvariants(); // AT-4: Verify invariants after mutation
+            return moved_entity;
         }
 
         /// Get a pointer to a component for an entity at a given row.
@@ -401,6 +499,19 @@ pub fn ArchetypeTable(
         }
 
         /// Find the row index for a given entity ID.
+        ///
+        /// ## AT-2: O(n) Linear Search Warning
+        /// **IMPORTANT**: This function uses O(n) linear search through all entities.
+        /// It is intended ONLY for:
+        /// - Debug assertions and invariant verification
+        /// - Testing and validation
+        /// - Rare, non-performance-critical lookups
+        ///
+        /// **DO NOT** use in hot paths or performance-critical code.
+        /// For efficient entity-to-row mapping, use EntityManager metadata
+        /// which provides O(1) lookup via `archetype_row` field.
+        ///
+        /// Tiger Style: Document performance characteristics explicitly.
         pub fn findEntity(self: *const Self, entity_id: EntityId) ?u32 {
             const entities = switch (capacity_mode) {
                 .fixed => self.entity_ids[0..self.count],
@@ -514,6 +625,7 @@ pub fn ArchetypeTable(
         /// Returns the row index where the entity was stored.
         /// Tiger Style: Bytes must match packedComponentSize() exactly.
         /// In fixed mode, returns error.CapacityExhausted if full.
+        /// AT-3: Also validates against max_capacity in dynamic mode if configured.
         pub fn addEntityFromBytes(self: *Self, entity_id: EntityId, data: []const u8) !u32 {
             const expected_size = packedComponentSize();
             std.debug.assert(data.len == expected_size); // Precondition: data size matches
@@ -543,9 +655,16 @@ pub fn ArchetypeTable(
                     }
 
                     self.count += 1;
+                    self.assertInvariants(); // AT-4: Verify invariants after mutation
                     return row;
                 },
                 .dynamic => {
+                    // AT-3: Validate against max_capacity if configured (non-zero)
+                    // Tiger Style: Bounded growth even in dynamic mode when limit specified
+                    if (max_capacity > 0 and row >= max_capacity) {
+                        return ArchetypeError.CapacityExhausted;
+                    }
+
                     // Reserve space for entity
                     try self.entity_ids.append(self.allocator, entity_id);
                     errdefer _ = self.entity_ids.pop();
@@ -564,6 +683,7 @@ pub fn ArchetypeTable(
                     }
 
                     self.count += 1;
+                    self.assertInvariants(); // AT-4: Verify invariants after mutation
                     return row;
                 },
             }

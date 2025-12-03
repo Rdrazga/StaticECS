@@ -8,9 +8,14 @@
 const std = @import("std");
 const testing = std.testing;
 
-const ecs = @import("../ecs.zig");
-const WorldConfig = ecs.WorldConfig;
-const EntityHandle = ecs.EntityHandle;
+// Direct imports to avoid path issues when benchmark.zig is root module
+const config_mod = @import("config.zig");
+const WorldConfig = config_mod.WorldConfig;
+
+const entity_mod = @import("world/entity.zig");
+const EntityHandle = entity_mod.EntityHandle;
+
+const world_mod = @import("world.zig");
 
 const system_context_mod = @import("system_context.zig");
 const SystemContext = system_context_mod.SystemContext;
@@ -82,7 +87,7 @@ const test_config = WorldConfig{
     },
 };
 
-const TestWorld = ecs.World(test_config);
+const TestWorld = world_mod.World(test_config);
 const TestContext = SystemContext(test_config, TestWorld);
 const TestResources = Resources(test_config.resources.types);
 const TestCmdBuf = TestContext.CmdBuf;

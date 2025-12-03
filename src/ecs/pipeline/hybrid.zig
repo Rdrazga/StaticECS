@@ -58,6 +58,24 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
 
         /// Thread-safe ring buffer queue for fast-path entities.
         ///
+        /// ## Why Hybrid-Only (Architecture Decision)
+        ///
+        /// This SPSC queue is intentionally scoped to the hybrid pipeline and is NOT
+        /// exposed as a general-purpose data structure. Reasons:
+        ///
+        /// 1. **Tight Coupling**: The queue's semantics (FastPathItem, InputData, OutputData)
+        ///    are specifically designed for the hybrid pipeline's fast-path bypass pattern.
+        ///
+        /// 2. **Existing Alternatives**: For general SPSC/MPSC needs:
+        ///    - `coordination/lock_free_queue.zig` - MPSC lock-free queue for multi-world
+        ///    - `std.fifo` - Standard library bounded FIFO
+        ///
+        /// 3. **Simplicity**: Hybrid-specific allows optimizations (e.g., fixed item types)
+        ///    that wouldn't apply to a generic queue.
+        ///
+        /// If you need a general-purpose SPSC queue, consider using `std.fifo` or
+        /// implementing one in a shared `utils/` module with generic types.
+        ///
         /// ## Thread Safety Model: SPSC (Single-Producer Single-Consumer)
         ///
         /// This queue is designed for scenarios where exactly ONE thread
@@ -200,15 +218,26 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
         // Data Types
         // ====================================================================
 
+        /// Configurable buffer sizes from HybridPipelineConfig.
+        /// Tiger Style: Comptime-computed sizes for zero runtime overhead.
+        const input_buffer_size = hybrid_cfg.input_buffer_size;
+        const output_buffer_size = hybrid_cfg.output_buffer_size;
+
         /// Input data type (can be customized via config).
-        /// Default is a generic byte buffer.
+        /// Buffer size is configurable via HybridPipelineConfig.input_buffer_size.
+        /// Default 256 bytes maintains backward compatibility.
         pub const InputData = struct {
-            /// Raw data buffer.
-            data: [256]u8 = undefined,
+            /// Raw data buffer (size configurable via config).
+            data: [input_buffer_size]u8 = undefined,
             /// Length of valid data.
             len: u32 = 0,
             /// User-defined flags.
             flags: u32 = 0,
+
+            /// Get the configured buffer capacity.
+            pub fn capacity() u32 {
+                return input_buffer_size;
+            }
 
             /// Initialize from slice.
             pub fn fromSlice(slice: []const u8) InputData {
@@ -226,13 +255,20 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
         };
 
         /// Output data type (can be customized via config).
+        /// Buffer size is configurable via HybridPipelineConfig.output_buffer_size.
+        /// Default 256 bytes maintains backward compatibility.
         pub const OutputData = struct {
-            /// Raw data buffer.
-            data: [256]u8 = undefined,
+            /// Raw data buffer (size configurable via config).
+            data: [output_buffer_size]u8 = undefined,
             /// Length of valid data.
             len: u32 = 0,
             /// Status code.
             status: i32 = 0,
+
+            /// Get the configured buffer capacity.
+            pub fn capacity() u32 {
+                return output_buffer_size;
+            }
 
             /// Initialize from slice.
             pub fn fromSlice(slice: []const u8) OutputData {
@@ -381,9 +417,13 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
         }
 
         /// Process input via ECS pipeline.
-        /// Creates an entity in the first configured archetype with default-initialized
-        /// components. The input data is acknowledged but semantic mapping to specific
-        /// component fields requires user-provided converters (future enhancement).
+        /// Creates an entity in the first configured archetype with components
+        /// initialized via the configured InputDataMapper.
+        ///
+        /// The mapper determines how input data maps to component values:
+        /// - DefaultInputDataMapper: Zero-initializes all components (backward compatible)
+        /// - RawInputDataMapper: Stores input bytes in RawInputData component if present
+        /// - Custom mappers: User-defined mapping logic
         ///
         /// Tiger Style: Fail-fast on errors, explicit bounds checking.
         fn processViaEcs(self: *Self, input: InputData) Error!void {
@@ -401,17 +441,13 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
             // Use first archetype as fallback destination
             // Future: Make fallback archetype configurable via HybridPipelineConfig
             const fallback_arch = cfg.archetypes.archetypes[0];
-            const FallbackComponents = @Tuple(fallback_arch.components);
 
-            // Create default-initialized component values
-            // Note: Components are zero-initialized; input bytes are acknowledged
-            // but not copied to components (would require type-specific mapping)
-            var components: FallbackComponents = undefined;
-            inline for (0..fallback_arch.components.len) |i| {
-                components[i] = std.mem.zeroes(fallback_arch.components[i]);
-            }
+            // Use configured mapper to convert input data to components
+            // This fixes P-M3: Input data now mapped to components instead of zero-initialization
+            const InputMapper = hybrid_cfg.input_data_mapper_type;
+            const components = InputMapper.mapInputToComponents(fallback_arch.components, input);
 
-            // Spawn entity with fallback archetype
+            // Spawn entity with mapped component values
             _ = self.world.spawn(fallback_arch.name, components) catch |err| {
                 // Track failed spawn attempts
                 self.stats.ecs_errors += 1;
@@ -422,10 +458,6 @@ pub fn HybridPipeline(comptime cfg: WorldConfig) type {
                 return error.EcsProcessingFailed;
             };
 
-            // Input data acknowledged - entity created as proxy
-            // The input.data bytes could be stored if we had a RawData component,
-            // but that would require adding it to the archetype configuration
-            // Input is used in assert above, no need for explicit discard
             self.stats.ecs_processed += 1;
         }
 
@@ -736,6 +768,93 @@ test "InputData and OutputData" {
     try std.testing.expectEqualStrings("response", output.asSlice());
 }
 
+test "InputData configurable buffer size" {
+    // Test P-M4: InputData buffer size is configurable via config.
+    // Verifies that different buffer sizes work correctly.
+
+    // Test 1: Small buffer (64 bytes)
+    {
+        const SmallPipeline = HybridPipeline(WorldConfig{
+            .components = .{ .types = &.{struct { x: i32 }} },
+            .archetypes = .{ .archetypes = &.{} },
+            .pipeline = .{
+                .mode = .hybrid,
+                .hybrid = .{
+                    .input_buffer_size = 64,
+                    .output_buffer_size = 64,
+                },
+            },
+        });
+
+        // Verify capacity reports configured size
+        try std.testing.expectEqual(@as(u32, 64), SmallPipeline.InputData.capacity());
+        try std.testing.expectEqual(@as(u32, 64), SmallPipeline.OutputData.capacity());
+
+        // Test data fits within small buffer
+        const input = SmallPipeline.InputData.fromSlice("short data");
+        try std.testing.expectEqual(@as(u32, 10), input.len);
+        try std.testing.expectEqualStrings("short data", input.asSlice());
+    }
+
+    // Test 2: Large buffer (1024 bytes)
+    {
+        const LargePipeline = HybridPipeline(WorldConfig{
+            .components = .{ .types = &.{struct { x: i32 }} },
+            .archetypes = .{ .archetypes = &.{} },
+            .pipeline = .{
+                .mode = .hybrid,
+                .hybrid = .{
+                    .input_buffer_size = 1024,
+                    .output_buffer_size = 512,
+                },
+            },
+        });
+
+        // Verify capacity reports configured size
+        try std.testing.expectEqual(@as(u32, 1024), LargePipeline.InputData.capacity());
+        try std.testing.expectEqual(@as(u32, 512), LargePipeline.OutputData.capacity());
+
+        // Test large data fits in large buffer
+        var large_data: [500]u8 = undefined;
+        @memset(&large_data, 'X');
+        const input = LargePipeline.InputData.fromSlice(&large_data);
+        try std.testing.expectEqual(@as(u32, 500), input.len);
+    }
+
+    // Test 3: Default buffer (256 bytes - backward compatible)
+    {
+        const DefaultPipeline = HybridPipeline(WorldConfig{
+            .components = .{ .types = &.{struct { x: i32 }} },
+            .archetypes = .{ .archetypes = &.{} },
+            .pipeline = .{ .mode = .hybrid },
+        });
+
+        // Verify default maintains backward compatibility
+        try std.testing.expectEqual(@as(u32, 256), DefaultPipeline.InputData.capacity());
+        try std.testing.expectEqual(@as(u32, 256), DefaultPipeline.OutputData.capacity());
+    }
+
+    // Test 4: Truncation with small buffer
+    {
+        const TinyPipeline = HybridPipeline(WorldConfig{
+            .components = .{ .types = &.{struct { x: i32 }} },
+            .archetypes = .{ .archetypes = &.{} },
+            .pipeline = .{
+                .mode = .hybrid,
+                .hybrid = .{
+                    .input_buffer_size = 8,
+                    .output_buffer_size = 8,
+                },
+            },
+        });
+
+        // Data exceeding buffer should be truncated
+        const input = TinyPipeline.InputData.fromSlice("this is way too long for the buffer");
+        try std.testing.expectEqual(@as(u32, 8), input.len);
+        try std.testing.expectEqualStrings("this is ", input.asSlice());
+    }
+}
+
 // ============================================================================
 // Phase 2 Bug Fix Regression Test
 // ============================================================================
@@ -890,4 +1009,261 @@ test "HybridPipeline processViaEcs fallback when queue full" {
     try std.testing.expectEqual(@as(u64, 1), pipeline.stats.fallback_count);
     try std.testing.expectEqual(@as(u64, 1), pipeline.stats.ecs_processed);
     try std.testing.expectEqual(@as(u32, 1), world.entityCount()); // One ECS entity created
+}
+
+// ============================================================================
+// P-M3 Fix Tests: Input Data Mapping in ECS Fallback
+// ============================================================================
+
+const query_mod = @import("../world/query.zig");
+const QuerySpec = query_mod.QuerySpec;
+
+test "HybridPipeline RawInputDataMapper preserves input data" {
+    // Test P-M3 fix: Input data is properly mapped to components during ECS fallback.
+    //
+    // Previously, processViaEcs zero-initialized all components, losing input data.
+    // Now, with RawInputDataMapper, input bytes are preserved in RawInputData component.
+
+    const RawInputData = config_mod.RawInputData;
+    const RawInputDataMapper = config_mod.RawInputDataMapper;
+
+    // Predicate that forces ECS fallback for all inputs
+    const NeverFastPath = struct {
+        pub fn canFastPath(input: anytype) bool {
+            _ = input;
+            return false;
+        }
+    };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{RawInputData} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "raw_entity", .components = &.{RawInputData} },
+        } },
+        .pipeline = .{
+            .mode = .hybrid,
+            .hybrid = .{
+                .fast_path_predicate_type = NeverFastPath,
+                .fast_path_capacity = 10,
+                .fallback_on_full = true,
+                .input_data_mapper_type = RawInputDataMapper, // Use mapper that preserves input
+            },
+        },
+        .options = .{
+            .max_entities = 100,
+            .enable_debug_asserts = false,
+        },
+    };
+
+    const WorldType = @import("../world.zig").World(test_config);
+    const Pipeline = HybridPipeline(test_config);
+
+    var world = WorldType.init(std.testing.allocator);
+    defer world.deinit();
+
+    var pipeline = Pipeline.init(&world);
+
+    // Create input with known data
+    var input = Pipeline.InputData.fromSlice("Hello, ECS Fallback!");
+    input.flags = 42;
+
+    const dummy_callback = struct {
+        fn cb(in: *Pipeline.InputData, out: *Pipeline.OutputData) void {
+            _ = in;
+            out.status = 200;
+        }
+    }.cb;
+
+    // Process - should go through ECS fallback with data mapping
+    try pipeline.process(input, dummy_callback);
+
+    // Verify entity was created
+    try std.testing.expectEqual(@as(u32, 1), world.entityCount());
+    try std.testing.expectEqual(@as(u64, 1), pipeline.stats.ecs_processed);
+
+    // Query to verify the RawInputData component has the correct data
+    const RawQuery = QuerySpec(&.{RawInputData}, &.{}, &.{}, &.{});
+    var query = world.query(RawQuery);
+
+    var found = false;
+    while (query.next()) |result| {
+        found = true;
+        const raw = result.getRead(RawInputData);
+        // Verify data was preserved
+        try std.testing.expectEqual(@as(u32, 20), raw.len); // "Hello, ECS Fallback!".len == 20
+        try std.testing.expectEqual(@as(u32, 42), raw.flags);
+        try std.testing.expectEqualStrings("Hello, ECS Fallback!", raw.data[0..raw.len]);
+    }
+
+    try std.testing.expect(found);
+}
+
+test "HybridPipeline DefaultInputDataMapper zero-initializes (backward compatible)" {
+    // Test that DefaultInputDataMapper maintains backward compatibility by zero-initializing.
+    //
+    // This ensures existing code that doesn't configure a mapper continues to work.
+
+    const NeverFastPath = struct {
+        pub fn canFastPath(input: anytype) bool {
+            _ = input;
+            return false;
+        }
+    };
+
+    const TestPosition = struct { x: f32 = 999.0, y: f32 = 999.0 }; // Non-zero defaults
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{TestPosition} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "positioned", .components = &.{TestPosition} },
+        } },
+        .pipeline = .{
+            .mode = .hybrid,
+            .hybrid = .{
+                .fast_path_predicate_type = NeverFastPath,
+                // No input_data_mapper_type specified - uses default
+            },
+        },
+        .options = .{
+            .max_entities = 100,
+            .enable_debug_asserts = false,
+        },
+    };
+
+    const WorldType = @import("../world.zig").World(test_config);
+    const Pipeline = HybridPipeline(test_config);
+
+    var world = WorldType.init(std.testing.allocator);
+    defer world.deinit();
+
+    var pipeline = Pipeline.init(&world);
+
+    const input = Pipeline.InputData.fromSlice("some data");
+    const dummy_callback = struct {
+        fn cb(in: *Pipeline.InputData, out: *Pipeline.OutputData) void {
+            _ = in;
+            out.status = 200;
+        }
+    }.cb;
+
+    try pipeline.process(input, dummy_callback);
+
+    // Verify entity created
+    try std.testing.expectEqual(@as(u32, 1), world.entityCount());
+
+    // Query to verify TestPosition was zero-initialized (not using struct defaults)
+    const PosQuery = QuerySpec(&.{TestPosition}, &.{}, &.{}, &.{});
+    var query = world.query(PosQuery);
+
+    var found = false;
+    while (query.next()) |result| {
+        found = true;
+        const pos = result.getRead(TestPosition);
+        // Default mapper zero-initializes, so x and y should be 0, not 999
+        try std.testing.expectEqual(@as(f32, 0.0), pos.x);
+        try std.testing.expectEqual(@as(f32, 0.0), pos.y);
+    }
+
+    try std.testing.expect(found);
+}
+
+test "HybridPipeline custom InputDataMapper maps input fields" {
+    // Test that users can provide custom mappers to map input data to specific components.
+    //
+    // This demonstrates the P-M3 fix extensibility: users define how input maps to components.
+
+    const Position = struct { x: f32, y: f32 };
+    const Velocity = struct { dx: f32, dy: f32 };
+
+    // Custom mapper that extracts position from input flags
+    const CustomPositionMapper = struct {
+        pub fn mapInputToComponents(comptime ComponentTypes: []const type, input: anytype) Tuple(ComponentTypes) {
+            var result: Tuple(ComponentTypes) = undefined;
+            inline for (0..ComponentTypes.len) |i| {
+                const CompType = ComponentTypes[i];
+                if (CompType == Position) {
+                    // Extract x,y from input flags (high/low bytes for demo)
+                    const flags = input.flags;
+                    result[i] = Position{
+                        .x = @floatFromInt((flags >> 16) & 0xFFFF),
+                        .y = @floatFromInt(flags & 0xFFFF),
+                    };
+                } else {
+                    result[i] = std.mem.zeroes(CompType);
+                }
+            }
+            return result;
+        }
+
+        fn Tuple(comptime types: []const type) type {
+            return std.meta.Tuple(types);
+        }
+    };
+
+    const NeverFastPath = struct {
+        pub fn canFastPath(input: anytype) bool {
+            _ = input;
+            return false;
+        }
+    };
+
+    const test_config = WorldConfig{
+        .components = .{ .types = &.{ Position, Velocity } },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "movable", .components = &.{ Position, Velocity } },
+        } },
+        .pipeline = .{
+            .mode = .hybrid,
+            .hybrid = .{
+                .fast_path_predicate_type = NeverFastPath,
+                .input_data_mapper_type = CustomPositionMapper,
+            },
+        },
+        .options = .{
+            .max_entities = 100,
+            .enable_debug_asserts = false,
+        },
+    };
+
+    const WorldType = @import("../world.zig").World(test_config);
+    const Pipeline = HybridPipeline(test_config);
+
+    var world = WorldType.init(std.testing.allocator);
+    defer world.deinit();
+
+    var pipeline = Pipeline.init(&world);
+
+    // Create input with encoded position in flags: x=100, y=200
+    var input = Pipeline.InputData{};
+    input.flags = (100 << 16) | 200;
+
+    const dummy_callback = struct {
+        fn cb(in: *Pipeline.InputData, out: *Pipeline.OutputData) void {
+            _ = in;
+            out.status = 200;
+        }
+    }.cb;
+
+    try pipeline.process(input, dummy_callback);
+
+    // Verify entity created with mapped position
+    try std.testing.expectEqual(@as(u32, 1), world.entityCount());
+
+    const MoveQuery = QuerySpec(&.{ Position, Velocity }, &.{}, &.{}, &.{});
+    var query = world.query(MoveQuery);
+
+    var found = false;
+    while (query.next()) |result| {
+        found = true;
+        const pos = result.getRead(Position);
+        const vel = result.getRead(Velocity);
+        // Custom mapper extracted position from flags
+        try std.testing.expectEqual(@as(f32, 100.0), pos.x);
+        try std.testing.expectEqual(@as(f32, 200.0), pos.y);
+        // Velocity was zero-initialized
+        try std.testing.expectEqual(@as(f32, 0.0), vel.dx);
+        try std.testing.expectEqual(@as(f32, 0.0), vel.dy);
+    }
+
+    try std.testing.expect(found);
 }

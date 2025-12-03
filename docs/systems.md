@@ -4,25 +4,39 @@ This guide covers advanced patterns for writing systems in StaticECS.
 
 ## System Fundamentals
 
-Systems receive an opaque pointer to the context for compile-time registration flexibility:
+Systems receive an opaque pointer to the context for compile-time registration flexibility.
+
+### The getContext Helper Pattern
+
+Every system file should define a `getContext` helper function to safely cast the opaque context pointer to the proper type. This pattern is essential for type-safe system authoring:
 
 ```zig
 const FrameError = ecs.FrameError;
 const World = ecs.World(cfg);
 const Context = ecs.SystemContext(cfg, World);
 
-// Helper function to cast opaque pointer
+/// Helper function to cast opaque pointer to SystemContext.
+///
+/// This is necessary because systems are registered in the config at comptime,
+/// but SystemContext type depends on the config, creating a circular dependency.
+/// The opaque pointer breaks this cycle.
+///
+/// Safety: The scheduler guarantees ctx_ptr points to a valid SystemContext.
 fn getContext(ctx_ptr: *anyopaque) *Context {
     return @ptrCast(@alignCast(ctx_ptr));
 }
+```
 
+With this helper defined, systems become simple:
+
+```zig
 fn mySystem(ctx_ptr: *anyopaque) FrameError!void {
     const ctx = getContext(ctx_ptr);
-    // System logic here
+    // System logic using ctx.world, ctx.delta_time, etc.
 }
 ```
 
-> **Why opaque pointers?** This pattern enables compile-time system registration without circular type dependencies between the config and system definitions.
+> **Why opaque pointers?** This pattern enables compile-time system registration without circular type dependencies between the config and system definitions. The `SystemContext` type depends on `WorldConfig`, but we need to reference system functions in `WorldConfig.systems`, creating a cycle that opaque pointers resolve.
 
 Systems receive a `SystemContext` providing access to:
 - `ctx.world` - The world instance

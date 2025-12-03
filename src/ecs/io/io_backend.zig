@@ -312,30 +312,40 @@ pub const IoBackend = struct {
 
     /// Poll for completed operations (compatibility layer).
     ///
-    /// Note: std.Io uses Group.wait() model for completion synchronization,
-    /// not a polling model. This method returns 0 for compatibility with
-    /// event-driven architectures that expect poll semantics.
+    /// **DEPRECATED**: This method exists only for backwards compatibility with
+    /// event-driven architectures that expect poll semantics. std.Io uses
+    /// Group.wait() model for completion synchronization, not polling.
     ///
-    /// For actual completion waiting, use waitGroup() with a Group.
+    /// This method always returns 0 and performs no actual work.
+    /// For actual completion waiting, use `waitGroup()` with a Group.
+    ///
+    /// Migration: Replace poll() loops with Group-based waiting -
+    /// create a Group, schedule async work via scheduleAsync(), then
+    /// call waitGroup() which blocks until completion.
     pub fn poll(self: *Self) u32 {
         _ = self;
-        // std.Io model uses Group.wait() for completion notification.
+        // DEPRECATED: std.Io model uses Group.wait() for completion notification.
         // For non-blocking poll semantics, return 0.
         return 0;
     }
 
     /// Poll with timeout (compatibility layer).
     ///
-    /// Note: std.Io uses Group.wait() which blocks until completion.
-    /// For timeout semantics, use Group with cancel() after a timer.
-    /// This method returns 0 for compatibility.
+    /// **DEPRECATED**: This method exists only for backwards compatibility.
+    /// std.Io uses Group.wait() which blocks until completion. For timeout
+    /// semantics, use Group with cancel() after a timer.
+    ///
+    /// This method always returns 0 and ignores the timeout parameter.
+    ///
+    /// Migration: For timeout behavior, use a separate timer task with
+    /// Group-based cancellation instead of polling.
     ///
     /// Parameters:
-    ///   - timeout_ns: Timeout in nanoseconds (unused in std.Io model)
+    ///   - timeout_ns: Timeout in nanoseconds (unused - exists for API compatibility only)
     pub fn pollWithTimeout(self: *Self, timeout_ns: u64) u32 {
         _ = self;
         _ = timeout_ns;
-        // std.Io model doesn't support poll with timeout directly.
+        // DEPRECATED: std.Io model doesn't support poll with timeout directly.
         // Return 0 for compatibility.
         return 0;
     }

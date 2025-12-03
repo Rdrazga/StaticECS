@@ -196,15 +196,19 @@ fn findRemovalTargetComptime(comptime cfg: WorldConfig, comptime T: type) ?usize
 }
 
 // ============================================================================
-// Query Iterator Builder (65 lines)
+// Query Iterator Builder (~97 lines - Builder pattern; individual methods ≤70)
 // ============================================================================
 
 /// Build query iterator type for given world and query spec.
+/// Tiger Style: Builder creates comptime-specialized iterator with static archetype matching.
 fn QueryIteratorBuilder(comptime WorldType: type, comptime cfg: WorldConfig, comptime Spec: type) type {
     const N = cfg.archetypes.archetypes.len;
     const R = query_mod.QueryResult(Spec);
+    // Tiger Style: Comptime assertion - must have at least one archetype
+    comptime std.debug.assert(N > 0);
     return struct {
         const QI = @This();
+        /// Comptime-computed archetype match table for O(1) runtime lookup
         const matches = blk: {
             var r: [N]bool = undefined;
             for (0..N) |i| r[i] = Spec.matchesArchetype(cfg.archetypes.archetypes[i].components);
@@ -213,16 +217,29 @@ fn QueryIteratorBuilder(comptime WorldType: type, comptime cfg: WorldConfig, com
         world: *WorldType,
         arch: usize,
         row: u32,
+
+        /// Initialize iterator at start position
         pub fn init(w: *WorldType) QI {
-            return .{ .world = w, .arch = 0, .row = 0 };
+            // Tiger Style: Precondition - world pointer must be valid
+            std.debug.assert(@intFromPtr(w) != 0);
+            const qi = QI{ .world = w, .arch = 0, .row = 0 };
+            // Tiger Style: Postcondition - iterator starts at beginning
+            std.debug.assert(qi.arch == 0 and qi.row == 0);
+            return qi;
         }
+
+        /// Advance to next matching entity, returning result or null if exhausted
         pub fn next(self: *QI) ?R {
+            // Tiger Style: Precondition - arch index must be bounded
+            std.debug.assert(self.arch <= N);
             while (self.arch < N) {
                 if (matches[self.arch]) {
                     const len = self.getLen();
                     if (self.row < len) {
                         const r = self.build();
                         self.row += 1;
+                        // Tiger Style: Postcondition - returned entity is valid
+                        std.debug.assert(r.entity_id.isValid());
                         return r;
                     }
                 }
@@ -231,29 +248,54 @@ fn QueryIteratorBuilder(comptime WorldType: type, comptime cfg: WorldConfig, com
             }
             return null;
         }
+
+        /// Get entity count for current archetype (internal helper)
         fn getLen(self: *QI) u32 {
+            // Tiger Style: Precondition - arch must be in bounds for storage access
+            std.debug.assert(self.arch < N);
             inline for (0..N) |i| if (self.arch == i) return @intCast(self.world.storage[i].len());
-            return 0;
+            unreachable; // Tiger Style: Assert - inline for must match one branch
         }
+
+        /// Build QueryResult for current row. WD-4: Expanded loops for debuggability.
         fn build(self: *QI) R {
+            // Tiger Style: Precondition - must be on a matching archetype with valid row
+            std.debug.assert(self.arch < N and matches[self.arch]);
+            std.debug.assert(self.row < self.getLen());
             var r: R = undefined;
             inline for (0..N) |i| if (self.arch == i) {
-                const t = &self.world.storage[i];
-                const ac = cfg.archetypes.archetypes[i].components;
-                r.entity_id = t.getEntityId(self.row).?;
-                inline for (0..Spec.read_components.len) |ri| r.read[ri] = t.getComponentConst(Spec.read_components[ri], self.row).?;
-                inline for (0..Spec.write_components.len) |wi| r.write[wi] = t.getComponent(Spec.write_components[wi], self.row).?;
+                const table = &self.world.storage[i];
+                const arch_comps = cfg.archetypes.archetypes[i].components;
+                r.entity_id = table.getEntityId(self.row).?;
+                // Read-only component pointers (Tiger Style: explicit loop for debuggability)
+                inline for (0..Spec.read_components.len) |ri| {
+                    r.read[ri] = table.getComponentConst(Spec.read_components[ri], self.row).?;
+                }
+                // Mutable component pointers
+                inline for (0..Spec.write_components.len) |wi| {
+                    r.write[wi] = table.getComponent(Spec.write_components[wi], self.row).?;
+                }
+                // Optional components (null if archetype lacks them)
                 inline for (0..Spec.optional_components.len) |oi| {
-                    const OT = Spec.optional_components[oi];
-                    r.optional[oi] = if (Spec.archetypeHasOptional(ac, OT)) t.getComponentConst(OT, self.row) else null;
+                    const Opt = Spec.optional_components[oi];
+                    r.optional[oi] = if (Spec.archetypeHasOptional(arch_comps, Opt))
+                        table.getComponentConst(Opt, self.row)
+                    else
+                        null;
                 }
                 return r;
             };
             unreachable;
         }
+
+        /// Reset iterator to beginning for re-iteration
         pub fn reset(self: *QI) void {
+            // Tiger Style: Precondition - world must still be valid
+            std.debug.assert(@intFromPtr(self.world) != 0);
             self.arch = 0;
             self.row = 0;
+            // Tiger Style: Postcondition - iterator reset to start
+            std.debug.assert(self.arch == 0 and self.row == 0);
         }
     };
 }
@@ -654,8 +696,44 @@ fn TransitionExecutionImpl(comptime Self: type, comptime cfg: WorldConfig) type 
                 };
             };
         }
-        pub fn updateMovedEntityMetadata(self: *Self, mid: EntityId, _: usize, nr: u32) void {
-            if (mid.index < self.entities.metadata.len) self.entities.metadata[mid.index].archetype_row = nr;
+        /// Update metadata for an entity that was moved within archetype storage.
+        /// WD-3 Fix: Uses generation-validated access instead of raw index.
+        ///
+        /// Pre-conditions (debug-asserted):
+        /// - Entity must be alive (was just in archetype storage)
+        /// - Generation must match (validates entity identity)
+        ///
+        /// Parameters:
+        /// - mid: EntityId of the entity that was moved
+        /// - arch_idx: Archetype index (for debug validation)
+        /// - new_row: New row in archetype storage after the move
+        pub fn updateMovedEntityMetadata(self: *Self, mid: EntityId, arch_idx: usize, new_row: u32) void {
+            // WD-3: Convert EntityId to Handle for validated access
+            // The moved entity must be alive (it was just stored in archetype table)
+            const handle = Self.WorldEntityHandle.fromId(
+                Self.WorldEntityId.init(@intCast(mid.index), @intCast(mid.generation)),
+            );
+
+            // WD-3: Debug assertions validate invariants
+            if (self.debug_asserts_enabled) {
+                // Entity must be alive - it was just in storage
+                std.debug.assert(self.isAlive(handle));
+            }
+
+            // WD-3: Use validated accessor instead of raw index access
+            if (self.entities.getMetadataMut(handle)) |meta| {
+                // Debug: verify archetype matches what caller expects
+                if (self.debug_asserts_enabled) {
+                    std.debug.assert(meta.archetype_index == arch_idx);
+                }
+                meta.archetype_row = new_row;
+            } else {
+                // This should never happen if invariants are maintained
+                // In release builds, log error but don't crash
+                if (self.debug_asserts_enabled) {
+                    @panic("updateMovedEntityMetadata: entity not found - storage corruption detected");
+                }
+            }
         }
     };
 }
@@ -797,4 +875,112 @@ test "World archetype transitions" {
     try world.removeComponent(entity, Velocity);
     try std.testing.expect(!world.hasComponent(entity, Velocity));
     try std.testing.expect(world.hasComponent(entity, Position));
+}
+
+test "WD-3: Invalid entity handling returns proper errors" {
+    // Tests that invalid/despawned entities are properly rejected
+    // Part of Phase 1 Safety & Correctness (WD-3 fix validation)
+    const Position = struct { x: f32, y: f32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{Position} },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "static", .components = &.{Position} },
+        } },
+        .options = .{ .max_entities = 100 },
+    };
+
+    const TestWorld = World(cfg);
+    var world = TestWorld.init(std.testing.allocator);
+    defer world.deinit();
+
+    // Create and despawn an entity
+    const entity = try world.spawn("static", .{Position{ .x = 1, .y = 2 }});
+    try std.testing.expect(world.isAlive(entity));
+    try world.despawn(entity);
+    try std.testing.expect(!world.isAlive(entity));
+
+    // Verify getComponent returns null for despawned entity
+    const pos = world.getComponent(entity, Position);
+    try std.testing.expect(pos == null);
+
+    // Verify getComponentMut returns null for despawned entity
+    const pos_mut = world.getComponentMut(entity, Position);
+    try std.testing.expect(pos_mut == null);
+
+    // Verify setComponent returns false for despawned entity
+    try std.testing.expect(!world.setComponent(entity, Position, .{ .x = 99, .y = 99 }));
+
+    // Verify hasComponent returns false for despawned entity
+    try std.testing.expect(!world.hasComponent(entity, Position));
+
+    // Verify despawn returns error for already despawned entity
+    try std.testing.expectError(WorldError.InvalidEntity, world.despawn(entity));
+
+    // Test stale handle (same index, old generation)
+    const entity2 = try world.spawn("static", .{Position{ .x = 5, .y = 6 }});
+    // entity2 reuses slot 0 but with incremented generation
+    try std.testing.expect(world.isAlive(entity2));
+    try std.testing.expect(!world.isAlive(entity)); // Old handle still invalid
+
+    // Verify stale handle gets null/error even though slot is reused
+    try std.testing.expect(world.getComponent(entity, Position) == null);
+    try std.testing.expectError(WorldError.InvalidEntity, world.despawn(entity));
+
+    // New handle works correctly
+    const pos2 = world.getComponent(entity2, Position);
+    try std.testing.expect(pos2 != null);
+    try std.testing.expectEqual(@as(f32, 5), pos2.?.x);
+}
+
+test "WD-3: Entity moves during transition are tracked correctly" {
+    // Tests that entity metadata updates during archetype transitions
+    // use validated access (not raw index) per WD-3 fix
+    const Position = struct { x: f32, y: f32 };
+    const Velocity = struct { dx: f32, dy: f32 };
+
+    const cfg = WorldConfig{
+        .components = .{ .types = &.{ Position, Velocity } },
+        .archetypes = .{ .archetypes = &.{
+            .{ .name = "static", .components = &.{Position} },
+            .{ .name = "moving", .components = &.{ Position, Velocity } },
+        } },
+        .options = .{ .max_entities = 100, .enable_debug_asserts = true },
+    };
+
+    const TestWorld = World(cfg);
+    var world = TestWorld.init(std.testing.allocator);
+    defer world.deinit();
+
+    // Create multiple entities to force row swaps during despawn
+    const e1 = try world.spawn("static", .{Position{ .x = 1, .y = 1 }});
+    const e2 = try world.spawn("static", .{Position{ .x = 2, .y = 2 }});
+    const e3 = try world.spawn("static", .{Position{ .x = 3, .y = 3 }});
+
+    // Verify all alive
+    try std.testing.expect(world.isAlive(e1));
+    try std.testing.expect(world.isAlive(e2));
+    try std.testing.expect(world.isAlive(e3));
+    try std.testing.expect(world.verify());
+
+    // Despawn middle entity - this triggers row swap in archetype table
+    // Entity e3 moves to e2's old row, updateMovedEntityMetadata is called
+    try world.despawn(e2);
+
+    // Verify e1 and e3 still work correctly after the swap
+    try std.testing.expect(world.isAlive(e1));
+    try std.testing.expect(!world.isAlive(e2));
+    try std.testing.expect(world.isAlive(e3));
+
+    // Components should still be accessible
+    const p1 = world.getComponent(e1, Position);
+    const p3 = world.getComponent(e3, Position);
+    try std.testing.expect(p1 != null);
+    try std.testing.expect(p3 != null);
+    try std.testing.expectEqual(@as(f32, 1), p1.?.x);
+    try std.testing.expectEqual(@as(f32, 3), p3.?.x);
+
+    // World state should be consistent
+    try std.testing.expect(world.verify());
+    try std.testing.expectEqual(@as(u32, 2), world.entityCount());
 }

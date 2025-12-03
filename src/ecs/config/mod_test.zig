@@ -432,3 +432,105 @@ test "WorldConfigView scalability accessors" {
     try std.testing.expect(view.wantsCluster());
     try std.testing.expectEqual(@as(u16, 5), view.clusterNodeId());
 }
+
+// ============================================================================
+// Type Safety Tests (M1 + M2: TypedContext and TypedFnPtr)
+// ============================================================================
+
+const TypedContext = config.TypedContext;
+const TypedFnPtr = config.TypedFnPtr;
+const asSystemFn = config.asSystemFn;
+const builtin = @import("builtin");
+
+test "TypedContext init and cast" {
+    const TestStruct = struct { value: i32 };
+    var data = TestStruct{ .value = 42 };
+
+    // Create typed context
+    const ctx = TypedContext.init(TestStruct, &data);
+
+    // Cast back to original type
+    const ptr = ctx.cast(TestStruct);
+    try std.testing.expectEqual(@as(i32, 42), ptr.value);
+
+    // Verify the cast pointer points to the same data
+    ptr.value = 100;
+    try std.testing.expectEqual(@as(i32, 100), data.value);
+
+    // Verify raw pointer access returns a valid pointer
+    const raw = ctx.rawPtr();
+    _ = raw; // Just verify we can get it
+}
+
+test "TypedContext getTypeName in debug mode" {
+    const TestStruct = struct { value: i32 };
+    var data = TestStruct{ .value = 100 };
+    const ctx = TypedContext.init(TestStruct, &data);
+
+    // In debug/safe builds, type name should be available
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+        const type_name = ctx.getTypeName();
+        try std.testing.expect(type_name != null);
+        try std.testing.expect(std.mem.indexOf(u8, type_name.?, "TestStruct") != null);
+    } else {
+        // In release builds, type name is not available (zero overhead)
+        try std.testing.expectEqual(@as(?[]const u8, null), ctx.getTypeName());
+    }
+}
+
+test "TypedFnPtr creation via asSystemFn" {
+    const TestContext = struct { data: i32 };
+    const TestSystem = struct {
+        fn run(_: *TestContext) void {}
+    };
+
+    // Create typed function pointer
+    const fn_ptr = asSystemFn(TestSystem.run);
+
+    // Verify raw pointer is accessible (just verify we can get it)
+    _ = fn_ptr.rawPtr();
+
+    // In debug/safe builds, context type name should be available
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+        const type_name = fn_ptr.getContextTypeName();
+        try std.testing.expect(type_name != null);
+        try std.testing.expect(std.mem.indexOf(u8, type_name.?, "TestContext") != null);
+    }
+}
+
+test "TypedFnPtr verifyContextType success" {
+    const TestContext = struct { data: i32 };
+    const TestSystem = struct {
+        fn run(_: *TestContext) void {}
+    };
+
+    const fn_ptr = asSystemFn(TestSystem.run);
+
+    // In debug/safe builds, verify should succeed for matching type
+    fn_ptr.verifyContextType(TestContext);
+    // If we get here, verification passed (no panic)
+}
+
+test "asSystemFn validates function signature" {
+    // Test with *anyopaque parameter (legacy pattern)
+    const LegacySystem = struct {
+        fn run(_: *anyopaque) void {}
+    };
+    const legacy_fn = asSystemFn(LegacySystem.run);
+    _ = legacy_fn.rawPtr(); // Verify we can access it
+
+    // Test with typed context parameter
+    const MyContext = struct { x: f32 };
+    const TypedSystem = struct {
+        fn run(_: *MyContext) void {}
+    };
+    const typed_fn = asSystemFn(TypedSystem.run);
+    _ = typed_fn.rawPtr(); // Verify we can access it
+
+    // Test with error return type
+    const ErrorSystem = struct {
+        fn run(_: *anyopaque) error{TestError}!void {}
+    };
+    const error_fn = asSystemFn(ErrorSystem.run);
+    _ = error_fn.rawPtr(); // Verify we can access it
+}
